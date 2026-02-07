@@ -14,6 +14,9 @@ class BaseModel(ABC):
     TARGET = ''
     
     def __init__(self, **xgb_params):
+        # Extract selected_features if provided (from tuning)
+        self.selected_features = xgb_params.pop('selected_features', None)
+        
         default_params = {
             'n_estimators': 200,
             'max_depth': 5,
@@ -26,13 +29,19 @@ class BaseModel(ABC):
         self.scaler = StandardScaler()
         self.is_fitted = False
     
+    @property
+    def features_to_use(self):
+        """Return selected features if available, otherwise all FEATURES."""
+        return self.selected_features if self.selected_features else self.FEATURES
+    
     def _prepare_X(self, df: pd.DataFrame) -> np.ndarray:
-        """Prepare feature matrix."""
+        """Prepare feature matrix using selected features if available."""
         df = df.copy()
-        for feat in self.FEATURES:
+        features = self.features_to_use
+        for feat in features:
             if feat not in df.columns:
                 df[feat] = 0
-        X = df[self.FEATURES].fillna(0).astype(float)
+        X = df[features].fillna(0).astype(float)
         return X
     
     def fit(self, df: pd.DataFrame, verbose: bool = True):
@@ -49,7 +58,13 @@ class BaseModel(ABC):
         weights = df['minutes'].values / df['minutes'].mean()
         
         if verbose:
-            print(f"Training {self.__class__.__name__} on {len(X):,} samples...")
+            n_features = len(self.features_to_use)
+            feature_info = f"({n_features} features"
+            if self.selected_features:
+                feature_info += ", tuned selection)"
+            else:
+                feature_info += ")"
+            print(f"Training {self.__class__.__name__} on {len(X):,} samples {feature_info}...")
             print(f"  Target mean: {y.mean():.4f}")
         
         self.model.fit(X_scaled, y, sample_weight=weights)
@@ -75,7 +90,7 @@ class BaseModel(ABC):
         if not self.is_fitted:
             raise ValueError("Model not fitted")
         return pd.DataFrame({
-            'feature': self.FEATURES,
+            'feature': self.features_to_use,
             'importance': self.model.feature_importances_
         }).sort_values('importance', ascending=False)
     

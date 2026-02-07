@@ -18,6 +18,7 @@ FPL_POINTS = {
     'goal': {'GK': 6, 'DEF': 6, 'MID': 5, 'FWD': 4},
     'assist': 3,
     'clean_sheet': {'GK': 4, 'DEF': 4, 'MID': 1, 'FWD': 0},
+    'goals_conceded_2': {'GK': -1, 'DEF': -1, 'MID': 0, 'FWD': 0},  # Per 2 goals conceded
     'defcon': 2,
     'appearance_60': 2,
     'appearance_1': 1,
@@ -129,6 +130,8 @@ class FPLPipeline:
         """Train all models on full dataset using tuned params if available.
         
         Call this after tune() to train final models on ALL data before prediction.
+        Training order matters: CleanSheetModel first (generates pred_team_goals feature),
+        then Goals/Assists models use that feature.
         """
         if self.df is None:
             raise ValueError("Data not loaded")
@@ -142,36 +145,142 @@ class FPLPipeline:
                 print("(using default hyperparameters)")
             print("=" * 60)
         
-        # Minutes model
+        # Minutes model (independent)
         mins_params = self.tuned_params.get('minutes', {})
         self.models['minutes'] = MinutesModel(**mins_params)
         self.models['minutes'].fit(self.df, verbose)
         
-        # Goals model
-        goals_params = self.tuned_params.get('goals', {})
-        self.models['goals'] = GoalsModel(**goals_params)
-        self.models['goals'].fit(self.df, verbose)
-        
-        # Assists model
-        assists_params = self.tuned_params.get('assists', {})
-        self.models['assists'] = AssistsModel(**assists_params)
-        self.models['assists'].fit(self.df, verbose)
-        
-        # Defcon model
-        defcon_params = self.tuned_params.get('defcon', {})
-        self.models['defcon'] = DefconModel(**defcon_params)
-        self.models['defcon'].fit(self.df, verbose)
-        
-        # Clean sheet model (uses tuned params if available)
+        # Clean sheet model FIRST (needed for pred_team_goals feature)
         cs_params = self.tuned_params.get('clean_sheet', {})
         self.models['clean_sheet'] = CleanSheetModel(**cs_params)
         self.models['clean_sheet'].fit(self.df, verbose)
+        
+        # Generate leak-free OOF predicted team goals for training data
+        self._generate_oof_team_goals(verbose)
+        
+        # Goals model (uses pred_team_goals)
+        goals_params = self.tuned_params.get('goals', {})
+        # Ensure pred_team_goals is included in selected features if feature selection was done
+        if goals_params.get('selected_features') and 'pred_team_goals' not in goals_params['selected_features']:
+            goals_params['selected_features'] = goals_params['selected_features'] + ['pred_team_goals']
+        self.models['goals'] = GoalsModel(**goals_params)
+        self.models['goals'].fit(self.df, verbose)
+        
+        # Assists model (uses pred_team_goals)
+        assists_params = self.tuned_params.get('assists', {})
+        if assists_params.get('selected_features') and 'pred_team_goals' not in assists_params['selected_features']:
+            assists_params['selected_features'] = assists_params['selected_features'] + ['pred_team_goals']
+        self.models['assists'] = AssistsModel(**assists_params)
+        self.models['assists'].fit(self.df, verbose)
+        
+        # Defcon model (independent)
+        defcon_params = self.tuned_params.get('defcon', {})
+        self.models['defcon'] = DefconModel(**defcon_params)
+        self.models['defcon'].fit(self.df, verbose)
         
         # Bonus model (not tuned - uses Monte Carlo simulation)
         self.models['bonus'] = BonusModel()
         self.models['bonus'].fit(self.df, verbose)
         
         return self
+    
+    def _generate_oof_team_goals(self, verbose: bool = True):
+        """Generate out-of-fold predicted team goals using CleanSheetModel.
+        
+        For each match, predicts how many goals the opponent will concede 
+        (= how many goals this team will score). Uses 5-fold CV on the 
+        CleanSheetModel to avoid data leakage.
+        
+        The prediction is mapped to every player row as 'pred_team_goals'.
+        """
+        from sklearn.model_selection import KFold
+        import xgboost as xgb
+        
+        if verbose:
+            print("\nGenerating leak-free predicted team goals (5-fold OOF)...")
+        
+        cs_model = CleanSheetModel()
+        team_df = cs_model.prepare_team_features(self.df)
+        team_df = team_df.dropna(subset=['team_conceded_roll5', 'goals_conceded'])
+        
+        features = [f for f in cs_model.features_to_use if f in team_df.columns]
+        X = team_df[features].fillna(0).values
+        y = team_df['goals_conceded'].fillna(0).values
+        
+        # Get XGB params from tuned clean_sheet params (strip non-XGB keys)
+        cs_params = {k: v for k, v in self.tuned_params.get('clean_sheet', {}).items() 
+                     if k not in ('selected_features',)}
+        cs_params.setdefault('objective', 'count:poisson')
+        cs_params.setdefault('random_state', 42)
+        cs_params.setdefault('verbosity', 0)
+        
+        # 5-fold OOF predictions at team-match level
+        oof_preds = np.full(len(y), np.nan)
+        kf = KFold(n_splits=5, shuffle=True, random_state=42)
+        
+        for fold_idx, (train_idx, val_idx) in enumerate(kf.split(X)):
+            model = xgb.XGBRegressor(**cs_params)
+            model.fit(X[train_idx], y[train_idx])
+            oof_preds[val_idx] = np.clip(model.predict(X[val_idx]), 1e-6, 10.0)
+        
+        # Now we have predicted goals_conceded for each team-match (OOF)
+        # For a player on team A vs opponent B: 
+        #   pred_team_goals = predicted goals conceded by B (= goals scored by A)
+        # So we need to look up the OPPONENT's predicted goals_conceded
+        
+        team_df['oof_goals_conceded'] = oof_preds
+        
+        # Build lookup: for each (opponent, season, gameweek) -> their predicted goals_conceded
+        # This is: how many goals did the opponent concede in this match = how many team scored
+        opp_conceded_lookup = team_df[['team', 'season', 'gameweek', 'oof_goals_conceded']].copy()
+        opp_conceded_lookup = opp_conceded_lookup.rename(columns={
+            'team': 'opponent',
+            'oof_goals_conceded': 'pred_team_goals'
+        })
+        
+        # Normalize opponent names for matching
+        def normalize_name(name):
+            if pd.isna(name):
+                return ''
+            return str(name).lower().replace(' ', '_').replace("'", "").strip()
+        
+        opp_conceded_lookup['opponent_norm'] = opp_conceded_lookup['opponent'].apply(normalize_name)
+        self.df['opponent_norm'] = self.df['opponent'].apply(normalize_name)
+        
+        # Deduplicate lookup to avoid row multiplication during merge
+        opp_conceded_lookup = opp_conceded_lookup.drop_duplicates(
+            subset=['opponent_norm', 'season', 'gameweek'], keep='first'
+        )
+        
+        # Drop existing pred_team_goals if present (from previous run)
+        if 'pred_team_goals' in self.df.columns:
+            self.df = self.df.drop(columns=['pred_team_goals'])
+        
+        n_before = len(self.df)
+        
+        # Merge into player-level data
+        self.df = self.df.merge(
+            opp_conceded_lookup[['opponent_norm', 'season', 'gameweek', 'pred_team_goals']],
+            on=['opponent_norm', 'season', 'gameweek'],
+            how='left'
+        )
+        
+        # Safety check: merge should not create duplicate rows
+        if len(self.df) != n_before:
+            self.df = self.df.drop_duplicates(subset=['player_id', 'season', 'gameweek'], keep='first')
+            if verbose:
+                print(f"  WARNING: Merge created duplicates, deduplicated {len(self.df)} rows")
+        
+        # Fill NaN with league average (~1.3 goals/game)
+        self.df['pred_team_goals'] = self.df['pred_team_goals'].fillna(1.3)
+        
+        # Clean up
+        self.df = self.df.drop(columns=['opponent_norm'], errors='ignore')
+        
+        if verbose:
+            valid = self.df['pred_team_goals'].notna().sum()
+            print(f"  Mapped pred_team_goals to {valid:,}/{len(self.df):,} player rows")
+            print(f"  Mean pred_team_goals: {self.df['pred_team_goals'].mean():.3f}")
     
     def tune(self, models: list = None, n_iter: int = 100, test_size: float = 0.2,
              verbose: bool = True, use_subprocess: bool = False) -> 'FPLPipeline':
@@ -288,43 +397,54 @@ class FPLPipeline:
         poisson_scorer = make_scorer(safe_poisson_deviance, greater_is_better=False)
         
         # Model-specific scoring (regressors)
+        # Goals/Assists: MAE - sparse zero-inflated rates, RMSE would overweight rare high-scoring games
+        # Defcon: RMSE - continuous metric (mean ~10), large errors are genuinely informative
+        # Minutes: Huber - robust to the bimodal distribution (0 vs 60-90)
+        mae_scorer = 'neg_mean_absolute_error'
+        rmse_scorer = 'neg_root_mean_squared_error'
         SCORING = {
-            'goals': ('Poisson Deviance', poisson_scorer),
-            'assists': ('Poisson Deviance', poisson_scorer),
-            'defcon': ('Poisson Deviance', poisson_scorer),
+            'goals': ('MAE', mae_scorer),
+            'assists': ('MAE', mae_scorer),
+            'defcon': ('RMSE', rmse_scorer),
             'minutes': ('Huber Loss', huber_scorer),
         }
         
+        # n_features will be dynamically set based on available features for each model
         SEARCH_SPACES = {
             'goals': {
                 'n_estimators': (100, 400),
                 'max_depth': (3, 10),
                 'learning_rate': (0.01, 0.3, 'log'),
                 'min_child_weight': (1, 10),
+                'n_features_ratio': (0.4, 1.0),  # Fraction of features to use
             },
             'assists': {
                 'n_estimators': (100, 400),
                 'max_depth': (3, 10),
                 'learning_rate': (0.01, 0.3, 'log'),
                 'min_child_weight': (1, 10),
+                'n_features_ratio': (0.4, 1.0),
             },
             'minutes': {
                 'n_estimators': (100, 400),
                 'max_depth': (3, 8),
                 'learning_rate': (0.01, 0.3, 'log'),
                 'min_child_weight': (1, 15),
+                'n_features_ratio': (0.4, 1.0),
             },
             'defcon': {
                 'n_estimators': (100, 400),
                 'max_depth': (3, 10),
                 'learning_rate': (0.01, 0.3, 'log'),
                 'min_child_weight': (1, 10),
+                'n_features_ratio': (0.4, 1.0),
             },
             'clean_sheet': {
                 'n_estimators': (50, 300),
                 'max_depth': (3, 8),
                 'learning_rate': (0.01, 0.3, 'log'),
                 'min_child_weight': (1, 10),
+                'n_features_ratio': (0.4, 1.0),
             },
         }
         
@@ -354,16 +474,32 @@ class FPLPipeline:
             score_name, scorer = SCORING.get(model_name, ('RMSE', 'neg_root_mean_squared_error'))
             
             model_instance = model_class()
-            features = [f for f in model_instance.FEATURES if f in df_train.columns]
+            all_features = [f for f in model_instance.FEATURES if f in df_train.columns]
             target = model_instance.TARGET
+            n_total_features = len(all_features)
             
-            X = df_train[features].fillna(0).values
+            X_full = df_train[all_features].fillna(0).values
             y = df_train[target].fillna(0).values
             
+            # Pre-compute feature importance using a baseline model
+            baseline_model = xgb.XGBRegressor(n_estimators=50, max_depth=5, random_state=42, verbosity=0)
+            baseline_model.fit(X_full, y)
+            feature_importance = baseline_model.feature_importances_
+            importance_order = np.argsort(feature_importance)[::-1]  # Descending order
+            
             if verbose:
-                print(f"\nTuning {model_name.upper()} ({n_iter} trials, 5-fold CV, {score_name})...")
+                print(f"\nTuning {model_name.upper()} ({n_iter} trials, 5-fold CV, {score_name}, feature selection)...")
+                print(f"  Total features: {n_total_features}")
             
             def objective(trial):
+                # Feature selection: select top N features based on importance
+                n_features_ratio = trial.suggest_float('n_features_ratio', 
+                                                       space['n_features_ratio'][0], 
+                                                       space['n_features_ratio'][1])
+                n_features = max(5, int(n_total_features * n_features_ratio))  # At least 5 features
+                selected_indices = importance_order[:n_features]
+                X_selected = X_full[:, selected_indices]
+                
                 params = {
                     'n_estimators': trial.suggest_int('n_estimators', space['n_estimators'][0], space['n_estimators'][1]),
                     'max_depth': trial.suggest_int('max_depth', space['max_depth'][0], space['max_depth'][1]),
@@ -375,40 +511,75 @@ class FPLPipeline:
                 }
                 
                 model = xgb.XGBRegressor(**params)
-                scores = cross_val_score(model, X, y, cv=5, scoring=scorer, n_jobs=-1)
+                scores = cross_val_score(model, X_selected, y, cv=5, scoring=scorer, n_jobs=-1)
                 return -scores.mean()  # Optuna minimizes, scorer returns negative
             
             study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=42))
             study.optimize(objective, n_trials=n_iter, show_progress_bar=verbose)
             
-            tuned_params[model_name] = study.best_params
+            # Extract best params and compute selected features
+            best_params = study.best_params.copy()
+            best_ratio = best_params.pop('n_features_ratio')
+            best_n_features = max(5, int(n_total_features * best_ratio))
+            selected_indices = importance_order[:best_n_features]
+            selected_features = [all_features[i] for i in selected_indices]
+            
+            tuned_params[model_name] = {
+                **best_params,
+                'selected_features': selected_features,
+            }
+            
             if verbose:
                 print(f"  Best CV {score_name}: {study.best_value:.4f}")
-                print(f"  Params: {study.best_params}")
+                print(f"  Features: {best_n_features}/{n_total_features} ({best_ratio:.1%})")
+                print(f"  Params: {best_params}")
         
         return tuned_params
     
     def _tune_clean_sheet_in_process(self, n_iter: int, verbose: bool, 
                                       df_train: pd.DataFrame, space: dict) -> Dict:
-        """Tune CleanSheetModel (classifier) using Brier score."""
+        """Tune CleanSheetModel (Poisson regression for goals against) with feature selection."""
         import optuna
         from sklearn.model_selection import cross_val_score
+        from sklearn.metrics import make_scorer, mean_poisson_deviance
         import xgboost as xgb
+        
+        def safe_poisson_deviance(y_true, y_pred):
+            y_pred = np.clip(y_pred, 1e-8, None)
+            y_true = np.clip(y_true, 0, None)
+            return mean_poisson_deviance(y_true, y_pred)
+        poisson_scorer = make_scorer(safe_poisson_deviance, greater_is_better=False)
         
         # Prepare team-level data
         cs_model = CleanSheetModel()
         team_df = cs_model.prepare_team_features(df_train)
-        team_df = team_df.dropna(subset=['team_conceded_roll5'])
+        team_df = team_df.dropna(subset=['team_conceded_roll5', 'goals_conceded'])
         
-        features = [f for f in cs_model.FEATURES if f in team_df.columns]
-        X = team_df[features].fillna(0).values
-        y = team_df['clean_sheet'].values
+        all_features = [f for f in cs_model.FEATURES if f in team_df.columns]
+        n_total_features = len(all_features)
+        X_full = team_df[all_features].fillna(0).values
+        y = team_df['goals_conceded'].fillna(0).values  # Regression target: goals conceded
+        
+        # Pre-compute feature importance using a baseline model
+        baseline_model = xgb.XGBRegressor(n_estimators=50, max_depth=5, random_state=42, 
+                                           verbosity=0, objective='count:poisson')
+        baseline_model.fit(X_full, y)
+        feature_importance = baseline_model.feature_importances_
+        importance_order = np.argsort(feature_importance)[::-1]
         
         if verbose:
-            print(f"\nTuning CLEAN_SHEET ({n_iter} trials, 5-fold CV, Brier Score)...")
-            print(f"  Team-matches: {len(X)}, CS rate: {y.mean():.1%}")
+            print(f"\nTuning GOALS_AGAINST ({n_iter} trials, 5-fold CV, Poisson Deviance, feature selection)...")
+            print(f"  Team-matches: {len(X_full)}, Avg conceded: {y.mean():.3f}, Total features: {n_total_features}")
         
         def objective(trial):
+            # Feature selection
+            n_features_ratio = trial.suggest_float('n_features_ratio', 
+                                                   space['n_features_ratio'][0], 
+                                                   space['n_features_ratio'][1])
+            n_features = max(5, int(n_total_features * n_features_ratio))
+            selected_indices = importance_order[:n_features]
+            X_selected = X_full[:, selected_indices]
+            
             params = {
                 'n_estimators': trial.suggest_int('n_estimators', space['n_estimators'][0], space['n_estimators'][1]),
                 'max_depth': trial.suggest_int('max_depth', space['max_depth'][0], space['max_depth'][1]),
@@ -417,22 +588,32 @@ class FPLPipeline:
                 'random_state': 42,
                 'verbosity': 0,
                 'n_jobs': -1,
-                'eval_metric': 'logloss',
+                'objective': 'count:poisson',
             }
             
-            model = xgb.XGBClassifier(**params)
-            # neg_brier_score is the negative Brier score (higher/less negative is better)
-            scores = cross_val_score(model, X, y, cv=5, scoring='neg_brier_score', n_jobs=-1)
-            return -scores.mean()  # Optuna minimizes, return positive Brier score
+            model = xgb.XGBRegressor(**params)
+            scores = cross_val_score(model, X_selected, y, cv=5, scoring=poisson_scorer, n_jobs=-1)
+            return -scores.mean()  # Optuna minimizes
         
         study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=42))
         study.optimize(objective, n_trials=n_iter, show_progress_bar=verbose)
         
-        if verbose:
-            print(f"  Best CV Brier Score: {study.best_value:.4f}")
-            print(f"  Params: {study.best_params}")
+        # Extract best params and compute selected features
+        best_params = study.best_params.copy()
+        best_ratio = best_params.pop('n_features_ratio')
+        best_n_features = max(5, int(n_total_features * best_ratio))
+        selected_indices = importance_order[:best_n_features]
+        selected_features = [all_features[i] for i in selected_indices]
         
-        return study.best_params
+        if verbose:
+            print(f"  Best CV Poisson Deviance: {study.best_value:.4f}")
+            print(f"  Features: {best_n_features}/{n_total_features} ({best_ratio:.1%})")
+            print(f"  Params: {best_params}")
+        
+        return {
+            **best_params,
+            'selected_features': selected_features,
+        }
     
     def _tune_with_subprocess(self, models: list, n_iter: int, verbose: bool, df_train: pd.DataFrame) -> Dict:
         """Run each model's tuning in a separate subprocess to save RAM using Optuna with 5-fold CV.
@@ -440,7 +621,7 @@ class FPLPipeline:
         Uses appropriate loss functions:
         - Goals, Assists, Defcon: Poisson deviance (good for count/rate data)
         - Minutes: Huber loss (robust to outliers)
-        - Clean Sheet: Log loss (binary classification)
+        - Goals Against (clean sheet): Poisson deviance (count data)
         """
         import subprocess
         import sys
@@ -450,11 +631,11 @@ class FPLPipeline:
         
         # Scoring type for each model
         SCORING_NAMES = {
-            'goals': 'Poisson Deviance',
-            'assists': 'Poisson Deviance',
-            'defcon': 'Poisson Deviance',
+            'goals': 'MAE',
+            'assists': 'MAE',
+            'defcon': 'RMSE',
             'minutes': 'Huber Loss',
-            'clean_sheet': 'Brier Score',
+            'clean_sheet': 'Poisson Deviance',
         }
         
         SEARCH_SPACES = {
@@ -463,6 +644,7 @@ class FPLPipeline:
                 'max_depth': (3, 8),
                 'learning_rate': (0.01, 0.3),
                 'min_child_weight': (1, 10),
+                'n_features_ratio': (0.4, 1.0),
             },
         }
         
@@ -530,9 +712,9 @@ poisson_scorer = make_scorer(safe_poisson_deviance, greater_is_better=False)
 
 # Model-specific scoring
 SCORING = {{
-    'goals': poisson_scorer,
-    'assists': poisson_scorer,
-    'defcon': poisson_scorer,
+    'goals': 'neg_mean_absolute_error',
+    'assists': 'neg_mean_absolute_error',
+    'defcon': 'neg_root_mean_squared_error',
     'minutes': huber_scorer,
 }}
 
@@ -549,24 +731,28 @@ SEARCH_SPACES = {{
         'max_depth': (3, 10),
         'learning_rate': (0.01, 0.3),
         'min_child_weight': (1, 10),
+        'n_features_ratio': (0.4, 1.0),
     }},
     'assists': {{
         'n_estimators': (100, 400),
         'max_depth': (3, 10),
         'learning_rate': (0.01, 0.3),
         'min_child_weight': (1, 10),
+        'n_features_ratio': (0.4, 1.0),
     }},
     'minutes': {{
         'n_estimators': (100, 400),
         'max_depth': (3, 8),
         'learning_rate': (0.01, 0.3),
         'min_child_weight': (1, 15),
+        'n_features_ratio': (0.4, 1.0),
     }},
     'defcon': {{
         'n_estimators': (100, 400),
         'max_depth': (3, 10),
         'learning_rate': (0.01, 0.3),
         'min_child_weight': (1, 10),
+        'n_features_ratio': (0.4, 1.0),
     }},
 }}
 
@@ -579,13 +765,26 @@ space = SEARCH_SPACES[model_name]
 scorer = SCORING[model_name]
 
 model_instance = model_class()
-features = [f for f in model_instance.FEATURES if f in df_train.columns]
+all_features = [f for f in model_instance.FEATURES if f in df_train.columns]
 target = model_instance.TARGET
+n_total_features = len(all_features)
 
-X = df_train[features].fillna(0).values
+X_full = df_train[all_features].fillna(0).values
 y = df_train[target].fillna(0).values
 
+# Pre-compute feature importance using a baseline model
+baseline_model = xgb.XGBRegressor(n_estimators=50, max_depth=5, random_state=42, verbosity=0)
+baseline_model.fit(X_full, y)
+feature_importance = baseline_model.feature_importances_
+importance_order = np.argsort(feature_importance)[::-1]  # Descending order
+
 def objective(trial):
+    # Feature selection
+    n_features_ratio = trial.suggest_float('n_features_ratio', space['n_features_ratio'][0], space['n_features_ratio'][1])
+    n_features = max(5, int(n_total_features * n_features_ratio))
+    selected_indices = importance_order[:n_features]
+    X_selected = X_full[:, selected_indices]
+    
     params = {{
         'n_estimators': trial.suggest_int('n_estimators', space['n_estimators'][0], space['n_estimators'][1]),
         'max_depth': trial.suggest_int('max_depth', space['max_depth'][0], space['max_depth'][1]),
@@ -597,22 +796,31 @@ def objective(trial):
     }}
     
     model = xgb.XGBRegressor(**params)
-    scores = cross_val_score(model, X, y, cv=5, scoring=scorer, n_jobs=-1)
+    scores = cross_val_score(model, X_selected, y, cv=5, scoring=scorer, n_jobs=-1)
     return -scores.mean()  # Optuna minimizes, scorer returns negative
 
 study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=42))
 study.optimize(objective, n_trials=n_iter, show_progress_bar=False)
 
+# Extract best params and selected features
+best_params = study.best_params.copy()
+best_ratio = best_params.pop('n_features_ratio')
+best_n_features = max(5, int(n_total_features * best_ratio))
+selected_indices = importance_order[:best_n_features]
+selected_features = [all_features[i] for i in selected_indices]
+
 result = {{
-    'best_params': study.best_params,
-    'best_score': study.best_value
+    'best_params': best_params,
+    'best_score': study.best_value,
+    'selected_features': selected_features,
 }}
 
 with open(r"{temp_result_path}", 'w') as f:
     json.dump(result, f)
 
 print(f"Best CV {score_name}: {{study.best_value:.4f}}")
-print(f"Params: {{study.best_params}}")
+print(f"Features: {{best_n_features}}/{{n_total_features}} ({{best_ratio:.1%}})")
+print(f"Params: {{best_params}}")
 '''
                 
                 # Run in subprocess
@@ -636,7 +844,10 @@ print(f"Params: {{study.best_params}}")
                 try:
                     with open(temp_result_path, 'r') as f:
                         tune_result = json.load(f)
-                    tuned_params[model_name] = tune_result['best_params']
+                    tuned_params[model_name] = {
+                        **tune_result['best_params'],
+                        'selected_features': tune_result.get('selected_features', []),
+                    }
                 except Exception as e:
                     if verbose:
                         print(f"  Failed to read results: {e}")
@@ -660,8 +871,10 @@ print(f"Params: {{study.best_params}}")
         """Train models on train set with tuned params and evaluate on test set.
         
         Reports metrics matching the tuning loss functions:
-        - Goals, Assists, Defcon: Poisson deviance + MAE
+        - Goals, Assists: MAE (sparse zero-inflated rates)
+        - Defcon: RMSE (continuous metric)
         - Minutes: Huber loss + MAE
+        - Clean Sheet: Poisson deviance (actual count data)
         """
         from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_poisson_deviance
         import xgboost as xgb
@@ -673,7 +886,11 @@ print(f"Params: {{study.best_params}}")
             linear = residual - quadratic
             return np.mean(0.5 * quadratic**2 + delta * linear)
         
-        # Safe Poisson deviance
+        # RMSE helper
+        def rmse(y_true, y_pred):
+            return np.sqrt(mean_squared_error(y_true, y_pred))
+        
+        # Safe Poisson deviance (used for clean sheet goals conceded evaluation)
         def safe_poisson_deviance(y_true, y_pred):
             y_pred = np.clip(y_pred, 1e-8, None)
             y_true = np.clip(y_true, 0, None)
@@ -690,9 +907,9 @@ print(f"Params: {{study.best_params}}")
         
         # Model-specific primary metrics (for regressors)
         PRIMARY_METRICS = {
-            'goals': ('Poisson Dev', safe_poisson_deviance),
-            'assists': ('Poisson Dev', safe_poisson_deviance),
-            'defcon': ('Poisson Dev', safe_poisson_deviance),
+            'goals': ('MAE', mean_absolute_error),
+            'assists': ('MAE', mean_absolute_error),
+            'defcon': ('RMSE', rmse),
             'minutes': ('Huber Loss', huber_loss),
         }
         
@@ -710,9 +927,9 @@ print(f"Params: {{study.best_params}}")
             params = self.tuned_params[model_name]
             metric_name, metric_fn = PRIMARY_METRICS[model_name]
             
-            # Create model with tuned params
+            # Create model with tuned params (selected_features handled by constructor)
             model_instance = model_class(**params)
-            features = [f for f in model_instance.FEATURES if f in df_train.columns]
+            features = [f for f in model_instance.features_to_use if f in df_train.columns]
             target = model_instance.TARGET
             
             # Prepare train data
@@ -723,8 +940,9 @@ print(f"Params: {{study.best_params}}")
             X_test = df_test[features].fillna(0).values
             y_test = df_test[target].fillna(0).values
             
-            # Train on train set
-            xgb_model = xgb.XGBRegressor(**params, random_state=42, verbosity=0, n_jobs=-1)
+            # Train on train set (filter out non-XGB params like selected_features)
+            xgb_params = {k: v for k, v in params.items() if k != 'selected_features'}
+            xgb_model = xgb.XGBRegressor(**xgb_params, random_state=42, verbosity=0, n_jobs=-1)
             xgb_model.fit(X_train, y_train)
             
             # Predict on test set
@@ -740,56 +958,54 @@ print(f"Params: {{study.best_params}}")
                 'MAE': mae
             }
         
-        # Handle clean_sheet classifier separately (team-level data)
+        # Handle clean_sheet (goals against regression) separately (team-level data)
         if 'clean_sheet' in models and 'clean_sheet' in self.tuned_params:
-            from sklearn.metrics import brier_score_loss
-            
-            params = self.tuned_params['clean_sheet']
+            params = {k: v for k, v in self.tuned_params['clean_sheet'].items() if k != 'selected_features'}
+            selected_features = self.tuned_params['clean_sheet'].get('selected_features', None)
             cs_model = CleanSheetModel()
             
             # Prepare team-level train data
             team_train = cs_model.prepare_team_features(df_train)
-            team_train = team_train.dropna(subset=['team_conceded_roll5'])
+            team_train = team_train.dropna(subset=['team_conceded_roll5', 'goals_conceded'])
             
             # Prepare team-level test data
             team_test = cs_model.prepare_team_features(df_test)
-            team_test = team_test.dropna(subset=['team_conceded_roll5'])
+            team_test = team_test.dropna(subset=['team_conceded_roll5', 'goals_conceded'])
             
-            features = [f for f in cs_model.FEATURES if f in team_train.columns]
+            features = selected_features if selected_features else [f for f in cs_model.FEATURES if f in team_train.columns]
             
             X_train = team_train[features].fillna(0).values
-            y_train = team_train['clean_sheet'].values
+            y_train = team_train['goals_conceded'].fillna(0).values
             X_test = team_test[features].fillna(0).values
-            y_test = team_test['clean_sheet'].values
+            y_test = team_test['goals_conceded'].fillna(0).values
             
-            # Train classifier
-            xgb_model = xgb.XGBClassifier(**params, random_state=42, verbosity=0, n_jobs=-1, eval_metric='logloss')
+            # Train Poisson regressor
+            xgb_model = xgb.XGBRegressor(**params, random_state=42, verbosity=0, n_jobs=-1, objective='count:poisson')
             xgb_model.fit(X_train, y_train)
             
-            # Predict probabilities
-            y_pred_proba = xgb_model.predict_proba(X_test)[:, 1]
+            # Predict expected goals against
+            y_pred = np.clip(xgb_model.predict(X_test), 1e-8, None)
             
-            # Calculate metrics - Brier score (lower is better) and AUC (higher is better)
-            brier = brier_score_loss(y_test, y_pred_proba)
-            auc = roc_auc_score(y_test, y_pred_proba)
+            # Calculate metrics
+            poisson_dev = safe_poisson_deviance(y_test, y_pred)
+            mae = mean_absolute_error(y_test, y_pred)
             
             test_metrics['clean_sheet'] = {
-                'metric_name': 'Brier Score',
-                'primary': brier,
-                'MAE': auc  # Use AUC as secondary metric for classifiers
+                'metric_name': 'Poisson Dev',
+                'primary': poisson_dev,
+                'MAE': mae
             }
         
         # Print test set performance
         if verbose:
-            print(f"\n{'Model':<12} {'Metric':<12} {'Test Value':<12} {'Secondary':<12}")
-            print("-" * 48)
+            print(f"\n{'Model':<15} {'Metric':<15} {'Test Value':<12} {'MAE':<12}")
+            print("-" * 54)
             for model_name, metrics in test_metrics.items():
-                secondary_label = 'AUC' if model_name == 'clean_sheet' else 'MAE'
-                print(f"{model_name.upper():<12} {metrics['metric_name']:<12} {metrics['primary']:<12.4f} {metrics['MAE']:<12.4f}")
+                print(f"{model_name.upper():<15} {metrics['metric_name']:<15} {metrics['primary']:<12.4f} {metrics['MAE']:<12.4f}")
             
             # Add context for interpretation
-            print("\n(Lower is better for all metrics except AUC which should be higher)")
-            print("Poisson Dev: count/rate data | Huber: robust to outliers | Brier: probability calibration")
+            print("\n(Lower is better for all metrics)")
+            print("MAE: mean absolute error | RMSE: root mean squared error | Huber: robust to outliers")
     
     def predict(self, gameweek: int, season: str = '2025/2026', 
                 verbose: bool = True) -> pd.DataFrame:
@@ -811,14 +1027,23 @@ print(f"Params: {{study.best_params}}")
         
         # Generate predictions
         test_df['pred_minutes'] = self.models['minutes'].predict(test_df)
+        
+        # Clean sheet / goals against FIRST (needed for pred_team_goals feature)
+        cs_probs, two_plus_probs, pred_goals_against = self._predict_clean_sheet(test_df, gameweek, season, verbose)
+        test_df['pred_cs_prob'] = cs_probs
+        test_df['pred_2plus_conceded'] = two_plus_probs
+        test_df['pred_goals_against'] = pred_goals_against
+        
+        # Inject pred_team_goals: for each player, predicted goals their team will score
+        # = predicted goals conceded by the OPPONENT (from CleanSheetModel)
+        test_df['pred_team_goals'] = self._get_pred_team_goals(test_df, gameweek, season)
+        
+        # Goals/Assists now use pred_team_goals as a feature
         test_df['pred_goals_per90'] = self.models['goals'].predict(test_df)
         test_df['pred_exp_goals'] = self.models['goals'].predict_expected(test_df, test_df['pred_minutes'])
         test_df['pred_assists_per90'] = self.models['assists'].predict(test_df)
         test_df['pred_exp_assists'] = self.models['assists'].predict_expected(test_df, test_df['pred_minutes'])
         test_df['pred_defcon_prob'] = self.models['defcon'].predict_threshold_prob(test_df, test_df['pred_minutes'])
-        
-        # Clean sheet - need team-level features
-        test_df['pred_cs_prob'] = self._predict_clean_sheet(test_df, gameweek, season, verbose)
         
         # FPL positions (needed for bonus)
         self.fpl_positions = get_fpl_positions()
@@ -974,10 +1199,11 @@ print(f"Params: {{study.best_params}}")
         team_cols = ['team', 'season', 'gameweek', 
                      # Offensive stats
                      'team_goals_roll5', 'team_goals_roll10', 'team_xg_roll5', 'team_xg_roll10',
-                     # Defensive stats
-                     'team_conceded_roll5', 'team_conceded_roll10', 'team_xga_roll5', 'team_xga_roll10',
-                     # Clean sheet rates
-                     'team_cs_rate_roll5', 'team_cs_rate_roll10']
+                     # Defensive stats (multiple time horizons)
+                     'team_conceded_roll1', 'team_conceded_roll3', 'team_conceded_roll5', 'team_conceded_roll10', 'team_conceded_roll30',
+                     'team_xga_roll1', 'team_xga_roll3', 'team_xga_roll5', 'team_xga_roll10', 'team_xga_roll30',
+                     # Clean sheet rates (multiple time horizons)
+                     'team_cs_rate_roll1', 'team_cs_rate_roll3', 'team_cs_rate_roll5', 'team_cs_rate_roll10', 'team_cs_rate_roll30']
         
         available_cols = [c for c in team_cols if c in self.df.columns]
         
@@ -1014,15 +1240,12 @@ print(f"Params: {{study.best_params}}")
                 row['opp_xg_roll5'] = opp_stats['team_xg_roll5']
             if 'team_xg_roll10' in opp_stats:
                 row['opp_xg_roll10'] = opp_stats['team_xg_roll10']
-            # Opponent's defensive weakness = their team_conceded_roll
-            if 'team_conceded_roll5' in opp_stats:
-                row['opp_conceded_roll5'] = opp_stats['team_conceded_roll5']
-            if 'team_conceded_roll10' in opp_stats:
-                row['opp_conceded_roll10'] = opp_stats['team_conceded_roll10']
-            if 'team_xga_roll5' in opp_stats:
-                row['opp_xga_roll5'] = opp_stats['team_xga_roll5']
-            if 'team_xga_roll10' in opp_stats:
-                row['opp_xga_roll10'] = opp_stats['team_xga_roll10']
+            # Opponent's defensive weakness = their team_conceded_roll (multiple time horizons)
+            for window in [1, 3, 5, 10, 30]:
+                if f'team_conceded_roll{window}' in opp_stats:
+                    row[f'opp_conceded_roll{window}'] = opp_stats[f'team_conceded_roll{window}']
+                if f'team_xga_roll{window}' in opp_stats:
+                    row[f'opp_xga_roll{window}'] = opp_stats[f'team_xga_roll{window}']
     
     def _update_team_features(self, row: dict, team_name: str, team_stats_lookup: dict):
         """Update team features to latest values (fixes stale stats for players who missed games)."""
@@ -1036,20 +1259,14 @@ print(f"Params: {{study.best_params}}")
                 break
         
         if team_stats:
-            # Update team defensive stats
-            if 'team_conceded_roll5' in team_stats:
-                row['team_conceded_roll5'] = team_stats['team_conceded_roll5']
-            if 'team_conceded_roll10' in team_stats:
-                row['team_conceded_roll10'] = team_stats['team_conceded_roll10']
-            if 'team_xga_roll5' in team_stats:
-                row['team_xga_roll5'] = team_stats['team_xga_roll5']
-            if 'team_xga_roll10' in team_stats:
-                row['team_xga_roll10'] = team_stats['team_xga_roll10']
-            # Update clean sheet rates
-            if 'team_cs_rate_roll5' in team_stats:
-                row['team_cs_rate_roll5'] = team_stats['team_cs_rate_roll5']
-            if 'team_cs_rate_roll10' in team_stats:
-                row['team_cs_rate_roll10'] = team_stats['team_cs_rate_roll10']
+            # Update team defensive stats (multiple time horizons)
+            for window in [1, 3, 5, 10, 30]:
+                if f'team_conceded_roll{window}' in team_stats:
+                    row[f'team_conceded_roll{window}'] = team_stats[f'team_conceded_roll{window}']
+                if f'team_xga_roll{window}' in team_stats:
+                    row[f'team_xga_roll{window}'] = team_stats[f'team_xga_roll{window}']
+                if f'team_cs_rate_roll{window}' in team_stats:
+                    row[f'team_cs_rate_roll{window}'] = team_stats[f'team_cs_rate_roll{window}']
             # Update team offensive stats too
             if 'team_goals_roll5' in team_stats:
                 row['team_goals_roll5'] = team_stats['team_goals_roll5']
@@ -1087,8 +1304,12 @@ print(f"Params: {{study.best_params}}")
         return pd.DataFrame()
     
     def _predict_clean_sheet(self, test_df: pd.DataFrame, gameweek: int, 
-                             season: str, verbose: bool) -> np.ndarray:
-        """Predict clean sheet probability for each player's team."""
+                             season: str, verbose: bool) -> tuple:
+        """Predict goals against, then derive CS prob and 2+ conceded prob for each player's team.
+        
+        Returns:
+            Tuple of (cs_probs, two_plus_probs, pred_goals_against) as numpy arrays
+        """
         # Get team-level features
         team_features = self.models['clean_sheet'].prepare_team_features(self.df)
         
@@ -1097,6 +1318,9 @@ print(f"Params: {{study.best_params}}")
         
         # Map to players
         cs_probs = []
+        two_plus_probs = []
+        goals_against = []
+        
         for _, row in test_df.iterrows():
             team = str(row.get('team', '')).lower()
             
@@ -1111,16 +1335,58 @@ print(f"Params: {{study.best_params}}")
                 # Create single-row df for prediction
                 team_pred = pd.DataFrame([team_row])
                 team_pred['is_home'] = row.get('is_home', 0)
-                cs_prob = self.models['clean_sheet'].predict_proba(team_pred)[0]
+                cs_prob = self.models['clean_sheet'].predict_cs_prob(team_pred)[0]
+                two_plus = self.models['clean_sheet'].predict_2plus_conceded_prob(team_pred)[0]
+                ga = self.models['clean_sheet'].predict_goals_against(team_pred)[0]
             else:
                 cs_prob = 0.25  # Default
+                two_plus = 0.40  # Default
+                ga = 1.2  # Default ~league average
             
             cs_probs.append(cs_prob)
+            two_plus_probs.append(two_plus)
+            goals_against.append(ga)
         
-        return np.array(cs_probs)
+        return np.array(cs_probs), np.array(two_plus_probs), np.array(goals_against)
+    
+    def _get_pred_team_goals(self, test_df: pd.DataFrame, gameweek: int, season: str) -> np.ndarray:
+        """Predict how many goals each player's team will score.
+        
+        This equals the predicted goals conceded by the OPPONENT.
+        Uses the CleanSheetModel to predict the opponent's goals_conceded.
+        """
+        # Get team-level features
+        team_features = self.models['clean_sheet'].prepare_team_features(self.df)
+        latest_team = team_features.sort_values(['team', 'season', 'gameweek']).groupby('team').last().reset_index()
+        
+        pred_team_goals = []
+        for _, row in test_df.iterrows():
+            opponent = str(row.get('opponent', '')).lower()
+            is_home = row.get('is_home', 0)
+            # Opponent is away if player is home, and vice versa
+            opp_is_home = 1 - is_home
+            
+            # Find the opponent's team stats (we predict how many THEY concede)
+            opp_row = None
+            for _, t in latest_team.iterrows():
+                if opponent in str(t['team']).lower() or str(t['team']).lower() in opponent:
+                    opp_row = t
+                    break
+            
+            if opp_row is not None:
+                opp_pred = pd.DataFrame([opp_row])
+                opp_pred['is_home'] = opp_is_home
+                ga = self.models['clean_sheet'].predict_goals_against(opp_pred)[0]
+            else:
+                ga = 1.3  # Default league average
+            
+            pred_team_goals.append(ga)
+        
+        return np.array(pred_team_goals)
     
     def _calculate_expected_points(self, df: pd.DataFrame) -> pd.DataFrame:
         """Calculate expected FPL points."""
+        from scipy.stats import poisson
         df = df.copy()
         
         def calc_points(row):
@@ -1144,6 +1410,22 @@ print(f"Params: {{study.best_params}}")
             # Clean sheet (only if 60+ mins)
             cs_pts = row.get('pred_cs_prob', 0) * FPL_POINTS['clean_sheet'].get(pos, 0) if mins >= 60 else 0
             
+            # Goals conceded penalty (GK/DEF only, 60+ mins)
+            # FPL: lose 1 point per 2 goals conceded (i.e., floor(goals/2) * -1)
+            # Expected penalty = sum over k>=2: floor(k/2) * P(goals_against=k) * (-1)
+            conceded_penalty = 0
+            if pos in ['GK', 'DEF'] and mins >= 60:
+                lam = row.get('pred_goals_against', 1.2)
+                # Compute expected floor(k/2) penalty using Poisson probabilities
+                # Sum P(k) * floor(k/2) for k=2..10 (truncate at 10, negligible beyond)
+                expected_neg = 0
+                for k in range(2, 11):
+                    expected_neg += poisson.pmf(k, lam) * (k // 2)
+                # Also add the tail probability (11+) approximated
+                tail_prob = 1 - poisson.cdf(10, lam)
+                expected_neg += tail_prob * 5  # Conservative: 5 for 11+ goals
+                conceded_penalty = -expected_neg  # Negative points
+            
             # Defcon (DEF/MID only, 60+ mins)
             defcon_pts = 0
             if pos in ['DEF', 'MID'] and mins >= 60:
@@ -1156,10 +1438,11 @@ print(f"Params: {{study.best_params}}")
                 'exp_goals_pts': goal_pts,
                 'exp_assists_pts': assist_pts,
                 'exp_cs_pts': cs_pts,
+                'exp_conceded_penalty': conceded_penalty,
                 'exp_defcon_pts': defcon_pts,
                 'exp_bonus_pts': bonus_pts,
                 'exp_appearance_pts': app_pts,
-                'exp_total_pts': app_pts + goal_pts + assist_pts + cs_pts + defcon_pts + bonus_pts
+                'exp_total_pts': app_pts + goal_pts + assist_pts + cs_pts + conceded_penalty + defcon_pts + bonus_pts
             })
         
         points_df = df.apply(calc_points, axis=1)
@@ -1169,6 +1452,7 @@ print(f"Params: {{study.best_params}}")
         """Get top N players by expected points."""
         cols = ['player_name', 'team', 'fpl_position', 'opponent', 'is_home',
                 'pred_minutes', 'pred_exp_goals', 'pred_exp_assists', 
-                'pred_cs_prob', 'pred_defcon_prob', 'pred_bonus', 'exp_total_pts']
+                'pred_team_goals', 'pred_cs_prob', 'pred_2plus_conceded', 
+                'pred_goals_against', 'pred_defcon_prob', 'pred_bonus', 'exp_total_pts']
         available_cols = [c for c in cols if c in predictions.columns]
         return predictions.nlargest(n, 'exp_total_pts')[available_cols]

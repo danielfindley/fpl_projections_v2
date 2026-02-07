@@ -37,6 +37,8 @@ class MinutesModel:
     TARGET = 'minutes'
     
     def __init__(self, **xgb_params):
+        self.selected_features = xgb_params.pop('selected_features', None)
+        
         default_params = {
             'n_estimators': 200,
             'max_depth': 4,
@@ -49,12 +51,17 @@ class MinutesModel:
         self.scaler = StandardScaler()
         self.is_fitted = False
     
+    @property
+    def features_to_use(self):
+        return self.selected_features if self.selected_features else self.FEATURES
+    
     def _prepare_X(self, df: pd.DataFrame) -> np.ndarray:
         df = df.copy()
-        for feat in self.FEATURES:
+        features = self.features_to_use
+        for feat in features:
             if feat not in df.columns:
                 df[feat] = 0
-        return df[self.FEATURES].fillna(0).astype(float)
+        return df[features].fillna(0).astype(float)
     
     def fit(self, df: pd.DataFrame, verbose: bool = True):
         """Train on players who played 1+ minutes."""
@@ -130,6 +137,6 @@ class MinutesModel:
         if not self.is_fitted:
             raise ValueError("Model not fitted")
         return pd.DataFrame({
-            'feature': self.FEATURES,
+            'feature': self.features_to_use,
             'importance': self.model.feature_importances_
         }).sort_values('importance', ascending=False)

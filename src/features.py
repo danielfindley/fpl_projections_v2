@@ -243,45 +243,57 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     # TEAM DEFENSIVE STATS (Goals Conceded, xGA)
     # =========================================================================
     
+    # Normalize team names for consistent matching across all team-related features
+    def normalize_name(name):
+        if pd.isna(name):
+            return ''
+        return str(name).lower().replace(' ', '_').replace("'", "").strip()
+    
     if 'opponent' in df.columns:
+        # Create normalized versions for matching
+        df['team_norm'] = df['team'].apply(normalize_name)
+        df['opponent_norm'] = df['opponent'].apply(normalize_name)
+        
         # Get goals conceded by each team (= opponent's goals scored that match)
         # First build a match-level lookup: team -> opponent's goals that game
-        match_results = df.groupby(['team', 'opponent', 'season', 'gameweek']).agg({
-            'goals': 'sum', 'xg': 'sum'
+        match_results = df.groupby(['team_norm', 'opponent_norm', 'season', 'gameweek']).agg({
+            'goals': 'sum', 'xg': 'sum', 'team': 'first', 'opponent': 'first'
         }).reset_index()
         
         # Swap to get what the opponent scored against this team
+        # After swap: team_norm becomes what was opponent_norm, so we get each team's conceded stats
         team_conceded = match_results.rename(columns={
-            'team': 'opponent_temp', 
-            'opponent': 'team',
+            'team_norm': 'opponent_temp_norm', 
+            'opponent_norm': 'team_norm',  # The opponent becomes the team for defensive stats
             'goals': 'goals_conceded',
             'xg': 'xga'
         })
-        team_conceded = team_conceded.rename(columns={'opponent_temp': 'opponent_for_merge'})
-        team_conceded = team_conceded.sort_values(['team', 'season', 'gameweek'])
+        team_conceded = team_conceded.sort_values(['team_norm', 'season', 'gameweek'])
         
-        # Rolling goals conceded and xGA
-        for window in [5, 10]:
-            team_conceded[f'team_conceded_roll{window}'] = team_conceded.groupby('team')['goals_conceded'].transform(
+        # Rolling goals conceded and xGA (multiple windows for different time horizons)
+        # Last game (roll1), recent form (roll3), short term (roll5), medium term (roll10), season trend (roll30)
+        for window in [1, 3, 5, 10, 30]:
+            team_conceded[f'team_conceded_roll{window}'] = team_conceded.groupby('team_norm')['goals_conceded'].transform(
                 lambda x: x.shift(1).rolling(window, min_periods=1).mean()
             )
-            team_conceded[f'team_xga_roll{window}'] = team_conceded.groupby('team')['xga'].transform(
+            team_conceded[f'team_xga_roll{window}'] = team_conceded.groupby('team_norm')['xga'].transform(
                 lambda x: x.shift(1).rolling(window, min_periods=1).mean()
             )
         
         # Clean sheet tracking
         team_conceded['clean_sheet'] = (team_conceded['goals_conceded'] == 0).astype(int)
-        for window in [5, 10]:
-            team_conceded[f'team_cs_rate_roll{window}'] = team_conceded.groupby('team')['clean_sheet'].transform(
+        for window in [1, 3, 5, 10, 30]:
+            team_conceded[f'team_cs_rate_roll{window}'] = team_conceded.groupby('team_norm')['clean_sheet'].transform(
                 lambda x: x.shift(1).rolling(window, min_periods=1).mean()
             )
         
+        # Merge using normalized team name
         df = df.merge(
-            team_conceded[['team', 'season', 'gameweek', 
-                          'team_conceded_roll5', 'team_conceded_roll10',
-                          'team_xga_roll5', 'team_xga_roll10',
-                          'team_cs_rate_roll5', 'team_cs_rate_roll10']],
-            on=['team', 'season', 'gameweek'], how='left'
+            team_conceded[['team_norm', 'season', 'gameweek', 
+                          'team_conceded_roll1', 'team_conceded_roll3', 'team_conceded_roll5', 'team_conceded_roll10', 'team_conceded_roll30',
+                          'team_xga_roll1', 'team_xga_roll3', 'team_xga_roll5', 'team_xga_roll10', 'team_xga_roll30',
+                          'team_cs_rate_roll1', 'team_cs_rate_roll3', 'team_cs_rate_roll5', 'team_cs_rate_roll10', 'team_cs_rate_roll30']],
+            on=['team_norm', 'season', 'gameweek'], how='left'
         )
     
     # =========================================================================
@@ -289,36 +301,39 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     # =========================================================================
     
     if 'opponent' in df.columns:
+        # Add normalized team name to team_stats for opponent matching
+        team_stats['team_norm'] = team_stats['team'].apply(normalize_name)
+        
         # Opponent's goals scored (their attacking strength)
-        opp_offense = team_stats[['team', 'season', 'gameweek', 'team_goals', 'team_xg']].copy()
+        opp_offense = team_stats[['team_norm', 'season', 'gameweek', 'team_goals', 'team_xg']].copy()
         opp_offense = opp_offense.rename(columns={
-            'team': 'opponent', 
+            'team_norm': 'opponent_norm', 
             'team_goals': 'opp_goals',
             'team_xg': 'opp_xg'
         })
-        opp_offense = opp_offense.sort_values(['opponent', 'season', 'gameweek'])
+        opp_offense = opp_offense.sort_values(['opponent_norm', 'season', 'gameweek'])
         
         for window in [5, 10]:
-            opp_offense[f'opp_goals_roll{window}'] = opp_offense.groupby('opponent')['opp_goals'].transform(
+            opp_offense[f'opp_goals_roll{window}'] = opp_offense.groupby('opponent_norm')['opp_goals'].transform(
                 lambda x: x.shift(1).rolling(window, min_periods=1).mean()
             )
-            opp_offense[f'opp_xg_roll{window}'] = opp_offense.groupby('opponent')['opp_xg'].transform(
+            opp_offense[f'opp_xg_roll{window}'] = opp_offense.groupby('opponent_norm')['opp_xg'].transform(
                 lambda x: x.shift(1).rolling(window, min_periods=1).mean()
             )
         
         df = df.merge(
-            opp_offense[['opponent', 'season', 'gameweek', 'opp_goals_roll5', 'opp_xg_roll5',
+            opp_offense[['opponent_norm', 'season', 'gameweek', 'opp_goals_roll5', 'opp_xg_roll5',
                         'opp_goals_roll10', 'opp_xg_roll10']],
-            on=['opponent', 'season', 'gameweek'], how='left'
+            on=['opponent_norm', 'season', 'gameweek'], how='left'
         )
         
         # Opponent's defensive weakness (goals they concede = xGA)
-        opp_defense = team_conceded[['team', 'season', 'gameweek', 
+        opp_defense = team_conceded[['team_norm', 'season', 'gameweek', 
                                      'goals_conceded', 'xga',
                                      'team_conceded_roll5', 'team_conceded_roll10',
                                      'team_xga_roll5', 'team_xga_roll10']].copy()
         opp_defense = opp_defense.rename(columns={
-            'team': 'opponent',
+            'team_norm': 'opponent_norm',
             'team_conceded_roll5': 'opp_conceded_roll5',
             'team_conceded_roll10': 'opp_conceded_roll10', 
             'team_xga_roll5': 'opp_xga_roll5',
@@ -326,11 +341,14 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
         })
         
         df = df.merge(
-            opp_defense[['opponent', 'season', 'gameweek', 
+            opp_defense[['opponent_norm', 'season', 'gameweek', 
                         'opp_conceded_roll5', 'opp_conceded_roll10',
                         'opp_xga_roll5', 'opp_xga_roll10']],
-            on=['opponent', 'season', 'gameweek'], how='left'
+            on=['opponent_norm', 'season', 'gameweek'], how='left'
         )
+        
+        # Clean up temporary normalized columns
+        df = df.drop(columns=['team_norm', 'opponent_norm'], errors='ignore')
     
     # =========================================================================
     # CLEAN UP

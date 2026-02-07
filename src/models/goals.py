@@ -27,6 +27,9 @@ class GoalsModel(BaseModel):
         # Opponent defensive weakness (how many they concede = opportunity)
         'opp_conceded_roll5', 'opp_xga_roll5', 'opp_conceded_roll10', 'opp_xga_roll10',
         
+        # Match-specific predicted team goals (from CleanSheetModel, leak-free OOF)
+        'pred_team_goals',
+        
         # Match context
         'is_home',
     ]
