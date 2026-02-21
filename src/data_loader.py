@@ -23,14 +23,15 @@ COLUMN_MAP = {
 def load_player_stats(data_dir: Path, verbose: bool = True) -> pd.DataFrame:
     """Load player stats from FotMob CSV files."""
     data_dir = Path(data_dir)
-    
-    # Find the player stats file
-    player_files = list((data_dir / 'players').glob('player_stats_*.csv'))
-    if not player_files:
-        raise FileNotFoundError(f"No player stats files found in {data_dir / 'players'}")
-    
-    # Use most recent file
-    player_file = sorted(player_files)[-1]
+
+    # Try canonical path first, fall back to timestamped glob
+    player_file = data_dir / 'players' / 'player_stats.csv'
+    if not player_file.exists():
+        player_files = list((data_dir / 'players').glob('player_stats_*.csv'))
+        if not player_files:
+            raise FileNotFoundError(f"No player stats files found in {data_dir / 'players'}")
+        player_file = sorted(player_files)[-1]
+
     if verbose:
         print(f"Loading player stats from: {player_file.name}")
     
@@ -79,10 +80,13 @@ def load_player_stats(data_dir: Path, verbose: bool = True) -> pd.DataFrame:
 def load_fixtures(data_dir: Path, verbose: bool = True) -> pd.DataFrame:
     """Load fixtures from CSV."""
     data_dir = Path(data_dir)
-    fixtures_file = data_dir / 'all_fixtures_8_seasons.csv'
-    
+
+    # Try canonical path first, fall back to old name
+    fixtures_file = data_dir / 'fixtures.csv'
     if not fixtures_file.exists():
-        raise FileNotFoundError(f"Fixtures file not found: {fixtures_file}")
+        fixtures_file = data_dir / 'all_fixtures_8_seasons.csv'
+    if not fixtures_file.exists():
+        raise FileNotFoundError(f"Fixtures file not found in {data_dir}")
     
     df = pd.read_csv(fixtures_file)
     df = df.rename(columns=COLUMN_MAP)

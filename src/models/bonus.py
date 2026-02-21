@@ -277,32 +277,51 @@ class BaselineBPSModel:
     def _estimate_baseline_bps(self, df: pd.DataFrame) -> pd.Series:
         """
         Estimate baseline BPS from stats when actual BPS data is not available.
+
+        Uses official FPL BPS coefficients:
+        - Playing 60+ mins: 6, playing 1-59 mins: 3
+        - Key passes: 1 per
+        - Tackles won: 2 per
+        - Interceptions: 1 per
+        - Recoveries: 1 per
+        - Clearances: 1 per
+        - Blocks: 1 per
+        - Shots on target: 2 per (approximated as shots * 0.4)
         """
-        baseline = np.zeros(len(df))
-        
-        # Base for playing 60+ mins
-        baseline += 6
-        
-        # Key passes
+        mins = df['minutes'].fillna(0)
+        mins_per90 = mins / 90
+
+        # Base for playing: 6 if 60+ mins, 3 if 1-59 mins
+        baseline = np.where(mins >= 60, 6.0, np.where(mins >= 1, 3.0, 0.0))
+
+        # Key passes (1 BPS each)
         if 'key_passes_per90_roll5' in df.columns:
-            key_passes = df['key_passes_per90_roll5'].fillna(0) * (df['minutes'].fillna(0) / 90)
-            baseline += key_passes * 2
-        
-        # Tackles
+            baseline += df['key_passes_per90_roll5'].fillna(0) * mins_per90 * 1
+
+        # Tackles won (2 BPS each)
         if 'tackles_per90_roll5' in df.columns:
-            tackles = df['tackles_per90_roll5'].fillna(0) * (df['minutes'].fillna(0) / 90)
-            baseline += tackles * 2
-        
-        # Interceptions
+            baseline += df['tackles_per90_roll5'].fillna(0) * mins_per90 * 2
+
+        # Interceptions (1 BPS each)
         if 'interceptions_per90_roll5' in df.columns:
-            ints = df['interceptions_per90_roll5'].fillna(0) * (df['minutes'].fillna(0) / 90)
-            baseline += ints * 3
-        
-        # Recoveries
+            baseline += df['interceptions_per90_roll5'].fillna(0) * mins_per90 * 1
+
+        # Recoveries (1 BPS each)
         if 'recoveries_per90_roll5' in df.columns:
-            recoveries = df['recoveries_per90_roll5'].fillna(0) * (df['minutes'].fillna(0) / 90)
-            baseline += recoveries * 1
-        
+            baseline += df['recoveries_per90_roll5'].fillna(0) * mins_per90 * 1
+
+        # Clearances (1 BPS each)
+        if 'clearances_per90_roll5' in df.columns:
+            baseline += df['clearances_per90_roll5'].fillna(0) * mins_per90 * 1
+
+        # Blocks (1 BPS each)
+        if 'blocks_per90_roll5' in df.columns:
+            baseline += df['blocks_per90_roll5'].fillna(0) * mins_per90 * 1
+
+        # Shots on target approximation (2 BPS each, ~40% of shots are on target)
+        if 'shots_per90_roll5' in df.columns:
+            baseline += df['shots_per90_roll5'].fillna(0) * mins_per90 * 0.4 * 2
+
         return pd.Series(baseline, index=df.index)
     
     def fit(self, df: pd.DataFrame, verbose: bool = True):
@@ -619,196 +638,3 @@ class BonusModel:
     def feature_importance(self) -> pd.DataFrame:
         """Get feature importance from baseline model."""
         return self.baseline_model.feature_importance()
-
-        if not self.is_fitted:
-
-            raise ValueError("Model not fitted")
-
-        
-
-        n = len(df)
-
-        
-
-        # Get predictions from df if not provided
-
-        if pred_goals is None:
-
-            pred_goals = df.get('pred_exp_goals', np.zeros(n))
-
-        if pred_assists is None:
-
-            pred_assists = df.get('pred_exp_assists', np.zeros(n))
-
-        if pred_cs_prob is None:
-
-            pred_cs_prob = df.get('pred_cs_prob', np.full(n, 0.25))
-
-        if pred_minutes is None:
-
-            pred_minutes = df.get('pred_minutes', np.full(n, 60))
-
-        
-
-        pred_goals = np.array(pred_goals)
-
-        pred_assists = np.array(pred_assists)
-
-        pred_cs_prob = np.array(pred_cs_prob)
-
-        pred_minutes = np.array(pred_minutes)
-
-        
-
-        # Get positions
-
-        if fpl_positions is None:
-
-            fpl_positions = df.get('fpl_position', pd.Series(['MID'] * n)).values
-
-        
-
-        # Baseline BPS (scaled by minutes)
-
-        X = self._prepare_X(df)
-
-        X_scaled = self.scaler.transform(X)
-
-        baseline_bps = self.model.predict(X_scaled)
-
-        baseline_bps = baseline_bps * np.clip(pred_minutes / 90, 0, 1.0)
-
-        
-
-        # Zero out BPS for players with very low predicted minutes
-
-        baseline_bps = np.where(pred_minutes < 10, 0, baseline_bps)
-
-        
-
-        # BPS values by position
-
-        goal_bps = np.array([BPS_GOAL.get(p, 18) for p in fpl_positions])
-
-        cs_bps = np.array([BPS_CS.get(p, 0) for p in fpl_positions])
-
-        mins_mask = (pred_minutes >= 60).astype(float)
-
-        playing_mask = (pred_minutes >= 10).astype(float)  # Must play to get bonus
-
-        
-
-        # Monte Carlo simulation (only for players predicted to play)
-
-        all_goals = np.random.poisson(np.maximum(pred_goals, 0), (self.n_simulations, n)) * playing_mask
-
-        all_assists = np.random.poisson(np.maximum(pred_assists, 0), (self.n_simulations, n)) * playing_mask
-
-        all_cs = ((np.random.random((self.n_simulations, n)) < pred_cs_prob) * mins_mask).astype(int)
-
-        
-
-        all_bps = (baseline_bps + all_goals * goal_bps + all_assists * BPS_ASSIST + all_cs * cs_bps) * playing_mask
-
-        
-
-        # Match grouping
-
-        def normalize_team(name):
-
-            if pd.isna(name):
-
-                return ''
-
-            return str(name).lower().replace('_', ' ').replace("'", "").strip()[:10]
-
-        
-
-        if 'team' in df.columns and 'opponent' in df.columns:
-
-            match_groups = df.apply(
-
-                lambda r: '_'.join(sorted([normalize_team(r.get('team', '')), 
-
-                                           normalize_team(r.get('opponent', ''))])),
-
-                axis=1
-
-            ).values
-
-        else:
-
-            match_groups = np.array(['match'] * n)
-
-        
-
-        # Compute bonus per simulation
-
-        total_bonus = np.zeros(n)
-
-        unique_matches = np.unique(match_groups)
-
-        
-
-        for match_id in unique_matches:
-
-            match_idx = np.where(match_groups == match_id)[0]
-
-            if len(match_idx) == 0:
-
-                continue
-
-            
-
-            match_bps = all_bps[:, match_idx]
-
-            match_bonus = np.zeros((self.n_simulations, len(match_idx)))
-
-            
-
-            for sim in range(self.n_simulations):
-
-                bps_sim = match_bps[sim]
-
-                sorted_idx = np.argsort(-bps_sim)
-
-                
-
-                # Award 3, 2, 1 to top 3 (handling ties)
-
-                if len(sorted_idx) >= 1:
-
-                    match_bonus[sim, sorted_idx[0]] = 3
-
-                if len(sorted_idx) >= 2 and bps_sim[sorted_idx[1]] < bps_sim[sorted_idx[0]]:
-
-                    match_bonus[sim, sorted_idx[1]] = 2
-
-                if len(sorted_idx) >= 3 and bps_sim[sorted_idx[2]] < bps_sim[sorted_idx[1]]:
-
-                    match_bonus[sim, sorted_idx[2]] = 1
-
-            
-
-            total_bonus[match_idx] = match_bonus.mean(axis=0)
-
-        
-
-        return total_bonus
-
-    
-
-    def feature_importance(self) -> pd.DataFrame:
-
-        if not self.is_fitted:
-
-            raise ValueError("Model not fitted")
-
-        return pd.DataFrame({
-
-            'feature': self.FEATURES,
-
-            'importance': self.model.feature_importances_
-
-        }).sort_values('importance', ascending=False)
-

@@ -1,5 +1,6 @@
 """Goals Against model (team-level) - predicts expected goals conceded per match.
 Uses Poisson distribution to derive clean sheet probability and 2+ conceded probability.
+Includes isotonic calibration for CS probabilities.
 """
 import pandas as pd
 import numpy as np
@@ -12,28 +13,31 @@ class CleanSheetModel:
     """Predicts expected goals against per match, then derives:
     - P(clean sheet) = P(goals_against = 0) via Poisson
     - P(2+ conceded) = 1 - P(goals_against <= 1) via Poisson
+
+    Uses isotonic calibration to map raw Poisson CS probabilities to
+    calibrated probabilities that match observed CS rates.
     """
-    
+
     FEATURES = [
         # Team defensive history (multiple time horizons)
         'team_conceded_roll1', 'team_conceded_roll3', 'team_conceded_roll5', 'team_conceded_roll10', 'team_conceded_roll30',
         'team_xga_roll1', 'team_xga_roll3', 'team_xga_roll5', 'team_xga_roll10', 'team_xga_roll30',
         'team_cs_roll1', 'team_cs_roll3', 'team_cs_roll5', 'team_cs_roll10', 'team_cs_roll30',
-        
+
         # Opponent attacking history
         'opp_scored_roll5', 'opp_scored_roll10',
         'opp_xg_roll5', 'opp_xg_roll10',
-        
+
         # Match context
         'is_home',
     ]
-    
+
     TARGET = 'goals_conceded'
-    
+
     def __init__(self, **xgb_params):
         # Extract selected_features if provided (from tuning)
         self.selected_features = xgb_params.pop('selected_features', None)
-        
+
         default_params = {
             'n_estimators': 100,
             'max_depth': 5,
@@ -44,6 +48,7 @@ class CleanSheetModel:
         default_params.update(xgb_params)
         self.model = xgb.XGBRegressor(**default_params)
         self.is_fitted = False
+        self.cs_calibrator = None
     
     @property
     def features_to_use(self):
@@ -144,13 +149,23 @@ class CleanSheetModel:
         return df[features].fillna(0).astype(float)
     
     def fit(self, df: pd.DataFrame, verbose: bool = True):
-        """Train on team-match data to predict goals conceded."""
+        """Train on team-match data to predict goals conceded.
+
+        After fitting the XGBoost model, runs isotonic calibration on
+        OOF CS probabilities to correct systematic bias in P(CS) = e^(-lambda).
+        """
+        from sklearn.model_selection import TimeSeriesSplit
+        from sklearn.isotonic import IsotonicRegression
+
         team_df = self.prepare_team_features(df)
         team_df = team_df.dropna(subset=['team_conceded_roll5', 'goals_conceded'])
-        
+
+        # Ensure temporal ordering for OOF calibration
+        team_df = team_df.sort_values(['season', 'gameweek']).reset_index(drop=True)
+
         X = self._prepare_X(team_df)
         y = team_df['goals_conceded'].fillna(0).values
-        
+
         if verbose:
             n_features = len(self.features_to_use)
             feature_info = f"({n_features} features"
@@ -161,10 +176,40 @@ class CleanSheetModel:
             print(f"Training CleanSheetModel (Goals Against) on {len(X):,} team-matches {feature_info}...")
             print(f"  Avg goals conceded: {y.mean():.3f}")
             print(f"  Actual CS rate: {(y == 0).mean():.1%}")
-        
-        self.model.fit(X, y)
+
+        # Step 1: Generate OOF predictions for calibration (before fitting on all data)
+        tscv = TimeSeriesSplit(n_splits=5)
+        oof_lambda = np.full(len(y), np.nan)
+
+        for train_idx, val_idx in tscv.split(X):
+            fold_model = xgb.XGBRegressor(**self.model.get_params())
+            fold_model.fit(X.values[train_idx] if hasattr(X, 'values') else X[train_idx],
+                          y[train_idx])
+            X_val = X.values[val_idx] if hasattr(X, 'values') else X[val_idx]
+            oof_lambda[val_idx] = np.clip(fold_model.predict(X_val), 1e-6, 10.0)
+
+        # Only calibrate on rows that have OOF predictions (TimeSeriesSplit skips first fold)
+        valid_mask = ~np.isnan(oof_lambda)
+        if valid_mask.sum() > 50:
+            raw_cs_prob = poisson.pmf(0, oof_lambda[valid_mask])
+            actual_cs = (y[valid_mask] == 0).astype(float)
+
+            self.cs_calibrator = IsotonicRegression(y_min=0, y_max=1, out_of_bounds='clip')
+            self.cs_calibrator.fit(raw_cs_prob, actual_cs)
+
+            if verbose:
+                calibrated_cs = self.cs_calibrator.predict(raw_cs_prob)
+                print(f"  Calibration: raw CS prob mean={raw_cs_prob.mean():.3f}, "
+                      f"calibrated={calibrated_cs.mean():.3f}, actual={actual_cs.mean():.3f}")
+        else:
+            self.cs_calibrator = None
+            if verbose:
+                print("  Skipping calibration (insufficient OOF data)")
+
+        # Step 2: Fit final model on ALL data
+        self.model.fit(X.values if hasattr(X, 'values') else X, y)
         self.is_fitted = True
-        
+
         if verbose:
             y_pred = self.predict_goals_against(team_df)
             cs_probs = self.predict_cs_prob(team_df)
@@ -172,7 +217,7 @@ class CleanSheetModel:
             print(f"  MAE (goals against): {mean_absolute_error(y, y_pred):.3f}")
             print(f"  Predicted CS prob (mean): {cs_probs.mean():.1%}")
             print(f"  Predicted 2+ conceded prob (mean): {two_plus_probs.mean():.1%}")
-        
+
         return self
     
     def predict_goals_against(self, df: pd.DataFrame) -> np.ndarray:
@@ -184,9 +229,16 @@ class CleanSheetModel:
         return np.clip(self.model.predict(X), 1e-6, 10.0)
     
     def predict_cs_prob(self, df: pd.DataFrame) -> np.ndarray:
-        """Predict clean sheet probability: P(goals_against = 0) = e^(-lambda)."""
+        """Predict clean sheet probability: P(goals_against = 0) = e^(-lambda).
+
+        If isotonic calibrator is available, applies calibration to raw probabilities.
+        """
         lambda_pred = self.predict_goals_against(df)
-        return poisson.pmf(0, lambda_pred)
+        raw_cs_prob = poisson.pmf(0, lambda_pred)
+
+        if self.cs_calibrator is not None:
+            return self.cs_calibrator.predict(raw_cs_prob)
+        return raw_cs_prob
     
     def predict_2plus_conceded_prob(self, df: pd.DataFrame) -> np.ndarray:
         """Predict probability of conceding 2+ goals: 1 - P(0) - P(1)."""
