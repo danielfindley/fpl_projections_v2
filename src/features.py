@@ -117,9 +117,61 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     df['goal_involvements_roll5'] = df['goals_roll5'] + df['assists_roll5']
     
     # =========================================================================
+    # FOULS COMMITTED (for card prediction)
+    # =========================================================================
+
+    if 'fouls_committed' not in df.columns:
+        df['fouls_committed'] = 0
+    else:
+        df['fouls_committed'] = pd.to_numeric(df['fouls_committed'], errors='coerce').fillna(0)
+
+    df['fouls_committed_per90'] = np.where(sufficient_minutes, df['fouls_committed'] / mins_90, np.nan)
+    df['fouls_committed_per90'] = df['fouls_committed_per90'].clip(upper=6.0)
+
+    for window in [3, 5, 10]:
+        df[f'fouls_committed_per90_roll{window}'] = df.groupby('player_id')['fouls_committed_per90'].transform(
+            lambda x: x.shift(1).rolling(window, min_periods=1).mean()
+        )
+
+    # =========================================================================
+    # GOALKEEPER STATS (Saves, xGoT faced)
+    # =========================================================================
+
+    for col in ['saves', 'xgot_faced']:
+        if col not in df.columns:
+            df[col] = 0
+        else:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+    # Saves per 90 (only meaningful for GKs, but compute for all - model filters)
+    df['saves_per90'] = np.where(sufficient_minutes, df['saves'] / mins_90, np.nan)
+    df['saves_per90'] = df['saves_per90'].clip(upper=12.0)
+
+    for window in [3, 5, 10]:
+        df[f'saves_per90_roll{window}'] = df.groupby('player_id')['saves_per90'].transform(
+            lambda x: x.shift(1).rolling(window, min_periods=1).mean()
+        )
+
+    # Raw saves rolling (recent form counts)
+    df['saves_last1'] = df.groupby('player_id')['saves'].shift(1).fillna(0)
+    for window in [3, 5]:
+        df[f'saves_roll{window}'] = df.groupby('player_id')['saves'].transform(
+            lambda x: x.shift(1).rolling(window, min_periods=1).mean()
+        )
+
+    # xGoT faced per 90 (shot quality faced by GK)
+    df['xgot_faced_per90'] = np.where(sufficient_minutes, df['xgot_faced'] / mins_90, np.nan)
+    df['xgot_faced_per90'] = df['xgot_faced_per90'].clip(upper=5.0)
+
+    for window in [3, 5, 10]:
+        df[f'xgot_faced_per90_roll{window}'] = df.groupby('player_id')['xgot_faced_per90'].transform(
+            lambda x: x.shift(1).rolling(window, min_periods=1).mean()
+        )
+
+    # =========================================================================
     # DEFENSIVE STATS (DEFCON)
     # =========================================================================
-    
+
     for col in ['tackles', 'interceptions', 'clearances', 'blocks', 'recoveries']:
         if col not in df.columns:
             df[col] = 0
@@ -129,12 +181,12 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     df['CBIT'] = df['clearances'] + df['blocks'] + df['interceptions'] + df['tackles']
     df['CBIRT'] = df['CBIT'] + df['recoveries']
     
-    # Position indicators
-    pos = df['position'].fillna(2).astype(str)
-    df['is_gk'] = (pos == '0').astype(int)
-    df['is_def'] = (pos == '1').astype(int)
-    df['is_mid'] = (pos == '2').astype(int)
-    df['is_fwd'] = (pos == '3').astype(int)
+    # Position indicators (position may be int, float, or string)
+    pos = df['position'].fillna(2).astype(float).astype(int)
+    df['is_gk'] = (pos == 0).astype(int)
+    df['is_def'] = (pos == 1).astype(int)
+    df['is_mid'] = (pos == 2).astype(int)
+    df['is_fwd'] = (pos == 3).astype(int)
     
     # Defcon based on position
     df['defcon'] = np.where(df['is_def'] == 1, df['CBIT'], df['CBIRT'])
@@ -171,11 +223,18 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
                 lambda x: x.shift(1).expanding().sum()
             )
     
+    # Goalkeeper stats (lifetime)
+    for stat in ['saves', 'xgot_faced']:
+        if stat in df.columns:
+            df[f'lifetime_{stat}'] = df.groupby('player_name')[stat].transform(
+                lambda x: x.shift(1).expanding().sum()
+            )
+
     # Defensive stats (lifetime)
     df['lifetime_defcon'] = df.groupby('player_name')['defcon'].transform(
         lambda x: x.shift(1).expanding().sum()
     )
-    for col in ['tackles', 'interceptions', 'clearances', 'blocks', 'recoveries']:
+    for col in ['tackles', 'interceptions', 'clearances', 'blocks', 'recoveries', 'fouls_committed']:
         df[f'lifetime_{col}'] = df.groupby('player_name')[col].transform(
             lambda x: x.shift(1).expanding().sum()
         )
@@ -203,13 +262,20 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
         df['lifetime_defcon'].fillna(0) / lifetime_mins_90,
         0
     )
-    for col in ['tackles', 'interceptions', 'clearances']:
+    for col in ['tackles', 'interceptions', 'clearances', 'fouls_committed']:
         df[f'lifetime_{col}_per90'] = np.where(
             df['lifetime_minutes'] >= 90,
             df[f'lifetime_{col}'].fillna(0) / lifetime_mins_90,
             0
         )
-    
+
+    # Lifetime goalkeeper per 90
+    df['lifetime_saves_per90'] = np.where(
+        df['lifetime_minutes'] >= 90,
+        df['lifetime_saves'].fillna(0) / lifetime_mins_90,
+        0
+    )
+
     df['lifetime_appearances'] = df.groupby('player_name').cumcount()
     df['lifetime_mins_per_app'] = np.where(
         df['lifetime_appearances'] > 0,
@@ -234,11 +300,43 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
             )
     
     df = df.merge(
-        team_stats[['team', 'season', 'gameweek', 'team_goals_roll5', 'team_xg_roll5', 
+        team_stats[['team', 'season', 'gameweek', 'team_goals_roll5', 'team_xg_roll5',
                     'team_goals_roll10', 'team_xg_roll10']],
         on=['team', 'season', 'gameweek'], how='left'
     )
-    
+
+    # =========================================================================
+    # PLAYER SHARE / CENTRALITY FEATURES
+    # =========================================================================
+
+    # Merge raw per-match team totals for share computation
+    df = df.merge(
+        team_stats[['team', 'season', 'gameweek', 'team_goals', 'team_xg', 'team_shots']],
+        on=['team', 'season', 'gameweek'], how='left'
+    )
+
+    # Per-match share ratios (only for games with sufficient minutes and non-zero team totals)
+    for player_col, team_col, share_name in [
+        ('xg', 'team_xg', 'xg_share'),
+        ('shots', 'team_shots', 'shot_share'),
+        ('goals', 'team_goals', 'goal_share'),
+    ]:
+        df[share_name] = np.where(
+            sufficient_minutes & (df[team_col] > 0),
+            df[player_col] / df[team_col].clip(lower=0.1),
+            np.nan
+        )
+
+    # Rolling share features (shifted to prevent leakage)
+    for share_col in ['xg_share', 'shot_share', 'goal_share']:
+        df[f'{share_col}_roll5'] = df.groupby('player_id')[share_col].transform(
+            lambda x: x.shift(1).rolling(5, min_periods=1).mean()
+        )
+
+    # Drop intermediate columns
+    df = df.drop(columns=['team_goals', 'team_xg', 'team_shots',
+                          'xg_share', 'shot_share', 'goal_share'], errors='ignore')
+
     # =========================================================================
     # TEAM DEFENSIVE STATS (Goals Conceded, xGA)
     # =========================================================================
@@ -327,37 +425,70 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
             on=['opponent_norm', 'season', 'gameweek'], how='left'
         )
         
-        # Opponent's defensive weakness (goals they concede = xGA)
-        opp_defense = team_conceded[['team_norm', 'season', 'gameweek', 
+        # Opponent's defensive weakness (goals they concede = xGA) + CS rate
+        opp_defense = team_conceded[['team_norm', 'season', 'gameweek',
                                      'goals_conceded', 'xga',
                                      'team_conceded_roll5', 'team_conceded_roll10',
-                                     'team_xga_roll5', 'team_xga_roll10']].copy()
+                                     'team_xga_roll5', 'team_xga_roll10',
+                                     'team_cs_rate_roll5', 'team_cs_rate_roll10']].copy()
         opp_defense = opp_defense.rename(columns={
             'team_norm': 'opponent_norm',
             'team_conceded_roll5': 'opp_conceded_roll5',
-            'team_conceded_roll10': 'opp_conceded_roll10', 
+            'team_conceded_roll10': 'opp_conceded_roll10',
             'team_xga_roll5': 'opp_xga_roll5',
-            'team_xga_roll10': 'opp_xga_roll10'
+            'team_xga_roll10': 'opp_xga_roll10',
+            'team_cs_rate_roll5': 'opp_cs_rate_roll5',
+            'team_cs_rate_roll10': 'opp_cs_rate_roll10',
         })
-        
+
         df = df.merge(
-            opp_defense[['opponent_norm', 'season', 'gameweek', 
+            opp_defense[['opponent_norm', 'season', 'gameweek',
                         'opp_conceded_roll5', 'opp_conceded_roll10',
-                        'opp_xga_roll5', 'opp_xga_roll10']],
+                        'opp_xga_roll5', 'opp_xga_roll10',
+                        'opp_cs_rate_roll5', 'opp_cs_rate_roll10']],
             on=['opponent_norm', 'season', 'gameweek'], how='left'
         )
         
         # Clean up temporary normalized columns
         df = df.drop(columns=['team_norm', 'opponent_norm'], errors='ignore')
-    
+
+    # =========================================================================
+    # FORM TREND FEATURES (short-term vs medium-term momentum)
+    # =========================================================================
+
+    df['xg_trend'] = df['xg_per90_roll3'] - df['xg_per90_roll10']
+    df['goals_trend'] = df['goals_per90_roll3'] - df['goals_per90_roll10']
+    df['xa_trend'] = df['xa_per90_roll3'] - df['xa_per90_roll10']
+    df['assists_trend'] = df['assists_per90_roll3'] - df['assists_per90_roll10']
+    df['minutes_trend'] = df['minutes_roll3'] - df['minutes_roll10']
+    df['defcon_trend'] = df['defcon_per90_roll5'] - df['defcon_per90_roll10']
+
+    # =========================================================================
+    # xG OVER/UNDERPERFORMANCE (regression-to-mean signal)
+    # =========================================================================
+
+    df['xg_overperformance_roll10'] = df['goals_per90_roll10'] - df['xg_per90_roll10']
+    df['xa_overperformance_roll10'] = df['assists_per90_roll10'] - df['xa_per90_roll10']
+    df['lifetime_xg_overperformance'] = df['lifetime_goals_per90'] - df['lifetime_xg_per90']
+
+    # =========================================================================
+    # INTERACTION FEATURES (player ability x opponent weakness)
+    # =========================================================================
+
+    df['xg_x_opp_conceded'] = df['xg_per90_roll5'] * df['opp_conceded_roll5']
+    df['xa_x_opp_conceded'] = df['xa_per90_roll5'] * df['opp_conceded_roll5']
+    df['team_goals_x_opp_conceded'] = df['team_goals_roll5'] * df['opp_conceded_roll5']
+    df['defcon_x_opp_xg'] = df['defcon_per90_roll5'] * df['opp_xg_roll5']
+
     # =========================================================================
     # CLEAN UP
     # =========================================================================
     
     df = df.drop(columns=['was_starter', 'was_full_90'], errors='ignore')
     
-    # Fill NaN in rolling columns
-    rolling_cols = [c for c in df.columns if 'roll' in c or 'lifetime' in c or 'last_' in c]
+    # Fill NaN in rolling/derived columns
+    rolling_cols = [c for c in df.columns if 'roll' in c or 'lifetime' in c or 'last_' in c
+                    or 'trend' in c or 'overperformance' in c or '_x_' in c]
     for col in rolling_cols:
         df[col] = df[col].fillna(0)
     

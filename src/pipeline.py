@@ -10,7 +10,7 @@ from typing import Dict, Optional
 
 from .data_loader import load_player_stats, load_fixtures, merge_fixtures, get_fpl_positions, map_fpl_position, get_fpl_availability
 from .features import compute_rolling_features
-from .models import GoalsModel, AssistsModel, MinutesModel, DefconModel, CleanSheetModel, BonusModel
+from .models import GoalsModel, AssistsModel, MinutesModel, DefconModel, CleanSheetModel, BonusModel, CardsModel, SavesModel
 
 
 # FPL point values
@@ -19,7 +19,10 @@ FPL_POINTS = {
     'assist': 3,
     'clean_sheet': {'GK': 4, 'DEF': 4, 'MID': 1, 'FWD': 0},
     'goals_conceded_2': {'GK': -1, 'DEF': -1, 'MID': 0, 'FWD': 0},  # Per 2 goals conceded
+    'saves_per_3': 1,  # 1 point per 3 saves (GK only)
     'defcon': 2,
+    'yellow_card': -1,
+    'red_card': -3,
     'appearance_60': 2,
     'appearance_1': 1,
 }
@@ -181,7 +184,17 @@ class FPLPipeline:
         # Bonus model (not tuned - uses Monte Carlo simulation)
         self.models['bonus'] = BonusModel()
         self.models['bonus'].fit(self.df, verbose)
-        
+
+        # Cards model (fouls -> yellow/red card expectations)
+        cards_params = self.tuned_params.get('cards', {})
+        self.models['cards'] = CardsModel(**cards_params)
+        self.models['cards'].fit(self.df, verbose)
+
+        # Saves model (GK only - saves per 90)
+        saves_params = self.tuned_params.get('saves', {})
+        self.models['saves'] = SavesModel(**saves_params)
+        self.models['saves'].fit(self.df, verbose)
+
         return self
     
     def _generate_oof_team_goals(self, verbose: bool = True):
@@ -309,7 +322,7 @@ class FPLPipeline:
         
         # Default to tuning these models (includes clean_sheet classifier)
         if models is None:
-            models = ['goals', 'assists', 'minutes', 'defcon', 'clean_sheet']
+            models = ['goals', 'assists', 'minutes', 'defcon', 'clean_sheet', 'saves']
         
         if verbose:
             print("\n" + "=" * 60)
@@ -405,12 +418,13 @@ class FPLPipeline:
             'assists': ('MAE', mae_scorer),
             'defcon': ('RMSE', rmse_scorer),
             'minutes': ('Huber Loss', huber_scorer),
+            'saves': ('MAE', mae_scorer),
         }
 
         SEARCH_SPACES = {
             'goals': {
                 'n_estimators': (100, 400),
-                'max_depth': (3, 10),
+                'max_depth': (3, 7),
                 'learning_rate': (0.01, 0.3, 'log'),
                 'min_child_weight': (1, 10),
                 'colsample_bytree': (0.4, 1.0),
@@ -420,7 +434,7 @@ class FPLPipeline:
             },
             'assists': {
                 'n_estimators': (100, 400),
-                'max_depth': (3, 10),
+                'max_depth': (3, 7),
                 'learning_rate': (0.01, 0.3, 'log'),
                 'min_child_weight': (1, 10),
                 'colsample_bytree': (0.4, 1.0),
@@ -430,7 +444,7 @@ class FPLPipeline:
             },
             'minutes': {
                 'n_estimators': (100, 400),
-                'max_depth': (3, 8),
+                'max_depth': (3, 7),
                 'learning_rate': (0.01, 0.3, 'log'),
                 'min_child_weight': (1, 15),
                 'colsample_bytree': (0.4, 1.0),
@@ -440,7 +454,7 @@ class FPLPipeline:
             },
             'defcon': {
                 'n_estimators': (100, 400),
-                'max_depth': (3, 10),
+                'max_depth': (3, 7),
                 'learning_rate': (0.01, 0.3, 'log'),
                 'min_child_weight': (1, 10),
                 'colsample_bytree': (0.4, 1.0),
@@ -458,6 +472,16 @@ class FPLPipeline:
                 'reg_alpha': (1e-3, 10.0, 'log'),
                 'reg_lambda': (1e-3, 10.0, 'log'),
             },
+            'saves': {
+                'n_estimators': (100, 400),
+                'max_depth': (3, 7),
+                'learning_rate': (0.01, 0.3, 'log'),
+                'min_child_weight': (1, 10),
+                'colsample_bytree': (0.4, 1.0),
+                'subsample': (0.6, 1.0),
+                'reg_alpha': (1e-3, 10.0, 'log'),
+                'reg_lambda': (1e-3, 10.0, 'log'),
+            },
         }
 
         MODEL_CLASSES = {
@@ -466,6 +490,7 @@ class FPLPipeline:
             'minutes': MinutesModel,
             'defcon': DefconModel,
             'clean_sheet': CleanSheetModel,
+            'saves': SavesModel,
         }
 
         tuned_params = {}
@@ -489,8 +514,13 @@ class FPLPipeline:
             target = model_instance.TARGET
             n_total_features = len(all_features)
 
-            X_full = df_train[all_features].fillna(0).values
-            y = df_train[target].fillna(0).values
+            # Filter to GKs only for saves model
+            tune_df = df_train
+            if model_name == 'saves':
+                tune_df = df_train[df_train['is_gk'] == 1].copy()
+
+            X_full = tune_df[all_features].fillna(0).values
+            y = tune_df[target].fillna(0).values
 
             if verbose:
                 print(f"\nTuning {model_name.upper()} ({n_iter} trials, TimeSeriesSplit CV, {score_name})...")
@@ -513,7 +543,7 @@ class FPLPipeline:
                 }
 
                 model = xgb.XGBRegressor(**params)
-                scores = cross_val_score(model, X_full, y, cv=tscv, scoring=scorer, n_jobs=-1)
+                scores = cross_val_score(model, X_full, y, cv=tscv, scoring=scorer, n_jobs=1)
                 return -scores.mean()
 
             study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=42))
@@ -533,7 +563,7 @@ class FPLPipeline:
                 cv=tscv,
                 scoring=scorer,
                 min_features_to_select=5,
-                n_jobs=-1,
+                n_jobs=1,
             )
             rfecv.fit(X_full, y)
 
@@ -608,7 +638,7 @@ class FPLPipeline:
             }
 
             model = xgb.XGBRegressor(**params)
-            scores = cross_val_score(model, X_full, y, cv=tscv, scoring=poisson_scorer, n_jobs=-1)
+            scores = cross_val_score(model, X_full, y, cv=tscv, scoring=poisson_scorer, n_jobs=1)
             return -scores.mean()
 
         study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=42))
@@ -628,7 +658,7 @@ class FPLPipeline:
             cv=tscv,
             scoring=poisson_scorer,
             min_features_to_select=5,
-            n_jobs=-1,
+            n_jobs=1,
         )
         rfecv.fit(X_full, y)
 
@@ -652,7 +682,7 @@ class FPLPipeline:
         2. RFECV with best hyperparams finds the optimal feature subset
 
         Uses appropriate loss functions:
-        - Goals, Assists: MAE
+        - Goals, Assists, Saves: MAE
         - Defcon: RMSE
         - Minutes: Huber loss (robust to outliers)
         - Goals Against (clean sheet): Poisson deviance (count data)
@@ -669,6 +699,7 @@ class FPLPipeline:
             'defcon': 'RMSE',
             'minutes': 'Huber Loss',
             'clean_sheet': 'Poisson Deviance',
+            'saves': 'MAE',
         }
 
         SEARCH_SPACES_CS = {
@@ -721,7 +752,7 @@ import xgboost as xgb
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 sys.path.insert(0, r"{self.data_dir.parent}")
-from src.models import GoalsModel, AssistsModel, MinutesModel, DefconModel
+from src.models import GoalsModel, AssistsModel, MinutesModel, DefconModel, SavesModel
 
 def huber_loss(y_true, y_pred, delta=10.0):
     residual = np.abs(y_true - y_pred)
@@ -736,6 +767,7 @@ SCORING = {{
     'assists': 'neg_mean_absolute_error',
     'defcon': 'neg_root_mean_squared_error',
     'minutes': huber_scorer,
+    'saves': 'neg_mean_absolute_error',
 }}
 
 MODEL_CLASSES = {{
@@ -743,12 +775,13 @@ MODEL_CLASSES = {{
     'assists': AssistsModel,
     'minutes': MinutesModel,
     'defcon': DefconModel,
+    'saves': SavesModel,
 }}
 
 SEARCH_SPACES = {{
     'goals': {{
         'n_estimators': (100, 400),
-        'max_depth': (3, 10),
+        'max_depth': (3, 7),
         'learning_rate': (0.01, 0.3),
         'min_child_weight': (1, 10),
         'colsample_bytree': (0.4, 1.0),
@@ -758,7 +791,7 @@ SEARCH_SPACES = {{
     }},
     'assists': {{
         'n_estimators': (100, 400),
-        'max_depth': (3, 10),
+        'max_depth': (3, 7),
         'learning_rate': (0.01, 0.3),
         'min_child_weight': (1, 10),
         'colsample_bytree': (0.4, 1.0),
@@ -768,7 +801,7 @@ SEARCH_SPACES = {{
     }},
     'minutes': {{
         'n_estimators': (100, 400),
-        'max_depth': (3, 8),
+        'max_depth': (3, 7),
         'learning_rate': (0.01, 0.3),
         'min_child_weight': (1, 15),
         'colsample_bytree': (0.4, 1.0),
@@ -778,7 +811,17 @@ SEARCH_SPACES = {{
     }},
     'defcon': {{
         'n_estimators': (100, 400),
-        'max_depth': (3, 10),
+        'max_depth': (3, 7),
+        'learning_rate': (0.01, 0.3),
+        'min_child_weight': (1, 10),
+        'colsample_bytree': (0.4, 1.0),
+        'subsample': (0.6, 1.0),
+        'reg_alpha': (1e-3, 10.0),
+        'reg_lambda': (1e-3, 10.0),
+    }},
+    'saves': {{
+        'n_estimators': (100, 400),
+        'max_depth': (3, 7),
         'learning_rate': (0.01, 0.3),
         'min_child_weight': (1, 10),
         'colsample_bytree': (0.4, 1.0),
@@ -802,6 +845,10 @@ all_features = [f for f in model_instance.FEATURES if f in df_train.columns]
 target = model_instance.TARGET
 n_total_features = len(all_features)
 
+# Filter to GKs only for saves model
+if model_name == 'saves':
+    df_train = df_train[df_train['is_gk'] == 1].copy()
+
 X_full = df_train[all_features].fillna(0).values
 y = df_train[target].fillna(0).values
 
@@ -824,7 +871,7 @@ def objective(trial):
     }}
 
     model = xgb.XGBRegressor(**params)
-    scores = cross_val_score(model, X_full, y, cv=tscv, scoring=scorer, n_jobs=-1)
+    scores = cross_val_score(model, X_full, y, cv=tscv, scoring=scorer, n_jobs=1)
     return -scores.mean()
 
 study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=42))
@@ -843,7 +890,7 @@ rfecv = RFECV(
     cv=tscv,
     scoring=scorer,
     min_features_to_select=5,
-    n_jobs=-1,
+    n_jobs=1,
 )
 rfecv.fit(X_full, y)
 
@@ -941,14 +988,16 @@ with open(r"{temp_result_path}", 'w') as f:
             'assists': AssistsModel,
             'minutes': MinutesModel,
             'defcon': DefconModel,
+            'saves': SavesModel,
         }
-        
+
         # Model-specific primary metrics (for regressors)
         PRIMARY_METRICS = {
             'goals': ('MAE', mean_absolute_error),
             'assists': ('MAE', mean_absolute_error),
             'defcon': ('RMSE', rmse),
             'minutes': ('Huber Loss', huber_loss),
+            'saves': ('MAE', mean_absolute_error),
         }
         
         # Store test metrics
@@ -969,14 +1018,21 @@ with open(r"{temp_result_path}", 'w') as f:
             model_instance = model_class(**params)
             features = [f for f in model_instance.features_to_use if f in df_train.columns]
             target = model_instance.TARGET
-            
+
+            # Filter to GKs only for saves model
+            eval_train = df_train
+            eval_test = df_test
+            if model_name == 'saves':
+                eval_train = df_train[df_train['is_gk'] == 1]
+                eval_test = df_test[df_test['is_gk'] == 1]
+
             # Prepare train data
-            X_train = df_train[features].fillna(0).values
-            y_train = df_train[target].fillna(0).values
-            
+            X_train = eval_train[features].fillna(0).values
+            y_train = eval_train[target].fillna(0).values
+
             # Prepare test data
-            X_test = df_test[features].fillna(0).values
-            y_test = df_test[target].fillna(0).values
+            X_test = eval_test[features].fillna(0).values
+            y_test = eval_test[target].fillna(0).values
             
             # Train on train set (filter out non-XGB params like selected_features)
             xgb_params = {k: v for k, v in params.items() if k != 'selected_features'}
@@ -1058,7 +1114,10 @@ with open(r"{temp_result_path}", 'w') as f:
         
         # Get test data - latest features for players
         test_df = self._build_test_set(gameweek, season, verbose)
-        
+
+        # Recompute interaction features (opponent stats were updated by _build_test_set)
+        test_df = self._recompute_interaction_features(test_df)
+
         if len(test_df) == 0:
             print("WARNING: No players found for prediction")
             return pd.DataFrame()
@@ -1082,7 +1141,24 @@ with open(r"{temp_result_path}", 'w') as f:
         test_df['pred_assists_per90'] = self.models['assists'].predict(test_df)
         test_df['pred_exp_assists'] = self.models['assists'].predict_expected(test_df, test_df['pred_minutes'])
         test_df['pred_defcon_prob'] = self.models['defcon'].predict_threshold_prob(test_df, test_df['pred_minutes'])
-        
+
+        # Cards predictions
+        test_df['pred_yellow_prob'] = self.models['cards'].predict_expected_yellows(test_df, test_df['pred_minutes'])
+        test_df['pred_red_prob'] = self.models['cards'].predict_expected_reds(test_df, test_df['pred_minutes'])
+
+        # Saves predictions (GK only, 0 for outfield)
+        test_df['pred_exp_saves'] = 0.0
+        gk_mask = test_df['is_gk'] == 1
+        if gk_mask.any():
+            gk_df = test_df[gk_mask]
+            test_df.loc[gk_mask, 'pred_exp_saves'] = self.models['saves'].predict_expected_saves(
+                gk_df, gk_df['pred_minutes'].values
+            )
+
+        # 4+ goals conceded probability (from Poisson on predicted goals against)
+        from scipy.stats import poisson
+        test_df['pred_4plus_conceded'] = 1.0 - poisson.cdf(3, test_df['pred_goals_against'].values)
+
         # FPL positions (needed for bonus)
         self.fpl_positions = get_fpl_positions()
         test_df['fpl_position'] = test_df.apply(
@@ -1142,8 +1218,10 @@ with open(r"{temp_result_path}", 'w') as f:
         # Columns to take from first fixture (player identity, rolling features, etc.)
         skip_cols = set(sum_cols + ['opponent', 'is_home', 'fixture_num',
                                       'pred_minutes', 'pred_goals_per90', 'pred_assists_per90',
-                                      'pred_cs_prob', 'pred_2plus_conceded', 'pred_goals_against',
-                                      'pred_team_goals', 'pred_defcon_prob', 'pred_bonus'])
+                                      'pred_cs_prob', 'pred_2plus_conceded', 'pred_4plus_conceded',
+                                      'pred_goals_against', 'pred_team_goals',
+                                      'pred_defcon_prob', 'pred_yellow_prob', 'pred_red_prob',
+                                      'pred_bonus'])
 
         # Aggregate DGW rows per player
         agg_rows = []
@@ -1158,13 +1236,16 @@ with open(r"{temp_result_path}", 'w') as f:
 
             # Sum key prediction columns too
             for col in ['pred_minutes', 'pred_exp_goals', 'pred_exp_assists',
-                        'pred_bonus', 'pred_defcon_prob']:
+                        'pred_bonus', 'pred_defcon_prob',
+                        'pred_yellow_prob', 'pred_red_prob',
+                        'pred_exp_saves']:
                 if col in group.columns:
                     base[col] = group[col].sum()
 
             # Average probability-based columns (don't sum probabilities)
-            for col in ['pred_cs_prob', 'pred_2plus_conceded', 'pred_goals_against',
-                        'pred_team_goals', 'pred_goals_per90', 'pred_assists_per90']:
+            for col in ['pred_cs_prob', 'pred_2plus_conceded', 'pred_4plus_conceded',
+                        'pred_goals_against', 'pred_team_goals',
+                        'pred_goals_per90', 'pred_assists_per90']:
                 if col in group.columns:
                     base[col] = group[col].mean()
 
@@ -1383,6 +1464,10 @@ with open(r"{temp_result_path}", 'w') as f:
                     row[f'opp_conceded_roll{window}'] = opp_stats[f'team_conceded_roll{window}']
                 if f'team_xga_roll{window}' in opp_stats:
                     row[f'opp_xga_roll{window}'] = opp_stats[f'team_xga_roll{window}']
+            # Opponent's clean sheet rate
+            for window in [5, 10]:
+                if f'team_cs_rate_roll{window}' in opp_stats:
+                    row[f'opp_cs_rate_roll{window}'] = opp_stats[f'team_cs_rate_roll{window}']
     
     def _update_team_features(self, row: dict, team_name: str, team_stats_lookup: dict):
         """Update team features to latest values (fixes stale stats for players who missed games)."""
@@ -1414,6 +1499,20 @@ with open(r"{temp_result_path}", 'w') as f:
             if 'team_xg_roll10' in team_stats:
                 row['team_xg_roll10'] = team_stats['team_xg_roll10']
     
+    def _recompute_interaction_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Recompute interaction features after opponent stats have been updated.
+
+        _update_opponent_features overwrites opp_* columns with actual fixture
+        opponent stats, but interaction columns (products of player x opponent)
+        remain stale from historical data. This recalculates them.
+        """
+        df = df.copy()
+        df['xg_x_opp_conceded'] = df['xg_per90_roll5'].fillna(0) * df['opp_conceded_roll5'].fillna(0)
+        df['xa_x_opp_conceded'] = df['xa_per90_roll5'].fillna(0) * df['opp_conceded_roll5'].fillna(0)
+        df['team_goals_x_opp_conceded'] = df['team_goals_roll5'].fillna(0) * df['opp_conceded_roll5'].fillna(0)
+        df['defcon_x_opp_xg'] = df['defcon_per90_roll5'].fillna(0) * df['opp_xg_roll5'].fillna(0)
+        return df
+
     def _get_gw_fixtures(self, gameweek: int, season: str, verbose: bool = True) -> pd.DataFrame:
         """Get fixtures for a gameweek from FPL API or local data."""
         import requests
@@ -1591,18 +1690,31 @@ with open(r"{temp_result_path}", 'w') as f:
             if pos in ['DEF', 'MID'] and mins >= 60:
                 defcon_pts = row.get('pred_defcon_prob', 0) * FPL_POINTS['defcon']
             
+            # Saves (GK only) - 1 point per 3 saves
+            saves_pts = 0
+            if pos == 'GK':
+                exp_saves = row.get('pred_exp_saves', 0)
+                saves_pts = (exp_saves / 3) * FPL_POINTS['saves_per_3']
+
             # Bonus
             bonus_pts = row.get('pred_bonus', 0)
-            
+
+            # Yellow/Red cards (all positions)
+            yellow_pts = row.get('pred_yellow_prob', 0) * FPL_POINTS['yellow_card']
+            red_pts = row.get('pred_red_prob', 0) * FPL_POINTS['red_card']
+
             return pd.Series({
                 'exp_goals_pts': goal_pts,
                 'exp_assists_pts': assist_pts,
                 'exp_cs_pts': cs_pts,
                 'exp_conceded_penalty': conceded_penalty,
+                'exp_saves_pts': saves_pts,
                 'exp_defcon_pts': defcon_pts,
                 'exp_bonus_pts': bonus_pts,
+                'exp_yellow_pts': yellow_pts,
+                'exp_red_pts': red_pts,
                 'exp_appearance_pts': app_pts,
-                'exp_total_pts': app_pts + goal_pts + assist_pts + cs_pts + conceded_penalty + defcon_pts + bonus_pts
+                'exp_total_pts': app_pts + goal_pts + assist_pts + cs_pts + conceded_penalty + saves_pts + defcon_pts + bonus_pts + yellow_pts + red_pts
             })
         
         points_df = df.apply(calc_points, axis=1)
@@ -1612,7 +1724,8 @@ with open(r"{temp_result_path}", 'w') as f:
         """Get top N players by expected points."""
         cols = ['player_name', 'team', 'fpl_position', 'fixture_num', 'opponent', 'is_home',
                 'pred_minutes', 'pred_exp_goals', 'pred_exp_assists',
-                'pred_team_goals', 'pred_cs_prob', 'pred_2plus_conceded',
-                'pred_goals_against', 'pred_defcon_prob', 'pred_bonus', 'exp_total_pts']
+                'pred_team_goals', 'pred_cs_prob', 'pred_2plus_conceded', 'pred_4plus_conceded',
+                'pred_goals_against', 'pred_defcon_prob', 'pred_yellow_prob', 'pred_red_prob',
+                'pred_bonus', 'exp_total_pts']
         available_cols = [c for c in cols if c in predictions.columns]
         return predictions.nlargest(n, 'exp_total_pts')[available_cols]

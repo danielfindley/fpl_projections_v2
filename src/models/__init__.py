@@ -5,3 +5,5 @@ from .minutes import MinutesModel
 from .defcon import DefconModel
 from .clean_sheet import CleanSheetModel
 from .bonus import BonusModel
+from .cards import CardsModel
+from .saves import SavesModel

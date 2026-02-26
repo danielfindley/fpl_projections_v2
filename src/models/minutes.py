@@ -30,6 +30,9 @@ class MinutesModel:
         # Position
         'is_gk', 'is_def', 'is_mid', 'is_fwd',
         
+        # Form trend
+        'minutes_trend',
+
         # Match context
         'is_home', 'team_goals_roll5',
     ]
