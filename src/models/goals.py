@@ -4,8 +4,8 @@ from .base import BaseModel
 
 
 class GoalsModel(BaseModel):
-    """Predicts goals per 90 minutes rate."""
-    
+    """Predicts goals per 90 minutes rate using Poisson objective."""
+
     FEATURES = [
         # Player xG/shooting
         'xg_per90_roll3', 'xg_per90_roll5', 'xg_per90_roll10',
@@ -48,9 +48,13 @@ class GoalsModel(BaseModel):
         # Match context
         'is_home',
     ]
-    
+
     TARGET = 'goals_per90'
-    
+
+    def __init__(self, **xgb_params):
+        xgb_params.setdefault('objective', 'count:poisson')
+        super().__init__(**xgb_params)
+
     def _get_y_max(self) -> float:
         return 3.0
     

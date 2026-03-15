@@ -2,21 +2,20 @@
 import pandas as pd
 import numpy as np
 import xgboost as xgb
-from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, r2_score
 from abc import ABC, abstractmethod
 
 
 class BaseModel(ABC):
     """Abstract base class for FPL prediction models."""
-    
+
     FEATURES = []
     TARGET = ''
-    
+
     def __init__(self, **xgb_params):
         # Extract selected_features if provided (from tuning)
         self.selected_features = xgb_params.pop('selected_features', None)
-        
+
         default_params = {
             'n_estimators': 200,
             'max_depth': 5,
@@ -26,7 +25,6 @@ class BaseModel(ABC):
         }
         default_params.update(xgb_params)
         self.model = xgb.XGBRegressor(**default_params)
-        self.scaler = StandardScaler()
         self.is_fitted = False
     
     @property
@@ -52,11 +50,9 @@ class BaseModel(ABC):
         y = df[self.TARGET].fillna(0).values
         y = np.clip(y, 0, self._get_y_max())
         
-        X_scaled = self.scaler.fit_transform(X)
-        
         # Weight by minutes
         weights = df['minutes'].values / df['minutes'].mean()
-        
+
         if verbose:
             n_features = len(self.features_to_use)
             feature_info = f"({n_features} features"
@@ -66,12 +62,12 @@ class BaseModel(ABC):
                 feature_info += ")"
             print(f"Training {self.__class__.__name__} on {len(X):,} samples {feature_info}...")
             print(f"  Target mean: {y.mean():.4f}")
-        
-        self.model.fit(X_scaled, y, sample_weight=weights)
+
+        self.model.fit(X, y, sample_weight=weights)
         self.is_fitted = True
-        
+
         if verbose:
-            y_pred = self.model.predict(X_scaled)
+            y_pred = self.model.predict(X)
             print(f"  MAE: {mean_absolute_error(y, y_pred):.4f}")
         
         return self
@@ -82,8 +78,7 @@ class BaseModel(ABC):
             raise ValueError("Model not fitted")
         
         X = self._prepare_X(df)
-        X_scaled = self.scaler.transform(X)
-        return np.clip(self.model.predict(X_scaled), 0, self._get_y_max())
+        return np.clip(self.model.predict(X), 0, self._get_y_max())
     
     def feature_importance(self) -> pd.DataFrame:
         """Get feature importance."""

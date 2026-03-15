@@ -93,7 +93,7 @@ Two-phase approach per model using Optuna + RFECV:
 
 1. **Phase 1**: Optuna tunes XGBoost hyperparameters (100 trials, TimeSeriesSplit 5-fold CV)
    - Search space: `n_estimators`, `max_depth`, `learning_rate`, `min_child_weight`, `colsample_bytree`, `subsample`, `reg_alpha`, `reg_lambda`
-   - Loss functions: MAE (goals, assists, saves), RMSE (defcon), Huber (minutes), Poisson deviance (clean sheet)
+   - Loss functions: Poisson deviance (goals, assists, clean sheet), MAE (saves), RMSE (defcon), Huber (minutes)
 2. **Phase 2**: RFECV selects optimal feature subset using best hyperparameters
 3. **Evaluation**: Train on temporal train set, evaluate on held-out test set
 

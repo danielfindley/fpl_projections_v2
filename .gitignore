@@ -2,6 +2,7 @@
 data/players/
 data/matches/
 data/predictions/
+data/experiments.db
 *.csv
 
 # Python cache

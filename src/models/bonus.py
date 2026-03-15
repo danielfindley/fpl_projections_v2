@@ -421,6 +421,7 @@ class BonusModel:
         self.baseline_model = BaselineBPSModel(**xgb_params)
         self.is_fitted = False
         self.fpl_availability = {}
+        self._last_simulations = None
     
     def fit(self, df: pd.DataFrame, verbose: bool = True):
         """Train the baseline BPS model."""
@@ -583,58 +584,79 @@ class BonusModel:
             all_cs * cs_bps
         ) * playing_mask
         
-        # Compute bonus per match
-        total_bonus = np.zeros(n)
+        # Compute bonus per match via BPS ranking
+        all_bonus = np.zeros((n_sims, n))
         unique_matches = np.unique(match_groups)
         match_to_indices = {m: np.where(match_groups == m)[0] for m in unique_matches}
-        
+
         for match_id, match_idx in match_to_indices.items():
             if len(match_idx) == 0:
                 continue
-            
+
             # Get BPS for this match across all simulations: (n_sims, n_match)
             match_bps = all_bps[:, match_idx]
-            
+
             # Initialize match bonus
             match_bonus = np.zeros((n_sims, len(match_idx)))
-            
+
             # For each simulation, rank players and award bonus
             for sim in range(n_sims):
                 bps_sim = match_bps[sim]
-                
+
                 # Only consider players who are actually playing
                 playing_in_match = bps_sim > 0
                 if not np.any(playing_in_match):
                     continue
-                
+
                 sorted_idx = np.argsort(-bps_sim)
                 sorted_bps = bps_sim[sorted_idx]
-                
+
                 # Award 3, 2, 1 handling ties
                 bonus_to_award = [3, 2, 1]
                 bonus_idx = 0
                 i = 0
-                
+
                 while i < len(sorted_idx) and bonus_idx < 3:
                     if sorted_bps[i] <= 0:  # Skip non-playing players
                         i += 1
                         continue
-                    
+
                     # Find all tied at this BPS level
                     tied_mask = bps_sim == sorted_bps[i]
                     n_tied = np.sum(tied_mask)
-                    
+
                     # Award current bonus to all tied players
                     match_bonus[sim, tied_mask] = bonus_to_award[bonus_idx]
-                    
+
                     # Move to next bonus level
                     bonus_idx += 1
                     i += n_tied
-            
-            total_bonus[match_idx] = match_bonus.mean(axis=0)
-        
-        return total_bonus
+
+            all_bonus[:, match_idx] = match_bonus
+
+        # Store per-simulation arrays for distribution visualization
+        self._last_simulations = {
+            'goals': all_goals,       # (n_sims, n_players)
+            'assists': all_assists,    # (n_sims, n_players)
+            'cs': all_cs,             # (n_sims, n_players) binary
+            'bonus': all_bonus,       # (n_sims, n_players) 0-3
+        }
+
+        return all_bonus.mean(axis=0)
     
+    def get_last_simulations(self) -> dict:
+        """Return per-simulation arrays from the last predict() call.
+
+        Returns dict with keys:
+            goals:  (n_sims, n_players) sampled goals
+            assists: (n_sims, n_players) sampled assists
+            cs:     (n_sims, n_players) binary clean sheet
+            bonus:  (n_sims, n_players) awarded bonus 0-3
+        """
+        if self._last_simulations is None:
+            raise ValueError("No simulations available. Call predict() first.")
+        return self._last_simulations
+
     def feature_importance(self) -> pd.DataFrame:
         """Get feature importance from baseline model."""
         return self.baseline_model.feature_importance()
