@@ -1,0 +1,44 @@
+{
+  "minutes": {
+    "metric_name": "Huber Loss",
+    "primary": 141.16406746746893,
+    "MAE": 17.44574292768915,
+    "classifier": {
+      "AUC": 0.8390511508951406,
+      "Accuracy": 0.7909638554216868,
+      "LogLoss": 0.44666144570374255
+    },
+    "starter_MAE": 12.230241906124613,
+    "sub_MAE": 29.206186407687618
+  },
+  "goals": {
+    "metric_name": "Poisson Dev",
+    "primary": 0.3759150012172756,
+    "MAE": 0.15211502412945616
+  },
+  "assists": {
+    "metric_name": "Poisson Dev",
+    "primary": 0.33282558169369386,
+    "MAE": 0.11984388223198433
+  },
+  "defcon": {
+    "metric_name": "RMSE",
+    "primary": 16.27617493454804,
+    "MAE": 5.925077056532748
+  },
+  "saves": {
+    "metric_name": "MAE",
+    "primary": 1.4192873048374794,
+    "MAE": 1.4192873048374794
+  },
+  "clean_sheet": {
+    "metric_name": "Poisson Dev",
+    "primary": 1.0964489278501053,
+    "MAE": 0.8770670698748695
+  },
+  "_fpl_points_mae": {
+    "mae_ex_bonus": 1.7437330016522872,
+    "mae_inc_bonus": 1.801324809000993,
+    "bonus_mae": 0.22048240963855423
+  }
+}

@@ -31,11 +31,11 @@ Data scraping: `python scrape_update_data.py --gameweek 28` or `--auto`
 ### Pipeline stages (src/pipeline.py)
 `load_data()` → `compute_features()` → `tune()` → `train()` → `predict()`
 
-**Training order matters**: CleanSheetModel trains first and generates `pred_team_goals` via TimeSeriesSplit OOF predictions, which Goals and Assists models consume as a feature (leak-free).
+**Training order matters**: MinutesModel trains first (generates `pred_minutes`), then CleanSheetModel (generates `pred_team_goals` via TimeSeriesSplit OOF). Goals and Assists models consume both `pred_minutes` and `pred_team_goals` as features (leak-free).
 
 ### Model hierarchy (src/models/)
 - **BaseModel** (`base.py`): Abstract class with XGBoost + minute-weighted training (no scaler — trees don't need it). Subclasses define `FEATURES`, `TARGET`, and `_get_y_max()`.
-- **BaseModel subclasses**: GoalsModel (Poisson objective for log-link on skewed rate data), AssistsModel, DefconModel, SavesModel, CardsModel — all follow the same fit/predict pattern.
+- **BaseModel subclasses**: GoalsModel (Poisson objective on raw match counts), AssistsModel (Poisson objective on raw match counts), DefconModel, SavesModel, CardsModel — all follow the same fit/predict pattern.
 - **Custom models** (don't inherit BaseModel): MinutesModel (custom capping logic), CleanSheetModel (Poisson regression for goals-against lambda, raw Poisson CS probs with prior_lambda anchor, home/away split season stats, team-level aggregates), BonusModel (Monte Carlo BPS simulation).
 
 ### Feature engineering (src/features.py)
@@ -44,14 +44,14 @@ Data scraping: `python scrape_update_data.py --gameweek 28` or `--auto`
 Per-90 stats are capped (e.g., xg_per90 at 2.0) to prevent inflation from low-minute appearances.
 
 ### Tuning (two-phase, inside pipeline.tune())
-1. **Optuna** tunes XGBoost hyperparams (TimeSeriesSplit 5-fold CV on temporal train set)
-2. **RFECV** selects optimal feature subset with best hyperparams
+1. **Optuna** tunes XGBoost hyperparams on all features (TimeSeriesSplit 5-fold CV, `n_iter` trials)
+2. **RFECV** selects optimal feature subset using best hyperparams from Phase 1
 3. Results saved to `data/tuning_results/{model}_tuned.json`
 
-Loss functions per model: Poisson deviance (goals, assists, clean sheet), MAE (saves), RMSE (defcon), Huber (minutes). Goals and Assists use `count:poisson` objective + Poisson deviance eval metric — matching objective to eval is best practice for count data and produces better-calibrated rate estimates. RFECV min_features_to_select is 15 for goals (to prevent over-pruning), 5 for other models.
+Loss functions per model: Poisson deviance (goals, assists, clean sheet), MAE (saves), RMSE (defcon), Huber (minutes). Goals and Assists use `count:poisson` objective + Poisson deviance eval metric on raw match counts (0, 1, 2, ...) — true Poisson count data. `pred_minutes` is a feature so the model learns the minutes-count relationship internally. RFECV min_features_to_select is 15 for goals (to prevent over-pruning), 5 for other models.
 
 ### Prediction flow
-Per-90 model outputs are converted to expected counts via `pred_rate × (pred_minutes / 90)`, then mapped to FPL points using position-specific multipliers (see README.md for full formula). BonusModel uses Monte Carlo simulation of match outcomes.
+Goals and Assists models output expected match counts directly (no per-90 scaling needed). These are mapped to FPL points using position-specific multipliers (see README.md for full formula). BonusModel uses Monte Carlo simulation of match outcomes.
 
 ## Key Conventions
 

@@ -1,10 +1,10 @@
-"""Goals per 90 prediction model."""
+"""Goals prediction model — predicts raw match goal counts."""
 import numpy as np
 from .base import BaseModel
 
 
 class GoalsModel(BaseModel):
-    """Predicts goals per 90 minutes rate using Poisson objective."""
+    """Predicts expected goals per match using Poisson objective on raw counts."""
 
     FEATURES = [
         # Player xG/shooting
@@ -45,20 +45,18 @@ class GoalsModel(BaseModel):
         # Match-specific predicted team goals (from CleanSheetModel, leak-free OOF)
         'pred_team_goals',
 
+        # Predicted minutes (from MinutesModel — trained first)
+        'pred_minutes',
+
         # Match context
         'is_home',
     ]
 
-    TARGET = 'goals_per90'
+    TARGET = 'goals'
 
     def __init__(self, **xgb_params):
         xgb_params.setdefault('objective', 'count:poisson')
         super().__init__(**xgb_params)
 
     def _get_y_max(self) -> float:
-        return 3.0
-    
-    def predict_expected(self, df, pred_minutes) -> np.ndarray:
-        """Predict expected goals = per90 rate * (minutes/90)."""
-        per90 = self.predict(df)
-        return per90 * (np.array(pred_minutes) / 90)
+        return 4.0

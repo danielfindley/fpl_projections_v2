@@ -1,11 +1,11 @@
-"""Assists per 90 prediction model."""
+"""Assists prediction model — predicts raw match assist counts."""
 import numpy as np
 from .base import BaseModel
 
 
 class AssistsModel(BaseModel):
-    """Predicts assists per 90 minutes rate."""
-    
+    """Predicts expected assists per match using Poisson objective on raw counts."""
+
     FEATURES = [
         # Player xA/creativity
         'xa_per90_roll3', 'xa_per90_roll5', 'xa_per90_roll10',
@@ -45,16 +45,18 @@ class AssistsModel(BaseModel):
         # Match-specific predicted team goals (from CleanSheetModel, leak-free OOF)
         'pred_team_goals',
 
+        # Predicted minutes (from MinutesModel — trained first)
+        'pred_minutes',
+
         # Match context
         'is_home',
     ]
-    
-    TARGET = 'assists_per90'
-    
+
+    TARGET = 'assists'
+
+    def __init__(self, **xgb_params):
+        xgb_params.setdefault('objective', 'count:poisson')
+        super().__init__(**xgb_params)
+
     def _get_y_max(self) -> float:
-        return 3.0
-    
-    def predict_expected(self, df, pred_minutes) -> np.ndarray:
-        """Predict expected assists = per90 rate * (minutes/90)."""
-        per90 = self.predict(df)
-        return per90 * (np.array(pred_minutes) / 90)
+        return 4.0

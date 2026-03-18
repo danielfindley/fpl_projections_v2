@@ -279,6 +279,17 @@ def log_predictions(
     return len(rows)
 
 
+def clear_experiments(data_dir: str = 'data'):
+    """Delete all experiment and model_results rows. Predictions are kept."""
+    conn = _connect(data_dir)
+    try:
+        conn.execute("DELETE FROM model_results")
+        conn.execute("DELETE FROM experiments")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def get_predictions(
     data_dir: str = 'data',
     gameweek: Optional[int] = None,

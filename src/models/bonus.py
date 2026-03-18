@@ -416,7 +416,7 @@ class BonusModel:
     TARGET = 'bonus'
     FEATURES = BaselineBPSModel.FEATURES.copy()
     
-    def __init__(self, n_simulations: int = 1000, **xgb_params):
+    def __init__(self, n_simulations: int = 5000, **xgb_params):
         self.n_simulations = n_simulations
         self.baseline_model = BaselineBPSModel(**xgb_params)
         self.is_fitted = False
