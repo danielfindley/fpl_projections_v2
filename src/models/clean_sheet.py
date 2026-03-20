@@ -24,16 +24,19 @@ class CleanSheetModel:
         'naive_cs_prob',
 
         # Interaction features
-        'xga_x_opp_xg_roll10', 'xga_x_opp_xg_roll5',
-        'def_actions_x_opp_shots_roll5',
+        'xga_x_opp_xg_roll1', 'xga_x_opp_xg_roll2', 'xga_x_opp_xg_roll3',
+        'xga_x_opp_xg_roll5', 'xga_x_opp_xg_roll7', 'xga_x_opp_xg_roll10',
+        'def_actions_x_opp_shots_roll1', 'def_actions_x_opp_shots_roll2', 'def_actions_x_opp_shots_roll3',
+        'def_actions_x_opp_shots_roll5', 'def_actions_x_opp_shots_roll7', 'def_actions_x_opp_shots_roll10',
 
         # Ratio features (team defensive strength relative to opponent)
-        'xga_div_opp_xg_roll10', 'xga_div_opp_xg_roll5',
+        'xga_div_opp_xg_roll1', 'xga_div_opp_xg_roll2', 'xga_div_opp_xg_roll3',
+        'xga_div_opp_xg_roll5', 'xga_div_opp_xg_roll7', 'xga_div_opp_xg_roll10',
 
         # Team defensive history
-        'team_xga_roll3', 'team_xga_roll5', 'team_xga_roll10', 'team_xga_roll30',
-        'team_conceded_roll5', 'team_conceded_roll10', 'team_conceded_roll30',
-        'team_cs_roll5', 'team_cs_roll10', 'team_cs_roll30',
+        'team_xga_roll1', 'team_xga_roll2', 'team_xga_roll3', 'team_xga_roll5', 'team_xga_roll7', 'team_xga_roll10', 'team_xga_roll30',
+        'team_conceded_roll1', 'team_conceded_roll2', 'team_conceded_roll3', 'team_conceded_roll5', 'team_conceded_roll7', 'team_conceded_roll10', 'team_conceded_roll30',
+        'team_cs_roll1', 'team_cs_roll2', 'team_cs_roll3', 'team_cs_roll5', 'team_cs_roll7', 'team_cs_roll10', 'team_cs_roll30',
         'team_xga_ewm',
 
         # Team identity proxy (season-to-date defensive level)
@@ -43,18 +46,18 @@ class CleanSheetModel:
         'ha_season_xga', 'ha_season_cs_rate',
 
         # Team defensive quality aggregates
-        'team_def_actions_roll10',
-        'team_clearances_roll5',
-        'team_shots_faced_roll10',
+        'team_def_actions_roll1', 'team_def_actions_roll2', 'team_def_actions_roll3', 'team_def_actions_roll5', 'team_def_actions_roll7', 'team_def_actions_roll10',
+        'team_clearances_roll1', 'team_clearances_roll2', 'team_clearances_roll3', 'team_clearances_roll5', 'team_clearances_roll7', 'team_clearances_roll10',
+        'team_shots_faced_roll1', 'team_shots_faced_roll2', 'team_shots_faced_roll3', 'team_shots_faced_roll5', 'team_shots_faced_roll7', 'team_shots_faced_roll10',
 
         # Team possession proxy
-        'team_passes_roll5', 'team_passes_roll10',
-        'team_touches_roll5', 'team_touches_roll10',
+        'team_passes_roll1', 'team_passes_roll2', 'team_passes_roll3', 'team_passes_roll5', 'team_passes_roll7', 'team_passes_roll10',
+        'team_touches_roll1', 'team_touches_roll2', 'team_touches_roll3', 'team_touches_roll5', 'team_touches_roll7', 'team_touches_roll10',
 
         # Opponent attacking quality
-        'opp_xg_roll5', 'opp_xg_roll10',
-        'opp_key_passes_roll10',
-        'opp_shots_ot_roll5', 'opp_shots_ot_roll10',
+        'opp_xg_roll1', 'opp_xg_roll2', 'opp_xg_roll3', 'opp_xg_roll5', 'opp_xg_roll7', 'opp_xg_roll10',
+        'opp_key_passes_roll1', 'opp_key_passes_roll2', 'opp_key_passes_roll3', 'opp_key_passes_roll5', 'opp_key_passes_roll7', 'opp_key_passes_roll10',
+        'opp_shots_ot_roll1', 'opp_shots_ot_roll2', 'opp_shots_ot_roll3', 'opp_shots_ot_roll5', 'opp_shots_ot_roll7', 'opp_shots_ot_roll10',
 
         # Opponent identity proxy (season-to-date attacking level)
         'opp_season_goals_per_game', 'opp_season_xg_per_game',
@@ -153,6 +156,9 @@ class CleanSheetModel:
         team_match = team_match.sort_values(['team_norm', 'season', 'gameweek'])
 
         # --- Rolling features ---
+        _TEAM_WINDOWS = [1, 2, 3, 5, 7, 10, 30]
+        _PLAYER_WINDOWS = [1, 2, 3, 5, 7, 10]
+
         def _roll(source_col, prefix, windows):
             for w in windows:
                 team_match[f'{prefix}_roll{w}'] = team_match.groupby('team_norm')[source_col].transform(
@@ -160,13 +166,13 @@ class CleanSheetModel:
                 )
 
         # Team defensive
-        _roll('goals_conceded', 'team_conceded', [1, 3, 5, 10, 30])
-        _roll('xga', 'team_xga', [1, 3, 5, 10, 30])
-        _roll('clean_sheet', 'team_cs', [1, 3, 5, 10, 30])
+        _roll('goals_conceded', 'team_conceded', _TEAM_WINDOWS)
+        _roll('xga', 'team_xga', _TEAM_WINDOWS)
+        _roll('clean_sheet', 'team_cs', _TEAM_WINDOWS)
 
         # Team offensive (needed for opponent lookup at prediction time)
-        _roll('goals', 'team_scored', [5, 10])
-        _roll('xg', 'team_xg_scored', [5, 10])
+        _roll('goals', 'team_scored', _PLAYER_WINDOWS)
+        _roll('xg', 'team_xg_scored', _PLAYER_WINDOWS)
 
         # EWMA for xGA (reacts faster to form changes than rolling mean)
         team_match['team_xga_ewm'] = team_match.groupby('team_norm')['xga'].transform(
@@ -174,13 +180,13 @@ class CleanSheetModel:
         )
 
         # Defensive quality aggregates
-        _roll('def_actions', 'team_def_actions', [5, 10])
-        _roll('clearances', 'team_clearances', [5])
-        _roll('gk_workload', 'team_shots_faced', [5, 10])
+        _roll('def_actions', 'team_def_actions', _PLAYER_WINDOWS)
+        _roll('clearances', 'team_clearances', _PLAYER_WINDOWS)
+        _roll('gk_workload', 'team_shots_faced', _PLAYER_WINDOWS)
 
         # Possession proxy
-        _roll('accurate_passes', 'team_passes', [5, 10])
-        _roll('touches', 'team_touches', [5, 10])
+        _roll('accurate_passes', 'team_passes', _PLAYER_WINDOWS)
+        _roll('touches', 'team_touches', _PLAYER_WINDOWS)
 
         # --- Season-to-date team identity features (shifted to avoid leakage) ---
         team_match['season_cs_rate'] = team_match.groupby(['team_norm', 'season'])['clean_sheet'].transform(
@@ -195,7 +201,7 @@ class CleanSheetModel:
                                    'goals', 'xg', 'key_passes', 'shots_on_target']].copy()
         for col, pfx in [('goals', 'opp_scored'), ('xg', 'opp_xg'),
                           ('key_passes', 'opp_key_passes'), ('shots_on_target', 'opp_shots_ot')]:
-            for w in [5, 10]:
+            for w in _PLAYER_WINDOWS:
                 opp_offense[f'{pfx}_roll{w}'] = opp_offense.groupby('team_norm')[col].transform(
                     lambda x: x.shift(1).rolling(w, min_periods=1).mean()
                 )
@@ -216,19 +222,14 @@ class CleanSheetModel:
         opp_lookup = opp_lookup.rename(columns={'team_norm': 'opponent_norm'})
         team_match = team_match.merge(opp_lookup, on=['opponent_norm', 'season', 'gameweek'], how='left')
 
-        # --- Interaction features ---
-        team_match['xga_x_opp_xg_roll5'] = (team_match['team_xga_roll5'].fillna(0)
-                                              * team_match['opp_xg_roll5'].fillna(0))
-        team_match['xga_x_opp_xg_roll10'] = (team_match['team_xga_roll10'].fillna(0)
-                                               * team_match['opp_xg_roll10'].fillna(0))
-        team_match['def_actions_x_opp_shots_roll5'] = (team_match['team_def_actions_roll5'].fillna(0)
-                                                        * team_match['opp_shots_ot_roll5'].fillna(0))
-
-        # --- Ratio features (better for elite defenses than multiplicative) ---
-        team_match['xga_div_opp_xg_roll5'] = (team_match['team_xga_roll5'].fillna(1.0)
-                                                / (team_match['opp_xg_roll5'].fillna(1.0) + 0.01))
-        team_match['xga_div_opp_xg_roll10'] = (team_match['team_xga_roll10'].fillna(1.0)
-                                                 / (team_match['opp_xg_roll10'].fillna(1.0) + 0.01))
+        # --- Interaction and ratio features (computed for all standard windows) ---
+        for w in _PLAYER_WINDOWS:
+            team_match[f'xga_x_opp_xg_roll{w}'] = (team_match[f'team_xga_roll{w}'].fillna(0)
+                                                     * team_match[f'opp_xg_roll{w}'].fillna(0))
+            team_match[f'def_actions_x_opp_shots_roll{w}'] = (team_match[f'team_def_actions_roll{w}'].fillna(0)
+                                                               * team_match[f'opp_shots_ot_roll{w}'].fillna(0))
+            team_match[f'xga_div_opp_xg_roll{w}'] = (team_match[f'team_xga_roll{w}'].fillna(1.0)
+                                                       / (team_match[f'opp_xg_roll{w}'].fillna(1.0) + 0.01))
 
         # --- Home/away split season stats ---
         # Arsenal's home xGA is much lower than overall; this captures venue-specific identity

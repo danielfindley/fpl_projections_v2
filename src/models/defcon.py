@@ -15,16 +15,19 @@ class DefconModel(BaseModel):
 
     FEATURES = [
         # Raw defcon rolling counts
-        'defcon_roll3', 'defcon_roll5', 'defcon_roll10',
+        'defcon_roll1', 'defcon_roll2', 'defcon_roll3', 'defcon_roll5', 'defcon_roll7', 'defcon_roll10',
         'defcon_last1',
 
         # Defcon per-90 rolling (rate features)
-        'defcon_per90_roll5', 'defcon_per90_roll10',
-        'hit_threshold_roll5', 'hit_threshold_roll10',
+        'defcon_per90_roll1', 'defcon_per90_roll2', 'defcon_per90_roll3', 'defcon_per90_roll5', 'defcon_per90_roll7', 'defcon_per90_roll10',
+        'hit_threshold_roll1', 'hit_threshold_roll2', 'hit_threshold_roll3', 'hit_threshold_roll5', 'hit_threshold_roll7', 'hit_threshold_roll10',
 
         # Component stats (rolling per-90 rates)
-        'tackles_per90_roll5', 'interceptions_per90_roll5',
-        'clearances_per90_roll5', 'blocks_per90_roll5', 'recoveries_per90_roll5',
+        'tackles_per90_roll1', 'tackles_per90_roll2', 'tackles_per90_roll3', 'tackles_per90_roll5', 'tackles_per90_roll7', 'tackles_per90_roll10',
+        'interceptions_per90_roll1', 'interceptions_per90_roll2', 'interceptions_per90_roll3', 'interceptions_per90_roll5', 'interceptions_per90_roll7', 'interceptions_per90_roll10',
+        'clearances_per90_roll1', 'clearances_per90_roll2', 'clearances_per90_roll3', 'clearances_per90_roll5', 'clearances_per90_roll7', 'clearances_per90_roll10',
+        'blocks_per90_roll1', 'blocks_per90_roll2', 'blocks_per90_roll3', 'blocks_per90_roll5', 'blocks_per90_roll7', 'blocks_per90_roll10',
+        'recoveries_per90_roll1', 'recoveries_per90_roll2', 'recoveries_per90_roll3', 'recoveries_per90_roll5', 'recoveries_per90_roll7', 'recoveries_per90_roll10',
 
         # Lifetime defensive profile
         'lifetime_minutes',
@@ -35,7 +38,8 @@ class DefconModel(BaseModel):
         'is_def', 'is_mid',
 
         # Opponent context (more attacks = more defensive actions)
-        'opp_xg_roll5', 'opp_goals_roll5', 'opp_xg_roll10',
+        'opp_xg_roll1', 'opp_xg_roll2', 'opp_xg_roll3', 'opp_xg_roll5', 'opp_xg_roll7', 'opp_xg_roll10',
+        'opp_goals_roll1', 'opp_goals_roll2', 'opp_goals_roll3', 'opp_goals_roll5', 'opp_goals_roll7', 'opp_goals_roll10',
 
         # Interaction (defensive work x opponent attacking strength)
         'defcon_x_opp_xg',

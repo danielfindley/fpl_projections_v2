@@ -21,10 +21,12 @@ class CardsModel:
 
     FEATURES = [
         # Fouls history (primary predictor)
-        'fouls_committed_per90_roll3', 'fouls_committed_per90_roll5', 'fouls_committed_per90_roll10',
+        'fouls_committed_per90_roll1', 'fouls_committed_per90_roll2', 'fouls_committed_per90_roll3',
+        'fouls_committed_per90_roll5', 'fouls_committed_per90_roll7', 'fouls_committed_per90_roll10',
 
         # Yellow card history (from FPL merge)
-        'yellow_cards_roll3', 'yellow_cards_roll5', 'yellow_cards_roll10',
+        'yellow_cards_roll1', 'yellow_cards_roll2', 'yellow_cards_roll3',
+        'yellow_cards_roll5', 'yellow_cards_roll7', 'yellow_cards_roll10',
         'yellow_per_foul_roll10',
         'lifetime_yellow_cards_per90',
 
@@ -33,14 +35,19 @@ class CardsModel:
         'lifetime_minutes',
 
         # Defensive activity (correlated with card-worthy fouls)
-        'tackles_per90_roll5', 'interceptions_per90_roll5',
-        'defcon_per90_roll5',
+        'tackles_per90_roll1', 'tackles_per90_roll2', 'tackles_per90_roll3',
+        'tackles_per90_roll5', 'tackles_per90_roll7', 'tackles_per90_roll10',
+        'interceptions_per90_roll1', 'interceptions_per90_roll2', 'interceptions_per90_roll3',
+        'interceptions_per90_roll5', 'interceptions_per90_roll7', 'interceptions_per90_roll10',
+        'defcon_per90_roll1', 'defcon_per90_roll2', 'defcon_per90_roll3',
+        'defcon_per90_roll5', 'defcon_per90_roll7', 'defcon_per90_roll10',
 
         # Position (defenders/mids get carded more)
         'is_def', 'is_mid', 'is_fwd',
 
         # Opponent context (stronger opponents = more tactical fouls)
-        'opp_xg_roll5', 'opp_goals_roll5',
+        'opp_xg_roll1', 'opp_xg_roll2', 'opp_xg_roll3', 'opp_xg_roll5', 'opp_xg_roll7', 'opp_xg_roll10',
+        'opp_goals_roll1', 'opp_goals_roll2', 'opp_goals_roll3', 'opp_goals_roll5', 'opp_goals_roll7', 'opp_goals_roll10',
 
         # Match context
         'is_home',
@@ -48,13 +55,19 @@ class CardsModel:
 
     # Features for fouls regression (red card prediction)
     _FOULS_FEATURES = [
-        'fouls_committed_per90_roll3', 'fouls_committed_per90_roll5', 'fouls_committed_per90_roll10',
+        'fouls_committed_per90_roll1', 'fouls_committed_per90_roll2', 'fouls_committed_per90_roll3',
+        'fouls_committed_per90_roll5', 'fouls_committed_per90_roll7', 'fouls_committed_per90_roll10',
         'lifetime_fouls_committed_per90',
         'lifetime_minutes',
-        'tackles_per90_roll5', 'interceptions_per90_roll5',
-        'defcon_per90_roll5',
+        'tackles_per90_roll1', 'tackles_per90_roll2', 'tackles_per90_roll3',
+        'tackles_per90_roll5', 'tackles_per90_roll7', 'tackles_per90_roll10',
+        'interceptions_per90_roll1', 'interceptions_per90_roll2', 'interceptions_per90_roll3',
+        'interceptions_per90_roll5', 'interceptions_per90_roll7', 'interceptions_per90_roll10',
+        'defcon_per90_roll1', 'defcon_per90_roll2', 'defcon_per90_roll3',
+        'defcon_per90_roll5', 'defcon_per90_roll7', 'defcon_per90_roll10',
         'is_def', 'is_mid', 'is_fwd',
-        'opp_xg_roll5', 'opp_goals_roll5',
+        'opp_xg_roll1', 'opp_xg_roll2', 'opp_xg_roll3', 'opp_xg_roll5', 'opp_xg_roll7', 'opp_xg_roll10',
+        'opp_goals_roll1', 'opp_goals_roll2', 'opp_goals_roll3', 'opp_goals_roll5', 'opp_goals_roll7', 'opp_goals_roll10',
         'is_home',
     ]
 

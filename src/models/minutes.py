@@ -15,11 +15,12 @@ from sklearn.metrics import mean_absolute_error
 # Shared feature list (classifier uses all, regressors use subsets)
 ALL_FEATURES = [
     # Minutes history
-    'last_minutes', 'minutes_roll3', 'minutes_roll5', 'minutes_roll10',
+    'last_minutes', 'minutes_roll1', 'minutes_roll2', 'minutes_roll3', 'minutes_roll5', 'minutes_roll7', 'minutes_roll10',
 
     # Starting likelihood
-    'starter_score', 'starter_rate_roll5', 'starter_rate_roll10',
-    'full90_rate_roll5', 'full90_rate_roll10',
+    'starter_score',
+    'starter_rate_roll1', 'starter_rate_roll2', 'starter_rate_roll3', 'starter_rate_roll5', 'starter_rate_roll7', 'starter_rate_roll10',
+    'full90_rate_roll1', 'full90_rate_roll2', 'full90_rate_roll3', 'full90_rate_roll5', 'full90_rate_roll7', 'full90_rate_roll10',
     'last_was_starter', 'last_was_full_90',
 
     # Lifetime profile
@@ -29,7 +30,9 @@ ALL_FEATURES = [
     'current_season_minutes', 'current_season_apps', 'current_season_mins_per_app',
 
     # Goal involvement (key players play more)
-    'goals_roll5', 'assists_roll5', 'goal_involvements_roll5',
+    'goals_roll2', 'goals_roll3', 'goals_roll5', 'goals_roll7', 'goals_roll10',
+    'assists_roll2', 'assists_roll3', 'assists_roll5', 'assists_roll7', 'assists_roll10',
+    'goal_involvements_roll5',
 
     # Position
     'is_gk', 'is_def', 'is_mid', 'is_fwd',
@@ -38,29 +41,31 @@ ALL_FEATURES = [
     'minutes_trend',
 
     # Match context
-    'is_home', 'team_goals_roll5',
+    'is_home',
+    'team_goals_roll1', 'team_goals_roll2', 'team_goals_roll3', 'team_goals_roll5', 'team_goals_roll7', 'team_goals_roll10',
 
     # Opponent strength (rotation signal)
-    'opp_goals_roll5', 'opp_xg_roll5',
+    'opp_goals_roll1', 'opp_goals_roll2', 'opp_goals_roll3', 'opp_goals_roll5', 'opp_goals_roll7', 'opp_goals_roll10',
+    'opp_xg_roll1', 'opp_xg_roll2', 'opp_xg_roll3', 'opp_xg_roll5', 'opp_xg_roll7', 'opp_xg_roll10',
 
     # Fixture context
     'gameweek',
 
     # Player importance to team
-    'goal_share_roll5', 'xg_per90_roll5',
-
-    # Longer-term team form
-    'team_goals_roll10',
+    'goal_share_roll1', 'goal_share_roll2', 'goal_share_roll3', 'goal_share_roll5', 'goal_share_roll7', 'goal_share_roll10',
+    'xg_per90_roll1', 'xg_per90_roll2', 'xg_per90_roll3', 'xg_per90_roll5', 'xg_per90_roll7', 'xg_per90_roll10',
 ]
 
 # Starter regressor: features that matter for how long starters play
 STARTER_FEATURES = [
-    'last_minutes', 'minutes_roll3', 'minutes_roll5', 'minutes_roll10',
-    'starter_score', 'full90_rate_roll5', 'full90_rate_roll10',
+    'last_minutes', 'minutes_roll1', 'minutes_roll2', 'minutes_roll3', 'minutes_roll5', 'minutes_roll7', 'minutes_roll10',
+    'starter_score',
+    'full90_rate_roll1', 'full90_rate_roll2', 'full90_rate_roll3', 'full90_rate_roll5', 'full90_rate_roll7', 'full90_rate_roll10',
     'last_was_full_90',
     'lifetime_mins_per_app',
     'current_season_mins_per_app', 'current_season_apps',
-    'goals_roll5', 'goal_involvements_roll5',
+    'goals_roll2', 'goals_roll3', 'goals_roll5', 'goals_roll7', 'goals_roll10',
+    'goal_involvements_roll5',
     'is_gk', 'is_def', 'is_mid', 'is_fwd',
     'minutes_trend',
     'is_home',
@@ -69,8 +74,9 @@ STARTER_FEATURES = [
 
 # Sub regressor: features focused on sub patterns
 SUB_FEATURES = [
-    'last_minutes', 'minutes_roll3', 'minutes_roll5',
-    'starter_score', 'starter_rate_roll5',
+    'last_minutes', 'minutes_roll1', 'minutes_roll2', 'minutes_roll3', 'minutes_roll5', 'minutes_roll7', 'minutes_roll10',
+    'starter_score',
+    'starter_rate_roll1', 'starter_rate_roll2', 'starter_rate_roll3', 'starter_rate_roll5', 'starter_rate_roll7', 'starter_rate_roll10',
     'last_was_starter',
     'lifetime_mins_per_app',
     'current_season_mins_per_app', 'current_season_apps',

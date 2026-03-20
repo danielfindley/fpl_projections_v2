@@ -15,25 +15,25 @@ class SavesModel:
 
     FEATURES = [
         # Saves history (rolling per90 rates)
-        'saves_per90_roll3', 'saves_per90_roll5', 'saves_per90_roll10',
+        'saves_per90_roll1', 'saves_per90_roll2', 'saves_per90_roll3', 'saves_per90_roll5', 'saves_per90_roll7', 'saves_per90_roll10',
 
         # Recent saves form (raw counts)
-        'saves_last1', 'saves_roll3', 'saves_roll5',
+        'saves_last1', 'saves_roll2', 'saves_roll3', 'saves_roll5', 'saves_roll7', 'saves_roll10',
 
         # Shot quality faced (xGoT faced per 90)
-        'xgot_faced_per90_roll3', 'xgot_faced_per90_roll5', 'xgot_faced_per90_roll10',
+        'xgot_faced_per90_roll1', 'xgot_faced_per90_roll2', 'xgot_faced_per90_roll3', 'xgot_faced_per90_roll5', 'xgot_faced_per90_roll7', 'xgot_faced_per90_roll10',
 
         # Lifetime goalkeeper profile
         'lifetime_saves_per90',
         'lifetime_minutes',
 
         # Team defensive context (leaky defense = more saves)
-        'team_conceded_roll5', 'team_conceded_roll10',
-        'team_xga_roll5', 'team_xga_roll10',
+        'team_conceded_roll1', 'team_conceded_roll2', 'team_conceded_roll3', 'team_conceded_roll5', 'team_conceded_roll7', 'team_conceded_roll10',
+        'team_xga_roll1', 'team_xga_roll2', 'team_xga_roll3', 'team_xga_roll5', 'team_xga_roll7', 'team_xga_roll10',
 
         # Opponent attacking strength (stronger attack = more shots = more saves)
-        'opp_xg_roll5', 'opp_xg_roll10',
-        'opp_goals_roll5', 'opp_goals_roll10',
+        'opp_xg_roll1', 'opp_xg_roll2', 'opp_xg_roll3', 'opp_xg_roll5', 'opp_xg_roll7', 'opp_xg_roll10',
+        'opp_goals_roll1', 'opp_goals_roll2', 'opp_goals_roll3', 'opp_goals_roll5', 'opp_goals_roll7', 'opp_goals_roll10',
 
         # Match context
         'is_home',
