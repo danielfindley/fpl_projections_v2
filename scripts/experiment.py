@@ -21,6 +21,7 @@ Usage:
 import sys
 import argparse
 from pathlib import Path
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -68,7 +69,7 @@ def show_history(args):
             cv = f"{m['cv_score']:.4f}" if m['cv_score'] is not None else "N/A"
             test = f"{m['test_score']:.4f}" if m['test_score'] is not None else "N/A"
             mae = f"{m['mae']:.4f}" if m['mae'] is not None else "N/A"
-            nf = str(int(m['n_features'])) if m['n_features'] is not None else "N/A"
+            nf = str(int(m['n_features'])) if pd.notna(m['n_features']) else "N/A"
             print(f"  {m['model_name']:<15} {m['metric_name'] or '':<15} {cv:<10} {test:<10} {mae:<10} {nf}")
         print()
 
