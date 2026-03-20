@@ -480,14 +480,15 @@ class BonusModel:
         
         return 1.0
     
-    def predict(self, df: pd.DataFrame, pred_goals=None, pred_assists=None, 
-                pred_cs_prob=None, pred_minutes=None, fpl_positions=None) -> np.ndarray:
+    def predict(self, df: pd.DataFrame, pred_goals=None, pred_assists=None,
+                pred_cs_prob=None, pred_minutes=None, fpl_positions=None,
+                pred_yellow_prob=None) -> np.ndarray:
         """
         Predict expected bonus using Monte Carlo simulation.
-        
+
         Players with low predicted minutes or low FPL availability are excluded
         from bonus competition.
-        
+
         Includes fixes for per90 stat inflation:
         1. Caps per90 stats at realistic maximums
         2. Applies reliability weighting based on historical minutes
@@ -519,7 +520,11 @@ class BonusModel:
         pred_assists = np.array(pred_assists)
         pred_cs_prob = np.array(pred_cs_prob)
         pred_minutes = np.array(pred_minutes)
-        
+
+        if pred_yellow_prob is None:
+            pred_yellow_prob = df.get('pred_yellow_prob', np.zeros(n))
+        pred_yellow_prob = np.array(pred_yellow_prob)
+
         # Get positions
         if fpl_positions is None:
             fpl_positions = df.get('fpl_position', pd.Series(['MID'] * n)).values
@@ -566,22 +571,25 @@ class BonusModel:
         # Monte Carlo simulation
         n_sims = self.n_simulations
         
-        # Sample goals, assists, clean sheets for all simulations
+        # Sample goals, assists, clean sheets, yellow cards for all simulations
         all_goals = np.random.poisson(np.maximum(pred_goals, 0), (n_sims, n))
         all_assists = np.random.poisson(np.maximum(pred_assists, 0), (n_sims, n))
         all_cs = ((np.random.random((n_sims, n)) < pred_cs_prob) * mins_60_mask).astype(int)
-        
+        all_yellows = (np.random.random((n_sims, n)) < np.clip(pred_yellow_prob, 0, 1)).astype(int)
+
         # Apply playing mask - non-playing players get 0 events
         all_goals = all_goals * playing_mask
         all_assists = all_assists * playing_mask
         all_cs = all_cs * playing_mask
-        
-        # Calculate total BPS for each simulation
+        all_yellows = all_yellows * playing_mask
+
+        # Calculate total BPS for each simulation (yellow cards = -3 BPS each)
         all_bps = (
             baseline_bps +
             all_goals * goal_bps +
             all_assists * BPS_RULES['assist'] +
-            all_cs * cs_bps
+            all_cs * cs_bps +
+            all_yellows * BPS_RULES['yellow_card']
         ) * playing_mask
         
         # Compute bonus per match via BPS ranking
@@ -639,6 +647,7 @@ class BonusModel:
             'goals': all_goals,       # (n_sims, n_players)
             'assists': all_assists,    # (n_sims, n_players)
             'cs': all_cs,             # (n_sims, n_players) binary
+            'yellows': all_yellows,   # (n_sims, n_players) binary
             'bonus': all_bonus,       # (n_sims, n_players) 0-3
         }
 
@@ -648,10 +657,11 @@ class BonusModel:
         """Return per-simulation arrays from the last predict() call.
 
         Returns dict with keys:
-            goals:  (n_sims, n_players) sampled goals
+            goals:   (n_sims, n_players) sampled goals
             assists: (n_sims, n_players) sampled assists
-            cs:     (n_sims, n_players) binary clean sheet
-            bonus:  (n_sims, n_players) awarded bonus 0-3
+            cs:      (n_sims, n_players) binary clean sheet
+            yellows: (n_sims, n_players) binary yellow card
+            bonus:   (n_sims, n_players) awarded bonus 0-3
         """
         if self._last_simulations is None:
             raise ValueError("No simulations available. Call predict() first.")

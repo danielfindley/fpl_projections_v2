@@ -351,3 +351,172 @@ def fetch_fpl_actual_points(gameweeks: list = None, cache_dir: str = None,
         print(f"  Total: {len(result):,} player-gameweek records")
 
     return result
+
+
+# FPL team name -> normalized name (matching FotMob conventions after lowercasing)
+_FPL_TEAM_NORMALIZE = {
+    'arsenal': 'arsenal',
+    'aston villa': 'aston villa',
+    'bournemouth': 'afc bournemouth',
+    'brentford': 'brentford',
+    'brighton': 'brighton & hove albion',
+    'chelsea': 'chelsea',
+    'crystal palace': 'crystal palace',
+    'everton': 'everton',
+    'fulham': 'fulham',
+    'ipswich': 'ipswich town',
+    'leicester': 'leicester city',
+    'liverpool': 'liverpool',
+    'man city': 'manchester city',
+    'man utd': 'manchester united',
+    'newcastle': 'newcastle united',
+    "nott'm forest": 'nottingham forest',
+    'southampton': 'southampton',
+    'spurs': 'tottenham hotspur',
+    'west ham': 'west ham united',
+    'wolves': 'wolverhampton wanderers',
+    # Historical
+    'burnley': 'burnley',
+    'luton': 'luton town',
+    'sheffield utd': 'sheffield united',
+    'leeds': 'leeds united',
+    'sunderland': 'sunderland',
+}
+
+
+def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
+                        verbose: bool = True) -> pd.DataFrame:
+    """Merge yellow/red card data from FPL API into the main DataFrame.
+
+    Fetches actual FPL points (which include yellow_cards, red_cards per
+    player per gameweek) and merges into the FotMob training data by
+    matching on player name + team + gameweek.
+
+    Args:
+        df: Main DataFrame with FotMob player-match data (must have
+            player_name, team, gameweek columns).
+        data_dir: Path to data directory (for caching FPL responses).
+        verbose: Print progress.
+
+    Returns:
+        DataFrame with yellow_cards and red_cards columns added where matched.
+    """
+    import unicodedata
+
+    def _strip_accents(s):
+        return ''.join(
+            c for c in unicodedata.normalize('NFD', str(s))
+            if unicodedata.category(c) != 'Mn'
+        )
+
+    def _norm_name(name):
+        if pd.isna(name):
+            return ''
+        return _strip_accents(str(name)).lower().strip()
+
+    def _norm_team(name):
+        if pd.isna(name):
+            return ''
+        n = str(name).lower().strip()
+        return _FPL_TEAM_NORMALIZE.get(n, n)
+
+    try:
+        fpl_df = fetch_fpl_actual_points(cache_dir=data_dir, verbose=verbose)
+    except Exception as e:
+        if verbose:
+            print(f"Warning: Could not fetch FPL card data: {e}")
+        return df
+
+    if fpl_df is None or len(fpl_df) == 0:
+        if verbose:
+            print("Warning: No FPL data returned, skipping card merge")
+        return df
+
+    # Prepare FPL side: normalize names and teams
+    fpl_df = fpl_df.copy()
+    fpl_df['_name_norm'] = fpl_df['player_name'].apply(_norm_name)
+    fpl_df['_team_norm'] = fpl_df['team'].apply(_norm_team)
+    fpl_df['gameweek'] = pd.to_numeric(fpl_df['gameweek'], errors='coerce')
+
+    # Also prepare web_name for fallback matching
+    if 'web_name' in fpl_df.columns:
+        fpl_df['_web_norm'] = fpl_df['web_name'].apply(_norm_name)
+
+    # Prepare main df side
+    df = df.copy()
+    df['_name_norm'] = df['player_name'].apply(_norm_name)
+    df['_team_norm'] = df['team'].apply(_norm_team)
+
+    # Build FPL lookup: (name_norm, team_norm, gameweek) -> dict of FPL stats
+    fpl_lookup = {}
+    for _, row in fpl_df.iterrows():
+        entry = {
+            'yellow_cards': row.get('yellow_cards', 0),
+            'red_cards': row.get('red_cards', 0),
+            'bonus': row.get('bonus', 0),
+            'actual_total_points': row.get('actual_total_points', 0),
+        }
+        key = (row['_name_norm'], row['_team_norm'], row['gameweek'])
+        fpl_lookup[key] = entry
+        # Also add web_name as alternate key
+        if '_web_norm' in row.index and row['_web_norm']:
+            alt_key = (row['_web_norm'], row['_team_norm'], row['gameweek'])
+            if alt_key not in fpl_lookup:
+                fpl_lookup[alt_key] = entry
+
+    # Detect DGW: count FotMob rows per player per gameweek.
+    # FPL reports cards per gameweek, not per match, so in a DGW we can't
+    # attribute which match the yellow came from. Exclude DGW rows from
+    # card data (NaN) — the model trains on SGW rows only (binary 0/1).
+    df['_gw_num'] = pd.to_numeric(df['gameweek'], errors='coerce')
+    matches_per_gw = df.groupby(['_name_norm', '_team_norm', '_gw_num'])['_gw_num'].transform('size')
+
+    # Match rows
+    yellows = np.full(len(df), np.nan)
+    reds = np.full(len(df), np.nan)
+    bonus = np.full(len(df), np.nan)
+    fpl_total_pts = np.full(len(df), np.nan)
+    matched = 0
+    dgw_skipped = 0
+
+    for i in range(len(df)):
+        row = df.iloc[i]
+        gw = row['_gw_num']
+        if pd.isna(gw):
+            continue
+        # Skip DGW rows — FPL reports per-gameweek totals, can't attribute per match
+        if matches_per_gw.iloc[i] > 1:
+            dgw_skipped += 1
+            continue
+        # Try full name match
+        key = (row['_name_norm'], row['_team_norm'], gw)
+        result = fpl_lookup.get(key)
+        # Try last-name-only match
+        if result is None:
+            parts = row['_name_norm'].split()
+            if len(parts) > 1:
+                last_key = (parts[-1], row['_team_norm'], gw)
+                result = fpl_lookup.get(last_key)
+        if result is not None:
+            yellows[i] = result['yellow_cards']
+            reds[i] = result['red_cards']
+            bonus[i] = result['bonus']
+            fpl_total_pts[i] = result['actual_total_points']
+            matched += 1
+
+    df['yellow_cards'] = yellows
+    df['red_cards'] = reds
+    df['bonus'] = bonus
+    df['fpl_total_points'] = fpl_total_pts
+
+    # Clean up temp columns
+    df = df.drop(columns=['_name_norm', '_team_norm', '_gw_num'], errors='ignore')
+
+    if verbose:
+        n_with_data = int(np.sum(~np.isnan(yellows)))
+        n_yellows = int(np.nansum(yellows))
+        print(f"  FPL card merge: {matched:,} rows matched, "
+              f"{n_with_data:,} with card data, {n_yellows} total yellows"
+              f"{f', {dgw_skipped:,} DGW rows excluded' if dgw_skipped > 0 else ''}")
+
+    return df

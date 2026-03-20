@@ -136,6 +136,7 @@ def _build_player_data(predictions, simulations, top_n):
             'pred_minutes': round(float(row.get('pred_minutes', 0)), 1),
             'pred_cs': round(float(row.get('pred_cs_prob', 0)) * 100, 1),
             'pred_defcon': round(float(row.get('pred_defcon_prob', 0)) * 100, 1),
+            'pred_bonus': round(float(row.get('pred_bonus', 0)), 2),
             'median': round(float(np.median(total)), 1),
             'p10': round(float(np.percentile(total, 10)), 1),
             'p90': round(float(np.percentile(total, 90)), 1),
@@ -530,6 +531,7 @@ function render() {
           <div class="tt-row"><span class="label">Prj Minutes</span><span class="value">${player.pred_minutes}</span></div>
           <div class="tt-row"><span class="label">CS %</span><span class="value">${player.pred_cs}%</span></div>
           <div class="tt-row"><span class="label">Defcon %</span><span class="value">${player.pred_defcon}%</span></div>
+          <div class="tt-row"><span class="label">Prj Bonus</span><span class="value">${player.pred_bonus}</span></div>
           <div class="tt-divider"></div>
           <div class="tt-row"><span class="label">E[pts]</span><span class="value">${player.exp_pts}</span></div>
           <div class="tt-row"><span class="label">Median</span><span class="value">${player.median}</span></div>
@@ -775,12 +777,15 @@ function render() {
         <div class="pts-badge">${player.exp_pts}<small>E[pts]</small></div>
       </div>
       <div class="chart-area"></div>
-      <div class="stats-row" style="grid-template-columns:repeat(5,1fr)">
+      <div class="stats-row" style="grid-template-columns:repeat(3,1fr)">
         <div class="stat"><div class="val">${player.pred_goals}</div><div class="lbl">Prj Goals</div></div>
         <div class="stat"><div class="val">${player.pred_assists}</div><div class="lbl">Prj Assists</div></div>
         <div class="stat"><div class="val">${player.pred_minutes}</div><div class="lbl">Prj Min</div></div>
+      </div>
+      <div class="stats-row" style="grid-template-columns:repeat(3,1fr)">
         <div class="stat"><div class="val">${player.pred_cs}%</div><div class="lbl">CS %</div></div>
         <div class="stat"><div class="val">${player.pred_defcon}%</div><div class="lbl">Defcon %</div></div>
+        <div class="stat"><div class="val">${player.pred_bonus}</div><div class="lbl">Prj Bonus</div></div>
       </div>
       <div class="stats-row">
         <div class="stat"><div class="val">${player.median}</div><div class="lbl">Median</div></div>

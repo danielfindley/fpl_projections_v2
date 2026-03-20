@@ -1,0 +1,47 @@
+[
+  {
+    "model": "Minutes",
+    "metric": "Huber Loss",
+    "score": "143.0047"
+  },
+  {
+    "model": "Goals",
+    "metric": "Poisson Dev",
+    "score": "0.3725"
+  },
+  {
+    "model": "Assists",
+    "metric": "Poisson Dev",
+    "score": "0.3310"
+  },
+  {
+    "model": "Defcon",
+    "metric": "Poisson Dev",
+    "score": "2.3040"
+  },
+  {
+    "model": "Saves",
+    "metric": "MAE",
+    "score": "1.4358"
+  },
+  {
+    "model": "Clean_sheet",
+    "metric": "Poisson Dev",
+    "score": "1.0921"
+  },
+  {
+    "model": "FPL Points",
+    "metric": "MAE (ex-bonus)",
+    "score": "1.7150"
+  },
+  {
+    "model": "FPL Points",
+    "metric": "MAE (inc-bonus)",
+    "score": "1.7675"
+  },
+  {
+    "model": "Bonus",
+    "metric": "MAE",
+    "score": "0.2205"
+  }
+]

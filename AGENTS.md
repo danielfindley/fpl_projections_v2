@@ -8,8 +8,8 @@ Improve FPL point prediction accuracy by iteratively tuning models, analyzing re
 
 Individual model metrics also matter (lower is better):
 - Goals, Assists: Poisson Deviance
+- Defcon: Poisson Deviance (training) + Negative Binomial CDF (threshold probs)
 - Saves: MAE
-- Defcon: RMSE
 - Minutes: Huber Loss
 - Clean Sheet: Poisson Deviance
 
@@ -65,7 +65,7 @@ Look at test metrics. The model with the worst relative performance (highest MAE
 ### 3. Form a hypothesis
 Examples:
 - "Goals Poisson deviance is high → try more trials (200) to explore hyperparameter space better"
-- "Assists model selected too many features → the RFECV might benefit from stricter min_features"
+- "Assists model selected too many features → try increasing n_iter so Optuna explores more feature subset sizes"
 - "Minutes model has high Huber loss → the Huber delta might need adjustment"
 - "Clean sheet Poisson deviance is high → might need more team-level features"
 
@@ -127,10 +127,12 @@ If the change improved the target metric, keep it. If not, revert the code chang
 - Per-90 rate prediction
 - Small sample size — be cautious with overfitting
 
-### Defcon (RMSE)
+### Defcon (Poisson Deviance + NB CDF)
 - Defensive contributions (clearances + blocks + interceptions + tackles + recoveries)
 - Only DEF/MID get FPL points for this
-- RMSE penalizes large errors more than MAE
+- Trained with `count:poisson` objective; Poisson deviance eval metric (consistent for mean estimation)
+- Threshold probabilities use Negative Binomial CDF to handle heavy overdispersion (var/mean ≈ 2.5–3.3x)
+- Dispersion parameter `r` estimated from Pearson residuals during `fit()`
 
 ## Rules for Sub-Agents
 

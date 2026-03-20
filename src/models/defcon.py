@@ -1,21 +1,28 @@
-"""Defensive contribution (defcon) prediction model."""
-import pandas as pd
+"""Defensive contribution (defcon) prediction model — predicts raw match counts.
+
+Uses Poisson objective for mean estimation (consistent even under overdispersion),
+but Negative Binomial CDF for threshold probabilities to account for the heavy
+overdispersion in defcon counts (var/mean ~ 2.5–3.3x).
+"""
 import numpy as np
-import xgboost as xgb
-from scipy.stats import poisson
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_absolute_error
+import pandas as pd
+from scipy.stats import nbinom
+from .base import BaseModel
 
 
-class DefconModel:
-    """Predicts defensive contribution per 90 and threshold probability."""
-    
+class DefconModel(BaseModel):
+    """Predicts expected defensive contributions per match using Poisson objective on raw counts."""
+
     FEATURES = [
-        # Defcon rolling
+        # Raw defcon rolling counts
+        'defcon_roll3', 'defcon_roll5', 'defcon_roll10',
+        'defcon_last1',
+
+        # Defcon per-90 rolling (rate features)
         'defcon_per90_roll5', 'defcon_per90_roll10',
         'hit_threshold_roll5', 'hit_threshold_roll10',
 
-        # Component stats (rolling)
+        # Component stats (rolling per-90 rates)
         'tackles_per90_roll5', 'interceptions_per90_roll5',
         'clearances_per90_roll5', 'blocks_per90_roll5', 'recoveries_per90_roll5',
 
@@ -36,87 +43,73 @@ class DefconModel:
         # Form trend
         'defcon_trend',
 
+        # Predicted minutes (from MinutesModel — trained first)
+        'pred_minutes',
+
         # Match context
         'is_home',
     ]
-    
-    TARGET = 'defcon_per90'
-    
+
+    TARGET = 'defcon'
+
     def __init__(self, **xgb_params):
-        self.selected_features = xgb_params.pop('selected_features', None)
-        
-        default_params = {
-            'n_estimators': 200,
-            'max_depth': 5,
-            'learning_rate': 0.08,
-            'random_state': 42,
-            'min_child_weight': 3,
-        }
-        default_params.update(xgb_params)
-        self.model = xgb.XGBRegressor(**default_params)
-        self.scaler = StandardScaler()
-        self.is_fitted = False
-    
-    @property
-    def features_to_use(self):
-        return self.selected_features if self.selected_features else self.FEATURES
-    
-    def _prepare_X(self, df: pd.DataFrame) -> np.ndarray:
-        df = df.copy()
-        features = self.features_to_use
-        for feat in features:
-            if feat not in df.columns:
-                df[feat] = 0
-        return df[features].fillna(0).astype(float)
-    
+        xgb_params.setdefault('objective', 'count:poisson')
+        super().__init__(**xgb_params)
+        self.dispersion_r = None
+
+    def _get_y_max(self) -> float:
+        return 30.0
+
+    def _estimate_dispersion(self, df: pd.DataFrame):
+        """Estimate Negative Binomial dispersion parameter r from training residuals.
+
+        Uses Pearson chi-squared method: φ = Σ(y-μ)²/μ / (n-1).
+        For NB: φ = 1 + mean(μ)/r, so r = mean(μ) / (φ - 1).
+        """
+        y = df[self.TARGET].fillna(0).values
+        mu = np.maximum(self.predict(df), 0.01)
+
+        pearson_chi2 = np.sum((y - mu) ** 2 / mu) / (len(y) - 1)
+
+        if pearson_chi2 <= 1.0:
+            self.dispersion_r = None
+            return
+
+        self.dispersion_r = float(np.mean(mu) / (pearson_chi2 - 1))
+        self.dispersion_r = max(self.dispersion_r, 0.5)
+
     def fit(self, df: pd.DataFrame, verbose: bool = True):
-        df = df[df['minutes'] >= 1].copy()
-        
-        X = self._prepare_X(df)
-        y = np.clip(df['defcon_per90'].fillna(0).values, 0, 30)
-        
-        X_scaled = self.scaler.fit_transform(X)
-        weights = df['minutes'].values / df['minutes'].mean()
-        
+        super().fit(df, verbose=verbose)
+
+        train_df = df[df['minutes'] >= 1].copy()
+        self._estimate_dispersion(train_df)
+
         if verbose:
-            print(f"Training DefconModel on {len(X):,} samples...")
-            print(f"  Mean defcon/90: {y.mean():.2f}")
-        
-        self.model.fit(X_scaled, y, sample_weight=weights)
-        self.is_fitted = True
-        
-        if verbose:
-            y_pred = self.model.predict(X_scaled)
-            print(f"  MAE: {mean_absolute_error(y, y_pred):.2f}")
-        
+            if self.dispersion_r is not None:
+                print(f"  NB dispersion r={self.dispersion_r:.2f} "
+                      f"(var/mean ≈ {1 + np.mean(self.predict(train_df)) / self.dispersion_r:.2f}x)")
+            else:
+                print("  No overdispersion detected, using Poisson CDF")
+
         return self
-    
-    def predict_per90(self, df: pd.DataFrame) -> np.ndarray:
-        if not self.is_fitted:
-            raise ValueError("Model not fitted")
-        X = self._prepare_X(df)
-        X_scaled = self.scaler.transform(X)
-        return np.clip(self.model.predict(X_scaled), 0, 30)
-    
-    def predict_expected(self, df, pred_minutes) -> np.ndarray:
-        per90 = self.predict_per90(df)
-        return per90 * (np.array(pred_minutes) / 90)
-    
-    def predict_threshold_prob(self, df: pd.DataFrame, pred_minutes) -> np.ndarray:
-        """Predict P(defcon >= threshold) using Poisson distribution."""
-        expected = self.predict_expected(df, pred_minutes)
+
+    def predict_threshold_prob(self, df, pred_minutes=None) -> np.ndarray:
+        """Predict P(defcon >= threshold) using Negative Binomial distribution.
+
+        Uses NB to account for overdispersion (var >> mean in defcon counts).
+        Falls back to Poisson if no overdispersion was detected during fit.
+        """
+        expected = self.predict(df)
         expected = np.maximum(expected, 0.01)
-        
-        # Threshold: DEF=10, MID/FWD=12
+
         thresholds = np.where(df['is_def'] == 1, 10, 12)
-        
-        # P(X >= threshold) = 1 - P(X <= threshold-1)
-        return np.clip(1 - poisson.cdf(thresholds - 1, expected), 0, 1)
-    
-    def feature_importance(self) -> pd.DataFrame:
-        if not self.is_fitted:
-            raise ValueError("Model not fitted")
-        return pd.DataFrame({
-            'feature': self.features_to_use,
-            'importance': self.model.feature_importances_
-        }).sort_values('importance', ascending=False)
+
+        if self.dispersion_r is not None:
+            r = self.dispersion_r
+            p = r / (r + expected)
+            probs = 1 - nbinom.cdf(thresholds - 1, r, p)
+        else:
+            from scipy.stats import poisson
+            probs = 1 - poisson.cdf(thresholds - 1, expected)
+
+        return np.clip(probs, 0, 1)

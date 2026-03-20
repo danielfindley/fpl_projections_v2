@@ -134,6 +134,30 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
         )
 
     # =========================================================================
+    # YELLOW / RED CARDS (from FPL API merge, if available)
+    # =========================================================================
+
+    if 'yellow_cards' in df.columns:
+        df['yellow_cards'] = pd.to_numeric(df['yellow_cards'], errors='coerce').fillna(0)
+        for window in [3, 5, 10]:
+            df[f'yellow_cards_roll{window}'] = df.groupby('player_id')['yellow_cards'].transform(
+                lambda x: x.shift(1).rolling(window, min_periods=1).mean()
+            )
+        # Fouls per yellow (personalized booking rate) — only where fouls > 0
+        df['_fouls_with_yellow'] = np.where(
+            df['fouls_committed'] > 0,
+            df['yellow_cards'] / df['fouls_committed'],
+            np.nan
+        )
+        df['yellow_per_foul_roll10'] = df.groupby('player_id')['_fouls_with_yellow'].transform(
+            lambda x: x.shift(1).rolling(10, min_periods=3).mean()
+        )
+        df = df.drop(columns=['_fouls_with_yellow'], errors='ignore')
+
+    if 'red_cards' in df.columns:
+        df['red_cards'] = pd.to_numeric(df['red_cards'], errors='coerce').fillna(0)
+
+    # =========================================================================
     # GOALKEEPER STATS (Saves, xGoT faced)
     # =========================================================================
 
@@ -202,6 +226,13 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
         df[f'hit_threshold_roll{window}'] = df.groupby('player_id')['hit_threshold'].transform(
             lambda x: x.shift(1).rolling(window, min_periods=1).mean()
         )
+
+    # Raw defcon rolling counts (for Poisson count model)
+    for window in [3, 5, 10]:
+        df[f'defcon_roll{window}'] = df.groupby('player_id')['defcon'].transform(
+            lambda x: x.shift(1).rolling(window, min_periods=1).mean()
+        )
+    df['defcon_last1'] = df.groupby('player_id')['defcon'].transform(lambda x: x.shift(1))
     
     # Component stats per 90
     for col in ['tackles', 'interceptions', 'clearances', 'blocks', 'recoveries']:
@@ -266,6 +297,17 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
         df[f'lifetime_{col}_per90'] = np.where(
             df['lifetime_minutes'] >= 90,
             df[f'lifetime_{col}'].fillna(0) / lifetime_mins_90,
+            0
+        )
+
+    # Lifetime yellow card per 90 (if yellow_cards column exists)
+    if 'yellow_cards' in df.columns:
+        df['lifetime_yellow_cards'] = df.groupby('player_name')['yellow_cards'].transform(
+            lambda x: x.shift(1).expanding().sum()
+        ).fillna(0)
+        df['lifetime_yellow_cards_per90'] = np.where(
+            df['lifetime_minutes'] >= 90,
+            df['lifetime_yellow_cards'] / lifetime_mins_90,
             0
         )
 

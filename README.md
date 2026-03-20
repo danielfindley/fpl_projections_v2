@@ -6,7 +6,7 @@ Predicts Fantasy Premier League (FPL) player points using historical FotMob data
 
 ```bash
 # Install dependencies
-pip install pandas numpy xgboost scikit-learn scipy requests optuna
+pip install pandas numpy xgboost scikit-learn scipy requests optuna lightgbm
 
 # Or use the notebook
 jupyter notebook run_models.ipynb
@@ -18,7 +18,7 @@ from src.pipeline import FPLPipeline
 pipeline = FPLPipeline('data')
 pipeline.load_data()
 pipeline.compute_features()
-pipeline.tune(n_iter=100, use_subprocess=True)  # Optuna tuning + RFECV feature selection
+pipeline.tune(n_iter=100, use_subprocess=True)  # Optuna tuning with integrated feature selection
 pipeline.train()
 predictions = pipeline.predict(gameweek=28, season='2025/2026')
 ```
@@ -36,17 +36,18 @@ projecting_fpl_v2/
 ├── src/
 │   ├── data_loader.py                  # Load/merge FotMob data, FPL API integration
 │   ├── features.py                     # Rolling feature engineering (120+ features)
+│   ├── feature_selection.py            # Pre-computed feature rankings for Optuna
 │   ├── pipeline.py                     # Main pipeline: tune, train, predict, points
 │   └── models/
-│       ├── base.py                     # Abstract base model (XGBoost + StandardScaler)
+│       ├── base.py                     # Abstract base model (XGBoost, minute-weighted)
 │       ├── minutes.py                  # Minutes prediction (1-90)
-│       ├── goals.py                    # Goals per 90 rate
-│       ├── assists.py                  # Assists per 90 rate
+│       ├── goals.py                    # Goals per match (Poisson counts)
+│       ├── assists.py                  # Assists per match (Poisson counts)
 │       ├── clean_sheet.py              # Team goals against (Poisson regression)
-│       ├── defcon.py                   # Defensive contribution threshold probability
+│       ├── defcon.py                   # Defensive contributions per match (Poisson counts)
 │       ├── saves.py                    # GK saves per 90 rate
-│       ├── cards.py                    # Yellow/red card probability (fouls model)
-│       └── bonus.py                    # Bonus points (Monte Carlo BPS simulation)
+│       ├── cards.py                    # Yellow/red card probability (direct classifier or fouls fallback)
+│       └── bonus.py                    # Bonus points (Monte Carlo BPS simulation with yellow cards)
 ├── run_models.ipynb                    # Main notebook: scrape, tune, train, predict
 ├── scrape_update_data.py               # Incremental FotMob data scraper
 ├── scrape_historical.py                # Historical data scraper
@@ -58,13 +59,13 @@ projecting_fpl_v2/
 | Model | Predicts | Method | Key Features |
 |-------|----------|--------|--------------|
 | **Minutes** | Playing time (1-90) | XGBoost regression | Rolling minutes, starter rate, current season minutes, goal involvement |
-| **Goals** | Goals per 90 rate | XGBoost regression | xG rolling, shots, player share of team output, opponent weakness, xG overperformance, form trends |
-| **Assists** | Assists per 90 rate | XGBoost regression | xA rolling, key passes, player centrality, opponent weakness, xA overperformance, form trends |
-| **Clean Sheet** | Team goals against (lambda) | XGBoost Poisson regression | Team conceded/xGA rolling (5 windows), opponent xG, isotonic calibration |
-| **Defcon** | P(defensive contribution >= threshold) | XGBoost + Poisson CDF | Tackles, interceptions, clearances, blocks, recoveries, opponent context |
+| **Goals** | Goals per match (raw counts) | XGBoost Poisson regression | xG rolling, shots, player share of team output, opponent weakness, xG overperformance, form trends |
+| **Assists** | Assists per match (raw counts) | XGBoost Poisson regression | xA rolling, key passes, player centrality, opponent weakness, xA overperformance, form trends |
+| **Clean Sheet** | Team goals against (lambda) | XGBoost Poisson regression | Team conceded/xGA rolling (5 windows), opponent xG, prior lambda anchor |
+| **Defcon** | Defensive contributions per match (raw counts) | XGBoost Poisson regression | Raw/per-90 defcon rolling, tackles, interceptions, clearances, blocks, recoveries, opponent context, pred_minutes |
 | **Saves** | GK saves per 90 | XGBoost regression (GK only) | Saves rolling, xGoT faced, team defensive context, opponent attacking strength |
-| **Cards** | Yellow/red card probability | XGBoost fouls model | Fouls per 90 rolling, defensive activity, calibrated PL conversion rates |
-| **Bonus** | Expected bonus points (0-3) | Monte Carlo BPS simulation | Simulates goals/assists/CS, ranks BPS per match, awards 3-2-1 bonus |
+| **Cards** | Yellow/red card probability | XGBoost binary classifier (`binary:logistic`) | Yellow card rolling history, fouls per 90 rolling, defensive activity, yellow-per-foul rate. Trained on actual FPL API yellow card data (required) |
+| **Bonus** | Expected bonus points (0-3) | Monte Carlo BPS simulation | Simulates goals/assists/CS/yellow cards, ranks BPS per match (including -3 BPS per yellow), awards 3-2-1 bonus |
 
 ## Feature Engineering
 
@@ -86,16 +87,22 @@ All rolling features use `shift(1)` to prevent data leakage.
 | **Lifetime profile** | `lifetime_goals_per90`, `lifetime_xg_per90`, `lifetime_minutes`, etc. | All models |
 | **Current season** | `current_season_minutes`, `current_season_apps`, `current_season_mins_per_app` | Minutes |
 | **Fouls** | `fouls_committed_per90_roll{3,5,10}`, `lifetime_fouls_committed_per90` | Cards |
+| **Yellow cards** | `yellow_cards_roll{3,5,10}`, `yellow_per_foul_roll10`, `lifetime_yellow_cards_per90` (from FPL API merge) | Cards |
 
 ## Hyperparameter Tuning
 
-Two-phase approach per model using Optuna + RFECV:
+Dependency-ordered tuning with OOF feature propagation and joint hyperparameter + feature selection optimization:
 
-1. **Phase 1**: Optuna tunes XGBoost hyperparameters (100 trials, TimeSeriesSplit 5-fold CV)
-   - Search space: `n_estimators`, `max_depth`, `learning_rate`, `min_child_weight`, `colsample_bytree`, `subsample`, `reg_alpha`, `reg_lambda`
-   - Loss functions: Poisson deviance (goals, assists, clean sheet), MAE (saves), RMSE (defcon), Huber (minutes)
-2. **Phase 2**: RFECV selects optimal feature subset using best hyperparameters
-3. **Evaluation**: Train on temporal train set, evaluate on held-out test set
+1. **Minutes model** tunes first → generates OOF `pred_minutes` on training set
+2. **Clean sheet model** tunes next → generates OOF `pred_team_goals` on training set
+3. **Remaining models** (goals, assists, defcon, saves) tune using OOF predictions as features, matching what they'll see at inference time
+
+For each model:
+1. **Pre-compute feature rankings** using 5 methods: XGBoost gain, XGBoost cover, LightGBM importance, permutation importance, mutual information
+2. **Optuna jointly tunes** XGBoost hyperparams + feature selection (`feat_method`, `n_features`) via TimeSeriesSplit 5-fold CV
+   - Search space: `n_estimators`, `max_depth`, `learning_rate`, `min_child_weight`, `colsample_bytree`, `subsample`, `reg_alpha`, `reg_lambda`, `feat_method`, `n_features`
+   - Loss functions: Poisson deviance (goals, assists, defcon, clean sheet), MAE (saves), Huber (minutes)
+   - Protected features (`pred_minutes`, `pred_team_goals`) are always included
 
 Tuning runs in **subprocess isolation** (`use_subprocess=True`) to prevent OOM from parallel XGBoost + cross-validation.
 
@@ -135,6 +142,7 @@ python scrape_update_data.py --auto
 - **Positions**: Maps FotMob position codes to FPL positions (GK/DEF/MID/FWD)
 - **Availability**: Filters out injured/suspended players (0% chance of playing)
 - **Fixtures**: Resolves DGW (double gameweek) fixtures, aggregating points across matches
+- **Yellow/Red cards**: `load_data()` fetches actual card data from the FPL live endpoint and merges it into the training DataFrame, enabling direct yellow card classification instead of fouls-based estimation
 
 ## Data Format
 
