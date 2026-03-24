@@ -1,0 +1,8 @@
+{
+  "gameweek": 32,
+  "season": "2025/2026",
+  "description": "baseline: full tune, 5k sims, 25/26 holdout inc-bonus MAE",
+  "timestamp": "2026-03-23T23:50:26.733852",
+  "n_sims": 5000,
+  "n_players": 456
+}

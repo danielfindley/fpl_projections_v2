@@ -30,7 +30,7 @@ import argparse
 import json
 from datetime import datetime
 from pathlib import Path
-from playwright.sync_api import sync_playwright
+import undetected_chromedriver as uc
 
 # =============================================================================
 # CONFIGURATION
@@ -81,39 +81,26 @@ FPL_TO_FOTMOB_TEAMS = {
 }
 
 # =============================================================================
-# PLAYWRIGHT BROWSER FOR FOTMOB
+# UNDETECTED CHROME BROWSER FOR FOTMOB
 # =============================================================================
 
 class FotMobBrowser:
-    """Context manager that uses Playwright to get past Cloudflare Turnstile,
-    then uses the session cookies for fast API requests."""
+    """Context manager that uses undetected-chromedriver to bypass Cloudflare
+    Turnstile, then exports cookies for fast requests.Session API calls."""
 
     def __init__(self):
-        self._playwright = None
-        self._browser = None
-        self._context = None
-        self._page = None
+        self._driver = None
         self._session = None  # requests.Session with browser cookies
 
     def __enter__(self):
         print("Launching browser to solve Cloudflare challenge...")
-        self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(
-            headless=False,
-            args=['--disable-blink-features=AutomationControlled'],
-        )
-        self._context = self._browser.new_context(
-            viewport={'width': 1920, 'height': 1080},
-        )
-        self._page = self._context.new_page()
+        self._driver = uc.Chrome(headless=False)
+        self._driver.get("https://www.fotmob.com/")
+        time.sleep(5)  # let Turnstile auto-solve
 
-        # Visit homepage to trigger and pass Turnstile challenge
-        self._page.goto("https://www.fotmob.com", wait_until="domcontentloaded", timeout=30000)
-        self._page.wait_for_timeout(5000)
-
-        # Extract cookies and user-agent for use with requests
-        cookies = self._context.cookies()
-        user_agent = self._page.evaluate('() => navigator.userAgent')
+        # Extract cookies for use with requests
+        cookies = self._driver.get_cookies()
+        user_agent = self._driver.execute_script('return navigator.userAgent')
 
         self._session = requests.Session()
         self._session.headers.update({
@@ -123,19 +110,16 @@ class FotMobBrowser:
         for c in cookies:
             self._session.cookies.set(c['name'], c['value'], domain=c.get('domain', '.fotmob.com'))
 
-        # Verify cookies work
-        test = self._session.get(f"https://www.fotmob.com/api/matchDetails?matchId=4813627")
+        # Verify cookies work on the new API path
+        test = self._session.get("https://www.fotmob.com/api/data/matchDetails?matchId=4813627")
         if test.status_code == 200:
             print(f"Session established! ({len(cookies)} cookies)")
         else:
             print(f"Warning: Cookie test returned {test.status_code}, scraping may fail")
 
         # Close browser - we only needed it for cookies
-        self._context.close()
-        self._browser.close()
-        self._browser = None
-        self._context = None
-        self._page = None
+        self._driver.quit()
+        self._driver = None
 
         return self
 
@@ -143,7 +127,7 @@ class FotMobBrowser:
         """Fetch match data using the authenticated session cookies."""
         try:
             r = self._session.get(
-                f"https://www.fotmob.com/api/matchDetails?matchId={match_id}",
+                f"https://www.fotmob.com/api/data/matchDetails?matchId={match_id}",
                 timeout=15
             )
             if r.status_code == 200:
@@ -155,13 +139,20 @@ class FotMobBrowser:
             print(f"  Request error for match {match_id}: {e}")
             return None
 
+    def fetch_json(self, path):
+        """Fetch any FotMob API path using the authenticated session.
+        Path should start with / (e.g., '/api/data/leagues?id=47')."""
+        try:
+            r = self._session.get(f"https://www.fotmob.com{path}", timeout=15)
+            if r.status_code == 200:
+                return r.json()
+            return None
+        except Exception:
+            return None
+
     def __exit__(self, *args):
-        if self._context:
-            self._context.close()
-        if self._browser:
-            self._browser.close()
-        if self._playwright:
-            self._playwright.stop()
+        if self._driver:
+            self._driver.quit()
         print("Session closed.")
 
 
@@ -186,7 +177,7 @@ def extract_match_data(match_id, browser=None):
         if not match:
             return None, None, None
     else:
-        url = f"https://www.fotmob.com/api/matchDetails?matchId={match_id}"
+        url = f"https://www.fotmob.com/api/data/matchDetails?matchId={match_id}"
         response = requests.get(url, headers=HEADERS)
         if response.status_code != 200:
             return None, None, None
@@ -257,16 +248,18 @@ def extract_match_data(match_id, browser=None):
     return match_info, players_data, shots_data
 
 
-def get_season_fixtures(season):
+def get_season_fixtures(season, browser=None):
     """Get all fixtures for a specific season."""
-    url = f"https://www.fotmob.com/api/leagues?id={PREMIER_LEAGUE_ID}&season={season}"
-    response = requests.get(url, headers=HEADERS)
+    path = f"/api/data/leagues?id={PREMIER_LEAGUE_ID}&season={season}"
+    if browser:
+        data = browser.fetch_json(path)
+    else:
+        response = requests.get(f"https://www.fotmob.com{path}", headers=HEADERS)
+        data = response.json() if response.status_code == 200 else None
 
-    if response.status_code != 200:
+    if not data:
         print(f"Failed to fetch fixtures for {season}")
         return []
-
-    data = response.json()
     fixtures_data = data.get('fixtures', {})
     matches = fixtures_data.get('allMatches', [])
 
@@ -289,13 +282,19 @@ def get_season_fixtures(season):
     return completed
 
 
-def get_current_season():
+def get_current_season(browser=None):
     """Determine current season from FotMob."""
-    url = f"https://www.fotmob.com/api/leagues?id={PREMIER_LEAGUE_ID}"
-    response = requests.get(url, headers=HEADERS)
-    data = response.json()
-    seasons = data.get('allAvailableSeasons', [])
-    return seasons[0] if seasons else '2025/2026'
+    path = f"/api/data/leagues?id={PREMIER_LEAGUE_ID}"
+    if browser:
+        data = browser.fetch_json(path)
+    else:
+        response = requests.get(f"https://www.fotmob.com{path}", headers=HEADERS)
+        data = response.json() if response.status_code == 200 else None
+
+    if data:
+        seasons = data.get('allAvailableSeasons', [])
+        return seasons[0] if seasons else '2025/2026'
+    return '2025/2026'
 
 
 def migrate_to_canonical_files():
@@ -428,14 +427,18 @@ def update_data(gameweeks=None, season=None, auto=False, force=False, verbose=Tr
     # Migrate old timestamped files to canonical names (one-time)
     migrate_to_canonical_files()
 
+    # Launch browser session early so all FotMob API calls can use it
+    browser = FotMobBrowser()
+    browser.__enter__()
+
     # Determine season
     if season is None:
-        season = get_current_season()
+        season = get_current_season(browser=browser)
     print(f"\nSeason: {season}")
 
     # Get all completed fixtures for the season
     print("Fetching fixture list...")
-    all_fixtures = get_season_fixtures(season)
+    all_fixtures = get_season_fixtures(season, browser=browser)
     print(f"Found {len(all_fixtures)} completed matches in {season}")
 
     if not all_fixtures:
@@ -483,46 +486,47 @@ def update_data(gameweeks=None, season=None, auto=False, force=False, verbose=Tr
         gw_counts[gw] = gw_counts.get(gw, 0) + 1
     print(f"Matches per matchday: {dict(sorted(gw_counts.items()))}")
 
-    # Scrape matches using Playwright browser
+    # Scrape matches using authenticated session
     all_players = []
     all_shots = []
     all_match_details = []
     failed = []
 
-    with FotMobBrowser() as browser:
-        for i, match in enumerate(matches_to_scrape):
-            match_id = match['match_id']
-            home = match.get('home_team', '?')
-            away = match.get('away_team', '?')
-            gw = match.get('round', '?')
+    for i, match in enumerate(matches_to_scrape):
+        match_id = match['match_id']
+        home = match.get('home_team', '?')
+        away = match.get('away_team', '?')
+        gw = match.get('round', '?')
 
-            try:
-                match_info, players_data, shots_data = extract_match_data(match_id, browser=browser)
+        try:
+            match_info, players_data, shots_data = extract_match_data(match_id, browser=browser)
 
-                if match_info:
-                    match_info['season'] = season
-                    all_match_details.append(match_info)
+            if match_info:
+                match_info['season'] = season
+                all_match_details.append(match_info)
 
-                    for p in players_data:
-                        p['season'] = season
-                    all_players.extend(players_data)
+                for p in players_data:
+                    p['season'] = season
+                all_players.extend(players_data)
 
-                    for s in shots_data:
-                        s['season'] = season
-                    all_shots.extend(shots_data)
+                for s in shots_data:
+                    s['season'] = season
+                all_shots.extend(shots_data)
 
-                    if verbose:
-                        print(f"[{i+1}/{len(matches_to_scrape)}] MD{gw}: {home} vs {away} ({len(players_data)} players)")
-                else:
-                    failed.append(match)
-                    print(f"[{i+1}/{len(matches_to_scrape)}] FAILED: MD{gw} {home} vs {away}")
-
-            except Exception as e:
+                if verbose:
+                    print(f"[{i+1}/{len(matches_to_scrape)}] MD{gw}: {home} vs {away} ({len(players_data)} players)")
+            else:
                 failed.append(match)
-                print(f"[{i+1}/{len(matches_to_scrape)}] ERROR: {str(e)[:80]}")
+                print(f"[{i+1}/{len(matches_to_scrape)}] FAILED: MD{gw} {home} vs {away}")
 
-            if i < len(matches_to_scrape) - 1:
-                random_delay()
+        except Exception as e:
+            failed.append(match)
+            print(f"[{i+1}/{len(matches_to_scrape)}] ERROR: {str(e)[:80]}")
+
+        if i < len(matches_to_scrape) - 1:
+            random_delay()
+
+    browser.__exit__(None, None, None)
 
     # Save/append data
     if not all_players:
