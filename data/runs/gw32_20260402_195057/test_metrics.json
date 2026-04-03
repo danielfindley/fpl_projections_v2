@@ -1,0 +1,30 @@
+{
+  "saves": {
+    "metric_name": "MAE",
+    "primary": 1.3792993226590704
+  },
+  "defcon": {
+    "metric_name": "Poisson Dev",
+    "primary": 2.349848590968085
+  },
+  "clean_sheet": {
+    "metric_name": "Poisson Dev",
+    "primary": 1.0902433484107925
+  },
+  "goals": {
+    "metric_name": "Poisson Dev",
+    "primary": 0.3831370577378
+  },
+  "minutes": {
+    "metric_name": "Huber Loss",
+    "primary": 145.98277658618358
+  },
+  "assists": {
+    "metric_name": "Poisson Dev",
+    "primary": 0.31964719409563763
+  },
+  "_fpl_points_mae": {
+    "mae_ex_bonus": 1.709145293737912,
+    "mae_inc_bonus": 1.8187301890248333
+  }
+}

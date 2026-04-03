@@ -122,9 +122,14 @@ class CleanSheetModel:
             else:
                 df[col] = 0
 
+        # Ensure own_goal column exists
+        if 'own_goal' not in df.columns:
+            df['own_goal'] = 0
+
         # Aggregate to team-match level
         team_match = df.groupby(['team_norm', 'opponent_norm', 'season', 'gameweek', 'is_home']).agg(
             goals=('goals', 'sum'),
+            own_goals=('own_goal', 'sum'),
             xg=('xg', 'sum'),
             team=('team', 'first'),
             opponent=('opponent', 'first'),
@@ -140,14 +145,15 @@ class CleanSheetModel:
             shots_on_target=('shots_on_target', 'sum'),
         ).reset_index()
 
-        # Goals conceded from opponent's goals
+        # Goals conceded = opponent's player goals + this team's own goals
         opp_goals = team_match[['team_norm', 'season', 'gameweek', 'goals', 'xg']].copy()
         opp_goals = opp_goals.rename(columns={
             'team_norm': 'opponent_norm',
-            'goals': 'goals_conceded',
+            'goals': 'opp_goals',
             'xg': 'xga'
         })
         team_match = team_match.merge(opp_goals, on=['opponent_norm', 'season', 'gameweek'], how='left')
+        team_match['goals_conceded'] = team_match['opp_goals'] + team_match['own_goals']
 
         team_match['clean_sheet'] = (team_match['goals_conceded'] == 0).astype(int)
         team_match['def_actions'] = (team_match['tackles'] + team_match['interceptions']

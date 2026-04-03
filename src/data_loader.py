@@ -44,7 +44,7 @@ def load_player_stats(data_dir: Path, verbose: bool = True) -> pd.DataFrame:
     # Ensure numeric columns
     numeric_cols = ['minutes', 'goals', 'assists', 'xg', 'xa', 'shots', 'key_passes',
                     'tackles', 'interceptions', 'clearances', 'blocks', 'recoveries',
-                    'fotmob_rating', 'touches', 'touches_in_opposition_box']
+                    'fotmob_rating', 'touches', 'touches_in_opposition_box', 'own_goal']
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)

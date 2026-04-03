@@ -1,0 +1,8 @@
+{
+  "gameweek": 32,
+  "season": "2025/2026",
+  "description": "GW32 weekly deploy (with metrics)",
+  "timestamp": "2026-04-02T19:50:57.647858",
+  "n_sims": 5000,
+  "n_players": 456
+}

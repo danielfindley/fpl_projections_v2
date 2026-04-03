@@ -91,7 +91,7 @@ class DefconModel(BaseModel):
         if verbose:
             if self.dispersion_r is not None:
                 print(f"  NB dispersion r={self.dispersion_r:.2f} "
-                      f"(var/mean ≈ {1 + np.mean(self.predict(train_df)) / self.dispersion_r:.2f}x)")
+                      f"(var/mean ~= {1 + np.mean(self.predict(train_df)) / self.dispersion_r:.2f}x)")
             else:
                 print("  No overdispersion detected, using Poisson CDF")
 

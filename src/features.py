@@ -334,10 +334,26 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     # TEAM ROLLING STATS (OFFENSIVE)
     # =========================================================================
 
+    # Ensure own_goal column exists
+    if 'own_goal' not in df.columns:
+        df['own_goal'] = 0
+
     team_stats = df.groupby(['team', 'season', 'gameweek']).agg({
-        'goals': 'sum', 'xg': 'sum', 'shots': 'sum'
+        'goals': 'sum', 'xg': 'sum', 'shots': 'sum', 'own_goal': 'sum'
     }).reset_index()
-    team_stats = team_stats.rename(columns={'goals': 'team_goals', 'xg': 'team_xg', 'shots': 'team_shots'})
+
+    # Add opponent own goals to team goals (own goals by opponent count as goals for this team)
+    if 'opponent' in df.columns:
+        opp_og = df.groupby(['opponent', 'season', 'gameweek'])['own_goal'].sum().reset_index()
+        opp_og = opp_og.rename(columns={'opponent': 'team', 'own_goal': 'opp_own_goals'})
+        team_stats = team_stats.merge(opp_og, on=['team', 'season', 'gameweek'], how='left')
+        team_stats['opp_own_goals'] = team_stats['opp_own_goals'].fillna(0)
+        team_stats['team_goals'] = team_stats['goals'] + team_stats['opp_own_goals']
+    else:
+        team_stats['team_goals'] = team_stats['goals']
+
+    team_stats = team_stats.rename(columns={'xg': 'team_xg', 'shots': 'team_shots'})
+    team_stats = team_stats.drop(columns=['goals', 'own_goal'], errors='ignore')
     team_stats = team_stats.sort_values(['team', 'season', 'gameweek'])
 
     for col in ['team_goals', 'team_xg', 'team_shots']:
@@ -401,20 +417,29 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
         df['team_norm'] = df['team'].apply(normalize_name)
         df['opponent_norm'] = df['opponent'].apply(normalize_name)
 
-        # Get goals conceded by each team (= opponent's goals scored that match)
-        # First build a match-level lookup: team -> opponent's goals that game
+        # Get goals conceded by each team (= opponent's goals + this team's own goals)
         match_results = df.groupby(['team_norm', 'opponent_norm', 'season', 'gameweek']).agg({
-            'goals': 'sum', 'xg': 'sum', 'team': 'first', 'opponent': 'first'
+            'goals': 'sum', 'xg': 'sum', 'own_goal': 'sum', 'team': 'first', 'opponent': 'first'
         }).reset_index()
 
         # Swap to get what the opponent scored against this team
         # After swap: team_norm becomes what was opponent_norm, so we get each team's conceded stats
         team_conceded = match_results.rename(columns={
             'team_norm': 'opponent_temp_norm',
-            'opponent_norm': 'team_norm',  # The opponent becomes the team for defensive stats
-            'goals': 'goals_conceded',
-            'xg': 'xga'
+            'opponent_norm': 'team_norm',
+            'goals': 'opp_goals',
+            'xg': 'xga',
+            'own_goal': 'opp_own_goals',
         })
+
+        # Goals conceded = opponent's player goals + this team's own goals
+        # own goals by this team are in the original (pre-swap) match_results
+        team_og = match_results[['team_norm', 'season', 'gameweek', 'own_goal']].rename(
+            columns={'own_goal': 'self_own_goals'}
+        )
+        team_conceded = team_conceded.merge(team_og, on=['team_norm', 'season', 'gameweek'], how='left')
+        team_conceded['self_own_goals'] = team_conceded['self_own_goals'].fillna(0)
+        team_conceded['goals_conceded'] = team_conceded['opp_goals'] + team_conceded['self_own_goals']
         team_conceded = team_conceded.sort_values(['team_norm', 'season', 'gameweek'])
 
         # Rolling goals conceded and xGA (multiple windows for different time horizons)
