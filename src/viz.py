@@ -35,78 +35,108 @@ def _build_metrics_html(metrics):
 FPL_GOAL_PTS = {'GK': 6, 'DEF': 6, 'MID': 5, 'FWD': 4}
 
 
-def _build_player_data(predictions, simulations, top_n):
+def _build_player_data(predictions, simulations, top_n, predictions_per_fixture=None):
     """Build simulation-based player data for both desktop and mobile viz.
 
     Returns (players_data, all_totals_flat) where players_data is a list of
     dicts with KDE curves, stats, and cumulative probabilities.
+
+    If predictions_per_fixture is provided (pre-DGW-aggregation DataFrame with
+    a '_sim_idx' column), per-sim totals are built fixture-by-fixture and
+    summed per player, so DGW distributions match their aggregated exp_pts.
     """
     np.random.seed(42)
 
     top = predictions[predictions['fpl_position'] != 'GK'].nlargest(top_n, 'exp_total_pts')
 
-    sim_names = simulations['player_names']
     sim_goals = simulations['goals']
     sim_assists = simulations['assists']
     sim_cs = simulations['cs']
     sim_bonus = simulations['bonus']
     N_SIMS = sim_goals.shape[0]
 
-    name_to_idx = {}
-    for idx, name in enumerate(sim_names):
-        name_to_idx.setdefault(name, idx)
+    use_per_fixture = (
+        predictions_per_fixture is not None
+        and '_sim_idx' in predictions_per_fixture.columns
+    )
+
+    if use_per_fixture:
+        key_col = 'player_id' if 'player_id' in predictions_per_fixture.columns else 'player_name'
+        pf_by_player = {}
+        for _, pf_row in predictions_per_fixture.iterrows():
+            pf_by_player.setdefault(pf_row[key_col], []).append(pf_row)
+    else:
+        sim_names = simulations['player_names']
+        name_to_idx = {}
+        for idx, name in enumerate(sim_names):
+            name_to_idx.setdefault(name, idx)
 
     players_data = []
     all_totals_flat = []
 
     for _, row in top.iterrows():
         pos = row['fpl_position']
-        mins = row.get('pred_minutes', 0)
         player_name = row['player_name']
 
-        pidx = name_to_idx.get(player_name)
-        if pidx is None:
-            print(f"WARNING: {player_name} not found in simulation arrays, skipping")
-            continue
+        if use_per_fixture:
+            player_key = row.get(key_col, player_name)
+            fixture_rows = pf_by_player.get(player_key)
+            if not fixture_rows:
+                print(f"WARNING: {player_name} not found in per-fixture predictions, skipping")
+                continue
+        else:
+            pidx = name_to_idx.get(player_name)
+            if pidx is None:
+                print(f"WARNING: {player_name} not found in simulation arrays, skipping")
+                continue
+            fixture_rows = [row]
 
-        goals = sim_goals[:, pidx]
-        assists = sim_assists[:, pidx]
-        cs = sim_cs[:, pidx]
-        bonus_pts = sim_bonus[:, pidx]
+        total = np.zeros(N_SIMS)
+        for fx in fixture_rows:
+            if use_per_fixture:
+                pidx = int(fx['_sim_idx'])
+                mins = fx.get('pred_minutes', 0)
+                ga = max(fx.get('pred_goals_against', 1.2), 0.01)
+                defcon_p = fx.get('pred_defcon_prob', 0)
+                yellow_p = fx.get('pred_yellow_prob', 0)
+                red_p = fx.get('pred_red_prob', 0)
+            else:
+                mins = row.get('pred_minutes', 0)
+                ga = max(row.get('pred_goals_against', 1.2), 0.01)
+                defcon_p = row.get('pred_defcon_prob', 0)
+                yellow_p = row.get('pred_yellow_prob', 0)
+                red_p = row.get('pred_red_prob', 0)
 
-        app = np.full(N_SIMS, 2 if mins >= 60 else (1 if mins >= 1 else 0))
-        goal_pts = goals * FPL_GOAL_PTS.get(pos, 5)
-        assist_pts = assists * 3
+            goals = sim_goals[:, pidx]
+            assists = sim_assists[:, pidx]
+            cs = sim_cs[:, pidx]
+            bonus_pts = sim_bonus[:, pidx]
 
-        cs_pts = np.zeros(N_SIMS)
-        if mins >= 60 and pos in ('DEF', 'MID'):
-            cs_pts = cs * {'DEF': 4, 'MID': 1}.get(pos, 0)
+            app = np.full(N_SIMS, 2 if mins >= 60 else (1 if mins >= 1 else 0))
+            goal_pts = goals * FPL_GOAL_PTS.get(pos, 5)
+            assist_pts = assists * 3
 
-        conceded_pen = np.zeros(N_SIMS)
-        if mins >= 60 and pos == 'DEF':
-            ga = max(row.get('pred_goals_against', 1.2), 0.01)
-            conceded_pen = -(np.random.poisson(ga, N_SIMS) // 2)
+            cs_pts = np.zeros(N_SIMS)
+            if mins >= 60 and pos in ('DEF', 'MID'):
+                cs_pts = cs * {'DEF': 4, 'MID': 1}.get(pos, 0)
 
-        defcon_pts = np.zeros(N_SIMS)
-        if mins >= 60 and pos in ('DEF', 'MID'):
-            defcon_pts = (
-                np.random.binomial(
-                    1, np.clip(row.get('pred_defcon_prob', 0), 0, 1), N_SIMS
-                )
-                * 2
+            conceded_pen = np.zeros(N_SIMS)
+            if mins >= 60 and pos == 'DEF':
+                conceded_pen = -(np.random.poisson(ga, N_SIMS) // 2)
+
+            defcon_pts = np.zeros(N_SIMS)
+            if mins >= 60 and pos in ('DEF', 'MID'):
+                defcon_pts = np.random.binomial(1, np.clip(defcon_p, 0, 1), N_SIMS) * 2
+
+            yellow = -np.random.binomial(1, np.clip(yellow_p, 0, 1), N_SIMS)
+            red = -3 * np.random.binomial(1, np.clip(red_p, 0, 1), N_SIMS)
+
+            fixture_total = (
+                app + goal_pts + assist_pts + cs_pts
+                + conceded_pen + defcon_pts + bonus_pts + yellow + red
             )
+            total = total + fixture_total
 
-        yellow = -np.random.binomial(
-            1, np.clip(row.get('pred_yellow_prob', 0), 0, 1), N_SIMS
-        )
-        red = -3 * np.random.binomial(
-            1, np.clip(row.get('pred_red_prob', 0), 0, 1), N_SIMS
-        )
-
-        total = (
-            app + goal_pts + assist_pts + cs_pts
-            + conceded_pen + defcon_pts + bonus_pts + yellow + red
-        )
         all_totals_flat.append(total)
 
         # KDE curve
@@ -157,6 +187,7 @@ def generate_distribution_html(
     top_n=100,
     gameweek=None,
     metrics=None,
+    predictions_per_fixture=None,
 ):
     """Generate a self-contained interactive HTML file with D3.js ridge plot.
 
@@ -168,7 +199,7 @@ def generate_distribution_html(
         gameweek: gameweek number for the title
         metrics: optional dict of model accuracy metrics to display at bottom
     """
-    players_data, all_totals_flat = _build_player_data(predictions, simulations, top_n)
+    players_data, all_totals_flat = _build_player_data(predictions, simulations, top_n, predictions_per_fixture)
 
     all_flat = np.concatenate(all_totals_flat)
     x_min = float(all_flat.min() - 1)
@@ -198,13 +229,14 @@ def generate_mobile_html(
     top_n=100,
     gameweek=None,
     metrics=None,
+    predictions_per_fixture=None,
 ):
     """Generate a mobile-friendly HTML file with card-based distribution layout.
 
     Uses the same simulation logic as ``generate_distribution_html`` but renders
     as vertically-stacked player cards rather than a ridge plot.
     """
-    players_data, all_totals_flat = _build_player_data(predictions, simulations, top_n)
+    players_data, all_totals_flat = _build_player_data(predictions, simulations, top_n, predictions_per_fixture)
 
     all_flat = np.concatenate(all_totals_flat)
     x_min = float(all_flat.min() - 1)

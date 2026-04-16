@@ -2277,6 +2277,11 @@ with open(r"{temp_result_path}", 'w') as f:
         output_path.parent.mkdir(exist_ok=True)
         test_df.to_csv(output_path, index=False)
 
+        # Snapshot per-fixture predictions for viz (sim arrays are indexed by row position here)
+        _pf = test_df.reset_index(drop=True).copy()
+        _pf['_sim_idx'] = range(len(_pf))
+        self.last_predictions_per_fixture = _pf
+
         # Aggregate DGW players: sum points across fixtures
         test_df = self._aggregate_dgw(test_df, verbose)
 
