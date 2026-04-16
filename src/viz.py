@@ -5,6 +5,7 @@ Monte Carlo points distributions for top outfield players.
 """
 
 import json
+import re
 import numpy as np
 from scipy.stats import gaussian_kde
 from pathlib import Path
@@ -204,6 +205,39 @@ def _build_player_data(predictions, simulations, top_n, predictions_per_fixture=
     return players_data, all_totals_flat
 
 
+def _extract_for_template(html):
+    """Extract (style, body_inner, inline_script) from a standalone HTML template.
+
+    Strips the d3 CDN script tag and rewrites ``const DATA = /*__DATA__*/null;``
+    to read from the shared ``window.DATA`` so the outer wrapper can define data
+    once. Preserves the ``<!--__METRICS__-->`` placeholder.
+    """
+    style_m = re.search(r'<style>(.*?)</style>', html, re.DOTALL)
+    style = style_m.group(1) if style_m else ''
+
+    body_m = re.search(r'<body[^>]*>(.*?)</body>', html, re.DOTALL)
+    body = body_m.group(1) if body_m else ''
+
+    body = re.sub(
+        r'\s*<script\s+src="https://d3js\.org/d3\.v7\.min\.js"></script>\s*',
+        '\n',
+        body,
+    )
+
+    script_m = re.search(r'<script>(.*?)</script>', body, re.DOTALL)
+    script = script_m.group(1) if script_m else ''
+    if script_m:
+        body = body[:script_m.start()] + body[script_m.end():]
+
+    script = re.sub(
+        r'const\s+DATA\s*=\s*/\*__DATA__\*/\s*null\s*;?',
+        'const DATA = window.DATA;',
+        script,
+    )
+
+    return style.strip(), body.strip(), script.strip()
+
+
 def generate_distribution_html(
     predictions,
     simulations,
@@ -213,15 +247,12 @@ def generate_distribution_html(
     metrics=None,
     predictions_per_fixture=None,
 ):
-    """Generate a self-contained interactive HTML file with D3.js ridge plot.
+    """Generate a self-contained responsive HTML file.
 
-    Args:
-        predictions: DataFrame from pipeline.predict()
-        simulations: dict from pipeline.last_simulations
-        output_path: path to write HTML file
-        top_n: number of top outfield players to show
-        gameweek: gameweek number for the title
-        metrics: optional dict of model accuracy metrics to display at bottom
+    Emits one file containing both the desktop D3 ridge plot and the
+    mobile card layout as inert ``<template>`` elements. At load time an
+    outer script picks the right one based on viewport width (<=768px
+    activates mobile).
     """
     players_data, all_totals_flat = _build_player_data(predictions, simulations, top_n, predictions_per_fixture)
 
@@ -238,48 +269,21 @@ def generate_distribution_html(
         'gw_label': gw_label,
     }
 
-    html = _HTML_TEMPLATE.replace('/*__DATA__*/null', json.dumps(data))
+    d_style, d_body, d_script = _extract_for_template(_HTML_TEMPLATE)
+    m_style, m_body, m_script = _extract_for_template(_MOBILE_TEMPLATE)
+
+    html = _RESPONSIVE_TEMPLATE
+    html = html.replace('__DESKTOP_STYLE__', d_style)
+    html = html.replace('__DESKTOP_BODY__', d_body)
+    html = html.replace('__DESKTOP_SCRIPT__', d_script)
+    html = html.replace('__MOBILE_STYLE__', m_style)
+    html = html.replace('__MOBILE_BODY__', m_body)
+    html = html.replace('__MOBILE_SCRIPT__', m_script)
+    html = html.replace('/*__DATA__*/null', json.dumps(data))
     html = html.replace('<!--__METRICS__-->', _build_metrics_html(metrics))
 
     Path(output_path).write_text(html, encoding='utf-8')
     print(f"Distribution visualization saved to: {output_path}")
-    return output_path
-
-
-def generate_mobile_html(
-    predictions,
-    simulations,
-    output_path='distributions_mobile.html',
-    top_n=100,
-    gameweek=None,
-    metrics=None,
-    predictions_per_fixture=None,
-):
-    """Generate a mobile-friendly HTML file with card-based distribution layout.
-
-    Uses the same simulation logic as ``generate_distribution_html`` but renders
-    as vertically-stacked player cards rather than a ridge plot.
-    """
-    players_data, all_totals_flat = _build_player_data(predictions, simulations, top_n, predictions_per_fixture)
-
-    all_flat = np.concatenate(all_totals_flat)
-    x_min = float(all_flat.min() - 1)
-    x_max = float(min(all_flat.max() + 1, 25))
-
-    gw_label = f'GW{gameweek}' if gameweek else ''
-
-    data = {
-        'players': players_data,
-        'x_min': x_min,
-        'x_max': x_max,
-        'gw_label': gw_label,
-    }
-
-    html = _MOBILE_TEMPLATE.replace('/*__DATA__*/null', json.dumps(data))
-    html = html.replace('<!--__METRICS__-->', _build_metrics_html(metrics))
-
-    Path(output_path).write_text(html, encoding='utf-8')
-    print(f"Mobile distribution visualization saved to: {output_path}")
     return output_path
 
 
@@ -929,6 +933,63 @@ function render() {
 }
 
 render();
+</script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Responsive wrapper — hosts desktop + mobile as inert <template> elements
+# and activates the correct one based on viewport width.
+# ---------------------------------------------------------------------------
+
+_RESPONSIVE_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FPL Points Distribution</title>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{background:#0d1117;color:#c9d1d9;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+</style>
+</head>
+<body>
+<template id="desktop-tmpl">
+<style>
+__DESKTOP_STYLE__
+</style>
+__DESKTOP_BODY__
+<script>
+__DESKTOP_SCRIPT__
+</script>
+</template>
+<template id="mobile-tmpl">
+<style>
+__MOBILE_STYLE__
+</style>
+__MOBILE_BODY__
+<script>
+__MOBILE_SCRIPT__
+</script>
+</template>
+<script>
+window.DATA = /*__DATA__*/null;
+function activate(id) {
+  const tmpl = document.getElementById(id);
+  if (!tmpl) return;
+  const frag = tmpl.content.cloneNode(true);
+  frag.querySelectorAll('script').forEach(old => {
+    const s = document.createElement('script');
+    for (const attr of old.attributes) s.setAttribute(attr.name, attr.value);
+    s.textContent = old.textContent;
+    old.parentNode.replaceChild(s, old);
+  });
+  document.body.appendChild(frag);
+}
+activate(window.matchMedia('(max-width: 768px)').matches ? 'mobile-tmpl' : 'desktop-tmpl');
 </script>
 </body>
 </html>
