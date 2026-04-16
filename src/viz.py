@@ -154,6 +154,30 @@ def _build_player_data(predictions, simulations, top_n, predictions_per_fixture=
         for x in range(int(total.min()), max_pts + 1):
             cum_prob[str(x)] = round(float((total >= x).mean() * 100), 1)
 
+        # Tooltip metrics: aggregate across fixtures.
+        # Counts (goals/assists/minutes/bonus) sum; probabilities (CS/defcon) use
+        # P(>=1 across fixtures) = 1 - prod(1 - p_i) so they stay in [0, 100%].
+        # For SGW players this reduces to the single fixture's value (identical to old behavior).
+        if use_per_fixture:
+            agg_goals = sum(float(fx.get('pred_exp_goals', 0) or 0) for fx in fixture_rows)
+            agg_assists = sum(float(fx.get('pred_exp_assists', 0) or 0) for fx in fixture_rows)
+            agg_minutes = sum(float(fx.get('pred_minutes', 0) or 0) for fx in fixture_rows)
+            agg_bonus = sum(float(fx.get('pred_bonus', 0) or 0) for fx in fixture_rows)
+            _cs_miss = 1.0
+            _dc_miss = 1.0
+            for fx in fixture_rows:
+                _cs_miss *= (1.0 - float(fx.get('pred_cs_prob', 0) or 0))
+                _dc_miss *= (1.0 - float(fx.get('pred_defcon_prob', 0) or 0))
+            agg_cs = (1.0 - _cs_miss) * 100
+            agg_defcon = (1.0 - _dc_miss) * 100
+        else:
+            agg_goals = float(row.get('pred_exp_goals', 0) or 0)
+            agg_assists = float(row.get('pred_exp_assists', 0) or 0)
+            agg_minutes = float(row.get('pred_minutes', 0) or 0)
+            agg_cs = float(row.get('pred_cs_prob', 0) or 0) * 100
+            agg_defcon = float(row.get('pred_defcon_prob', 0) or 0) * 100
+            agg_bonus = float(row.get('pred_bonus', 0) or 0)
+
         players_data.append({
             'name': player_name,
             'position': pos,
@@ -161,12 +185,12 @@ def _build_player_data(predictions, simulations, top_n, predictions_per_fixture=
             'opponent': str(row.get('opponent', '?')),
             'is_home': bool(row.get('is_home', False)),
             'exp_pts': round(float(row['exp_total_pts']), 2),
-            'pred_goals': round(float(row.get('pred_exp_goals', 0)), 2),
-            'pred_assists': round(float(row.get('pred_exp_assists', 0)), 2),
-            'pred_minutes': round(float(row.get('pred_minutes', 0)), 1),
-            'pred_cs': round(float(row.get('pred_cs_prob', 0)) * 100, 1),
-            'pred_defcon': round(float(row.get('pred_defcon_prob', 0)) * 100, 1),
-            'pred_bonus': round(float(row.get('pred_bonus', 0)), 2),
+            'pred_goals': round(agg_goals, 2),
+            'pred_assists': round(agg_assists, 2),
+            'pred_minutes': round(agg_minutes, 1),
+            'pred_cs': round(agg_cs, 1),
+            'pred_defcon': round(agg_defcon, 1),
+            'pred_bonus': round(agg_bonus, 2),
             'median': round(float(np.median(total)), 1),
             'p10': round(float(np.percentile(total, 10)), 1),
             'p90': round(float(np.percentile(total, 90)), 1),
@@ -643,7 +667,9 @@ body{
   background:#0d1117;color:#c9d1d9;
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
   padding:12px;-webkit-tap-highlight-color:transparent;
+  display:flex;justify-content:center;
 }
+.page{width:100%;max-width:560px}
 .header{text-align:center;margin-bottom:14px}
 .header h1{font-size:18px;font-weight:700;color:#e6edf3}
 .header p{font-size:12px;color:#8b949e;margin-top:2px}
@@ -729,10 +755,12 @@ body{
 </style>
 </head>
 <body>
+<div class="page">
 <div class="header">
   <h1 id="title">FPL Points Distribution</h1>
   <p>Monte Carlo Simulation &middot; Tap card for details</p>
 </div>
+<!--__METRICS__-->
 <div class="controls">
   <div class="pill active" data-pos="ALL">All</div>
   <div class="pill" data-pos="DEF">DEF</div>
@@ -750,6 +778,7 @@ body{
   </select>
 </div>
 <div class="cards" id="cards"></div>
+</div>
 
 <script src="https://d3js.org/d3.v7.min.js"></script>
 <script>
@@ -901,7 +930,6 @@ function render() {
 
 render();
 </script>
-<!--__METRICS__-->
 </body>
 </html>
 """
