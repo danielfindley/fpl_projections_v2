@@ -28,7 +28,8 @@ def _init_db(conn: sqlite3.Connection):
             n_iter INTEGER,
             test_size REAL,
             fpl_points_mae REAL,
-            fpl_points_mae_inc_bonus REAL
+            fpl_points_mae_inc_bonus REAL,
+            fpl_points_mae_top25_inc_bonus REAL
         );
 
         CREATE TABLE IF NOT EXISTS model_results (
@@ -76,11 +77,20 @@ def _init_db(conn: sqlite3.Connection):
     """)
 
 
+def _migrate(conn: sqlite3.Connection):
+    """Add columns introduced after initial schema. Idempotent."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(experiments)").fetchall()}
+    if 'fpl_points_mae_top25_inc_bonus' not in cols:
+        conn.execute("ALTER TABLE experiments ADD COLUMN fpl_points_mae_top25_inc_bonus REAL")
+        conn.commit()
+
+
 def _connect(data_dir: str = 'data') -> sqlite3.Connection:
     db_path = _get_db_path(data_dir)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     _init_db(conn)
+    _migrate(conn)
     return conn
 
 
@@ -94,6 +104,7 @@ def log_experiment(
     description: str = '',
     fpl_points_mae: float = None,
     fpl_points_mae_inc_bonus: float = None,
+    fpl_points_mae_top25_inc_bonus: float = None,
 ) -> str:
     """Log a complete tuning run to the database.
 
@@ -116,8 +127,10 @@ def log_experiment(
     try:
         conn.execute(
             """INSERT INTO experiments (run_id, timestamp, description, n_iter, test_size,
-               fpl_points_mae, fpl_points_mae_inc_bonus) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (run_id, timestamp, description, n_iter, test_size, fpl_points_mae, fpl_points_mae_inc_bonus),
+               fpl_points_mae, fpl_points_mae_inc_bonus, fpl_points_mae_top25_inc_bonus)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (run_id, timestamp, description, n_iter, test_size,
+             fpl_points_mae, fpl_points_mae_inc_bonus, fpl_points_mae_top25_inc_bonus),
         )
 
         all_models = set(tuned_params.keys()) | set(test_metrics.keys())

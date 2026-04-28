@@ -418,6 +418,7 @@ class FPLPipeline:
             fpl_mae_dict = test_metrics.pop('_fpl_points_mae', None)
             fpl_ex = fpl_mae_dict['mae_ex_bonus'] if isinstance(fpl_mae_dict, dict) else fpl_mae_dict
             fpl_inc = fpl_mae_dict['mae_inc_bonus'] if isinstance(fpl_mae_dict, dict) else None
+            fpl_top25 = fpl_mae_dict.get('mae_top25_inc_bonus') if isinstance(fpl_mae_dict, dict) else None
             run_id = log_experiment(
                 data_dir=str(self.data_dir),
                 n_iter=n_iter,
@@ -428,6 +429,7 @@ class FPLPipeline:
                 description=description,
                 fpl_points_mae=fpl_ex,
                 fpl_points_mae_inc_bonus=fpl_inc,
+                fpl_points_mae_top25_inc_bonus=fpl_top25,
             )
             if verbose:
                 print(f"\nExperiment logged: {run_id}")
@@ -1764,6 +1766,8 @@ with open(r"{temp_result_path}", 'w') as f:
                 print("-" * 54)
                 print(f"{'FPL POINTS':<15} {'ex-bonus MAE':<15} {fpl_mae['mae_ex_bonus']:<12.4f}")
                 print(f"{'':<15} {'inc-bonus MAE':<15} {fpl_mae['mae_inc_bonus']:<12.4f}")
+                if fpl_mae.get('mae_top25_inc_bonus') is not None:
+                    print(f"{'':<15} {'top25 inc MAE':<15} {fpl_mae['mae_top25_inc_bonus']:<12.4f}")
                 if 'bonus_mae' in fpl_mae:
                     print(f"{'BONUS':<15} {'MAE':<15} {fpl_mae['bonus_mae']:<12.4f}")
 
@@ -1946,9 +1950,27 @@ with open(r"{temp_result_path}", 'w') as f:
         mask = (df['minutes'] >= 1) & df['actual_pts_ex_bonus'].notna() & df['pred_fpl_pts'].notna()
         played = df.loc[mask]
 
+        # Top-25 per gameweek inc-bonus MAE: ranks players by predicted points within
+        # each test GW, keeps the top 25, and averages absolute error over those rows.
+        # Captures prediction quality where it matters (the players a manager would
+        # actually pick) rather than diluting across hundreds of bench/sub players.
+        if 'gameweek' in played.columns and len(played):
+            top25_rows = (
+                played.assign(_pred=played['pred_fpl_pts_inc_bonus'])
+                      .sort_values(['gameweek', '_pred'], ascending=[True, False])
+                      .groupby('gameweek', group_keys=False)
+                      .head(25)
+            )
+            mae_top25_inc = mean_absolute_error(
+                top25_rows['actual_fpl_pts'], top25_rows['pred_fpl_pts_inc_bonus']
+            ) if len(top25_rows) else None
+        else:
+            mae_top25_inc = None
+
         result = {
             'mae_ex_bonus': mean_absolute_error(played['actual_pts_ex_bonus'], played['pred_fpl_pts']),
             'mae_inc_bonus': mean_absolute_error(played['actual_fpl_pts'], played['pred_fpl_pts_inc_bonus']),
+            'mae_top25_inc_bonus': mae_top25_inc,
         }
 
         # Standalone bonus MAE (predicted bonus vs actual bonus)
@@ -2396,6 +2418,8 @@ with open(r"{temp_result_path}", 'w') as f:
                 result.append({'model': 'FPL Points', 'metric': 'MAE (ex-bonus)', 'score': f"{fpl['mae_ex_bonus']:.4f}"})
             if fpl.get('mae_inc_bonus') is not None:
                 result.append({'model': 'FPL Points', 'metric': 'MAE (inc-bonus)', 'score': f"{fpl['mae_inc_bonus']:.4f}"})
+            if fpl.get('mae_top25_inc_bonus') is not None:
+                result.append({'model': 'FPL Points', 'metric': 'MAE top-25/GW (inc-bonus)', 'score': f"{fpl['mae_top25_inc_bonus']:.4f}"})
             if fpl.get('bonus_mae') is not None:
                 result.append({'model': 'Bonus', 'metric': 'MAE', 'score': f"{fpl['bonus_mae']:.4f}"})
         elif fpl is not None:
