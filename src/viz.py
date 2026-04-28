@@ -242,7 +242,7 @@ def generate_distribution_html(
     predictions,
     simulations,
     output_path='distributions.html',
-    top_n=100,
+    top_n=200,
     gameweek=None,
     metrics=None,
     predictions_per_fixture=None,
