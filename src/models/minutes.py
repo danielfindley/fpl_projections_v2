@@ -28,6 +28,7 @@ ALL_FEATURES = [
 
     # Current season
     'current_season_minutes', 'current_season_apps', 'current_season_mins_per_app',
+    'gw_gap_since_last_appearance',
 
     # Goal involvement (key players play more)
     'goals_roll2', 'goals_roll3', 'goals_roll5', 'goals_roll7', 'goals_roll10',
@@ -54,6 +55,10 @@ ALL_FEATURES = [
     # Player importance to team
     'goal_share_roll1', 'goal_share_roll2', 'goal_share_roll3', 'goal_share_roll5', 'goal_share_roll7', 'goal_share_roll10',
     'xg_per90_roll1', 'xg_per90_roll2', 'xg_per90_roll3', 'xg_per90_roll5', 'xg_per90_roll7', 'xg_per90_roll10',
+
+    # Manager embeddings (rotation/playstyle signal — particularly relevant to minutes)
+    'manager_emb_0', 'manager_emb_1', 'manager_emb_2', 'manager_emb_3',
+    'manager_emb_4', 'manager_emb_5', 'manager_emb_6', 'manager_emb_7',
 ]
 
 # Starter regressor: features that matter for how long starters play
@@ -64,12 +69,15 @@ STARTER_FEATURES = [
     'last_was_full_90',
     'lifetime_mins_per_app',
     'current_season_mins_per_app', 'current_season_apps',
+    'gw_gap_since_last_appearance',
     'goals_roll2', 'goals_roll3', 'goals_roll5', 'goals_roll7', 'goals_roll10',
     'goal_involvements_roll5',
     'is_gk', 'is_def', 'is_mid', 'is_fwd',
     'minutes_trend',
     'is_home',
     'gameweek',
+    'manager_emb_0', 'manager_emb_1', 'manager_emb_2', 'manager_emb_3',
+    'manager_emb_4', 'manager_emb_5', 'manager_emb_6', 'manager_emb_7',
 ]
 
 # Sub regressor: features focused on sub patterns
@@ -80,9 +88,12 @@ SUB_FEATURES = [
     'last_was_starter',
     'lifetime_mins_per_app',
     'current_season_mins_per_app', 'current_season_apps',
+    'gw_gap_since_last_appearance',
     'is_gk', 'is_def', 'is_mid', 'is_fwd',
     'minutes_trend',
     'is_home',
+    'manager_emb_0', 'manager_emb_1', 'manager_emb_2', 'manager_emb_3',
+    'manager_emb_4', 'manager_emb_5', 'manager_emb_6', 'manager_emb_7',
 ]
 
 

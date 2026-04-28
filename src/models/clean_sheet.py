@@ -71,6 +71,10 @@ class CleanSheetModel:
 
         # Match context
         'is_home',
+
+        # Manager embeddings (8-dim PCA over rolling-20-prior manager stats)
+        'manager_emb_0', 'manager_emb_1', 'manager_emb_2', 'manager_emb_3',
+        'manager_emb_4', 'manager_emb_5', 'manager_emb_6', 'manager_emb_7',
     ]
 
     TARGET = 'goals_conceded'
@@ -126,8 +130,14 @@ class CleanSheetModel:
         if 'own_goal' not in df.columns:
             df['own_goal'] = 0
 
+        # Manager embedding columns: constant per team-match, take first
+        _mgr_emb_cols = [f'manager_emb_{i}' for i in range(8)]
+        for c in _mgr_emb_cols:
+            if c not in df.columns:
+                df[c] = 0.0
+
         # Aggregate to team-match level
-        team_match = df.groupby(['team_norm', 'opponent_norm', 'season', 'gameweek', 'is_home']).agg(
+        agg_kwargs = dict(
             goals=('goals', 'sum'),
             own_goals=('own_goal', 'sum'),
             xg=('xg', 'sum'),
@@ -143,6 +153,11 @@ class CleanSheetModel:
             touches=('touches', 'sum'),
             key_passes=('key_passes', 'sum'),
             shots_on_target=('shots_on_target', 'sum'),
+        )
+        for c in _mgr_emb_cols:
+            agg_kwargs[c] = (c, 'first')
+        team_match = df.groupby(['team_norm', 'opponent_norm', 'season', 'gameweek', 'is_home']).agg(
+            **agg_kwargs
         ).reset_index()
 
         # Goals conceded = opponent's player goals + this team's own goals

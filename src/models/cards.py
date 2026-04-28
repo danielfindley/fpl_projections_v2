@@ -51,6 +51,10 @@ class CardsModel:
 
         # Match context
         'is_home',
+
+        # Manager embeddings (8-dim PCA over rolling-20-prior manager stats)
+        'manager_emb_0', 'manager_emb_1', 'manager_emb_2', 'manager_emb_3',
+        'manager_emb_4', 'manager_emb_5', 'manager_emb_6', 'manager_emb_7',
     ]
 
     # Features for fouls regression (red card prediction)
@@ -69,6 +73,8 @@ class CardsModel:
         'opp_xg_roll1', 'opp_xg_roll2', 'opp_xg_roll3', 'opp_xg_roll5', 'opp_xg_roll7', 'opp_xg_roll10',
         'opp_goals_roll1', 'opp_goals_roll2', 'opp_goals_roll3', 'opp_goals_roll5', 'opp_goals_roll7', 'opp_goals_roll10',
         'is_home',
+        'manager_emb_0', 'manager_emb_1', 'manager_emb_2', 'manager_emb_3',
+        'manager_emb_4', 'manager_emb_5', 'manager_emb_6', 'manager_emb_7',
     ]
 
     TARGET = 'yellow_cards'

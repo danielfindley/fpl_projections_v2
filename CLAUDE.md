@@ -44,6 +44,8 @@ Data scraping: `python scrape_update_data.py --gameweek 28` or `--auto`
 
 Per-90 stats are capped (e.g., xg_per90 at 2.0) to prevent inflation from low-minute appearances.
 
+**Manager embeddings (`add_manager_embeddings`, end of `compute_rolling_features`)**: 8-dim PCA over rolling-20-prior manager stats. For each (manager, match) the pipeline builds a per-game vector covering minute distribution (mean/median/std/max, num_players_used, num_full_90, num_subs_made, mins_concentration_top11, mins_entropy), goals for/against, and parsed formation (def/mid/fwd counts). Each manager's rolling-20 mean is computed with `shift(1)` (strictly prior); managers with fewer than 3 prior games get a zero vector (interim protection). PCA is fit on all valid rows; the same basis is reused at predict time. For the next-GW synthetic rows the prior manager is assumed to continue, and their *current* rolled state (last 20 played games, no shift) is projected through the trained PCA. Manager identity for an upcoming match is treated as a known input — every numeric feature is still derived from games strictly before the row's own match. Outputs are 8 columns (`manager_emb_0..7`) added to every model's `FEATURES` list. Source data: `data/match_managers.csv`, derived once from the raw JSONs in `data/matches/raw/`.
+
 ### Tuning (dependency-ordered, Optuna with integrated feature selection)
 Tuning follows the model dependency chain with OOF feature propagation:
 1. **Minutes** tunes first → generates OOF `pred_minutes` on training set
@@ -115,3 +117,5 @@ For agent-driven experimentation workflow, see `AGENTS.md`.
 - `data/tuning_results/`: Cached Optuna tuning results (JSON)
 - `data/predictions/`: Output CSVs per gameweek (gitignored)
 - `data/experiments.db`: Experiment log (SQLite, gitignored)
+- `data/matches/raw/{match_id}.json.gz`: Full FotMob match-details payloads, gzipped. Written by `scrape_update_data.py` on every fetch (both `--gameweek N` and `--auto` modes call `save_raw_match()`). Source of truth for fields not flattened into `player_stats.csv` — currently used by the manager-embedding feature to extract `content.lineup.{home,away}Team.coach` and `.formation`.
+- `data/match_managers.csv`: Cache of (match_id, home/away team, manager id+name, formation) parsed from the raw JSONs. Rebuildable from raw at any time. Consumed by `add_manager_embeddings()` in `src/features.py`.

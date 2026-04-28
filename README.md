@@ -30,6 +30,8 @@ projecting_fpl_v2/
 ├── data/
 │   ├── players/player_stats.csv        # Player-match level stats from FotMob
 │   ├── matches/                        # Match details and shotmaps
+│   │   └── raw/{match_id}.json.gz      # Full FotMob match-details payloads (gzipped). Source of truth for managers/lineups; the scraper writes here on every fetch.
+│   ├── match_managers.csv              # Per-match (home_manager, away_manager, formations) — derived from raw JSONs (cache used by manager-embedding feature)
 │   ├── fixtures.csv                    # Fixture list
 │   ├── predictions/                    # Output predictions per gameweek
 │   └── tuning_results/                 # Cached tuning results
@@ -88,6 +90,19 @@ All rolling features use `shift(1)` to prevent data leakage.
 | **Current season** | `current_season_minutes`, `current_season_apps`, `current_season_mins_per_app` | Minutes |
 | **Fouls** | `fouls_committed_per90_roll{3,5,10}`, `lifetime_fouls_committed_per90` | Cards |
 | **Yellow cards** | `yellow_cards_roll{3,5,10}`, `yellow_per_foul_roll10`, `lifetime_yellow_cards_per90` (from FPL API merge) | Cards |
+| **Manager embeddings** | `manager_emb_0..7` — 8-dim PCA over rolling-20-prior manager stats (minutes distribution, GF/GA, formation) | All models |
+
+### Manager embeddings (leak-free)
+
+Each team's manager for a given match is looked up from `data/match_managers.csv` (extracted from raw FotMob JSONs at `data/matches/raw/`). For every (manager, match) pair, the pipeline builds a per-game feature vector capturing playstyle and rotation:
+
+- **Goals**: `gf`, `ga`
+- **Minutes distribution** (rotation/management signal): `mins_mean`, `mins_median`, `mins_std`, `mins_max`, `num_players_used`, `num_full_90`, `num_subs_made`, `mins_concentration_top11`, `mins_entropy`
+- **Formation** (from `homeTeam.formation` / `awayTeam.formation`): `form_def`, `form_mid`, `form_fwd`
+
+For each row, these are rolled over the manager's prior 20 games using `shift(1)` (strictly prior). Standardize → fit PCA(8) on rows with ≥3 prior games (interim-manager protection — fewer prior games gives a zero vector). For the upcoming gameweek's synthetic rows, the previous manager is assumed to continue and their *current* rolled state (their last 20 played games, no shift) is projected via the trained PCA basis.
+
+Manager identity for the upcoming game is treated as a known input — no future-data leakage in the features themselves, since every numeric feature is derived from games played strictly before the row's own match.
 
 ## Hyperparameter Tuning
 
@@ -136,6 +151,8 @@ python scrape_update_data.py --gameweek 28
 # Auto-detect latest gameweek
 python scrape_update_data.py --auto
 ```
+
+Both modes write the **full FotMob match-details JSON** to `data/matches/raw/{match_id}.json.gz` (gzipped) on every fetch (`save_raw_match()` in `scrape_update_data.py`). These raw payloads are the source of truth for downstream features that need fields not surfaced into `player_stats.csv` — currently the **manager embeddings** (manager identity + formation are pulled from `content.lineup.{home,away}Team.coach` and `.formation`). The cache used by the embedding feature, `data/match_managers.csv`, can be rebuilt at any time from these raw files.
 
 ### FPL API Integration
 

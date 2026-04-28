@@ -28,6 +28,7 @@ import time
 import random
 import argparse
 import json
+import gzip
 from datetime import datetime
 from pathlib import Path
 import undetected_chromedriver as uc
@@ -50,6 +51,17 @@ PLAYER_STATS_FILE = DATA_DIR / 'players' / 'player_stats.csv'
 SHOTMAP_FILE = DATA_DIR / 'matches' / 'shotmap.csv'
 MATCH_DETAILS_FILE = DATA_DIR / 'matches' / 'match_details.csv'
 FIXTURES_FILE = DATA_DIR / 'fixtures.csv'
+RAW_DIR = DATA_DIR / 'matches' / 'raw'
+
+
+def save_raw_match(match_id, payload):
+    """Save full match-details JSON gzipped at data/matches/raw/{match_id}.json.gz."""
+    if not payload:
+        return
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    path = RAW_DIR / f"{match_id}.json.gz"
+    with gzip.open(path, "wt", encoding="utf-8") as f:
+        json.dump(payload, f, separators=(",", ":"))
 
 # FPL short name -> FotMob full name mapping
 FPL_TO_FOTMOB_TEAMS = {
@@ -94,7 +106,7 @@ class FotMobBrowser:
 
     def __enter__(self):
         print("Launching browser to solve Cloudflare challenge...")
-        self._driver = uc.Chrome(headless=False)
+        self._driver = uc.Chrome(headless=False, version_main=147)
         self._driver.get("https://www.fotmob.com/")
         time.sleep(5)  # let Turnstile auto-solve
 
@@ -182,6 +194,7 @@ def extract_match_data(match_id, browser=None):
         if response.status_code != 200:
             return None, None, None
         match = response.json()
+    save_raw_match(match_id, match)
 
     content = match.get('content', {})
     general = match.get('general', {})

@@ -120,6 +120,11 @@ class FPLPipeline:
         # Merge FPL yellow/red card data (required for CardsModel)
         self.df = merge_fpl_card_data(self.df, str(self.data_dir), verbose)
 
+        # Snapshot raw data before feature engineering. Used at predict time to
+        # build synthetic target-gameweek rows so rolling features include the
+        # player's most recent actual match (shift(1) excludes the synthetic row).
+        self.raw_df = self.df.copy()
+
         return self
     
     def compute_features(self, verbose: bool = True) -> 'FPLPipeline':
@@ -2531,25 +2536,44 @@ with open(r"{temp_result_path}", 'w') as f:
         return predictions, simulations, viz_metrics, meta
 
     def _build_test_set(self, gameweek: int, season: str, verbose: bool) -> pd.DataFrame:
-        """Build test set for prediction from latest available data."""
-        # Get data before target gameweek
-        prior_data = self.df[
-            ~((self.df['season'] == season) & (self.df['gameweek'] >= gameweek))
+        """Build test set for target gameweek by appending synthetic prediction rows
+        to the raw historical data and recomputing rolling features.
+
+        Rolling features are defined as shift(1).rolling(N), which at a synthetic
+        GW-N prediction row yields the mean of the player's N most recent actual
+        matches. This fixes the stale-feature bug where predictions were effectively
+        based on the player's state as of the match BEFORE their most recent one.
+        """
+        if not hasattr(self, 'raw_df') or self.raw_df is None:
+            # Fallback: reconstruct a pseudo raw frame from self.df by keeping only
+            # the columns that existed before feature engineering.
+            raise ValueError("raw_df not available. Call load_data() before predict().")
+
+        fixtures = self._get_gw_fixtures(gameweek, season, verbose)
+        if len(fixtures) == 0:
+            if verbose:
+                print(f"WARNING: No fixtures found for GW{gameweek}")
+            return pd.DataFrame()
+
+        # Latest identity row per active player (from raw historical data only)
+        prior_raw = self.raw_df[
+            ~((self.raw_df['season'] == season) & (self.raw_df['gameweek'] >= gameweek))
         ].copy()
-        
-        if len(prior_data) == 0:
-            prior_data = self.df.copy()
-        
-        # Get latest features per player
-        latest = prior_data.sort_values(['player_id', 'season', 'gameweek']).groupby('player_id').last().reset_index()
-        
-        # Filter to only players active in current season
-        latest = latest[latest['player_id'].isin(self.current_season_players)].copy()
-        
+        if len(prior_raw) == 0:
+            prior_raw = self.raw_df.copy()
+
+        latest_identity = (
+            prior_raw.sort_values(['player_id', 'season', 'gameweek'])
+            .groupby('player_id').last().reset_index()
+        )
+        latest_identity = latest_identity[
+            latest_identity['player_id'].isin(self.current_season_players)
+        ].copy()
+
         if verbose:
-            print(f"Found {len(latest)} active players with historical data")
-        
-        # Get FPL availability and filter out unavailable players
+            print(f"Found {len(latest_identity)} active players with historical data")
+
+        # FPL availability filter
         fpl_availability = get_fpl_availability()
         if fpl_availability:
             def get_availability(name):
@@ -2559,11 +2583,9 @@ with open(r"{temp_result_path}", 'w') as f:
                 if name_lower in fpl_availability:
                     chance = fpl_availability[name_lower].get('chance_of_playing')
                     status = fpl_availability[name_lower].get('status', 'a')
-                    # If status is injured/suspended/unavailable with 0% chance, exclude
                     if status in ['i', 's', 'u'] and chance == 0:
                         return 0
                     return chance if chance is not None else 100
-                # Try last name
                 parts = str(name).split()
                 if len(parts) > 1:
                     last = parts[-1].lower()
@@ -2573,109 +2595,106 @@ with open(r"{temp_result_path}", 'w') as f:
                         if status in ['i', 's', 'u'] and chance == 0:
                             return 0
                         return chance if chance is not None else 100
-                return 100  # Default to available
-            
-            latest['fpl_chance_of_playing'] = latest['player_name'].apply(get_availability)
-            
-            # Filter: exclude players with 0% chance (injured/suspended)
-            n_before = len(latest)
-            latest = latest[latest['fpl_chance_of_playing'] > 0].copy()
-            n_filtered = n_before - len(latest)
-            
-            if verbose and n_filtered > 0:
-                print(f"  Filtered out {n_filtered} unavailable players (injured/suspended)")
-        
-        # Get fixtures for target gameweek
-        fixtures = self._get_gw_fixtures(gameweek, season, verbose)
+                return 100
 
-        if len(fixtures) == 0:
-            if verbose:
-                print("WARNING: No fixtures found - opponents will be 'Unknown'")
-            latest['opponent'] = 'Unknown'
-            latest['is_home'] = 0
-            latest['fixture_num'] = 1
-            return latest
-        
-        # Build lookup of latest team stats for updating opponent features
-        team_stats_lookup = self._build_team_stats_lookup()
-        
-        # Map players to fixtures using normalized team names
-        test_rows = []
-        
-        # Pre-normalize fixture team names
+            latest_identity['fpl_chance_of_playing'] = latest_identity['player_name'].apply(get_availability)
+            n_before = len(latest_identity)
+            latest_identity = latest_identity[latest_identity['fpl_chance_of_playing'] > 0].copy()
+            if verbose and (n_before - len(latest_identity)) > 0:
+                print(f"  Filtered out {n_before - len(latest_identity)} unavailable players (injured/suspended)")
+
+        # Normalize target-GW fixture teams once
         fixture_teams = []
         for _, fix in fixtures.iterrows():
-            home_norm = normalize_team_name(fix['home_team'])
-            away_norm = normalize_team_name(fix['away_team'])
             fixture_teams.append({
-                'home_norm': home_norm,
-                'away_norm': away_norm,
+                'home_norm': normalize_team_name(fix['home_team']),
+                'away_norm': normalize_team_name(fix['away_team']),
                 'home_team': fix['home_team'],
                 'away_team': fix['away_team'],
             })
-        
-        for _, player in latest.iterrows():
-            player_team = normalize_team_name(player.get('team', ''))
 
-            # Find ALL matching fixtures (handles DGW where a team plays twice)
+        # Raw stat columns (everything except identity / fixture-linkage) are
+        # zeroed out on synthetic rows so they don't contribute to rolling stats.
+        raw_cols = list(self.raw_df.columns)
+        preserve = {'player_id', 'player_name', 'team', 'position', 'shirt_number',
+                    'season', 'match_id', 'gameweek', 'opponent', 'is_home'}
+        stat_cols = [c for c in raw_cols if c not in preserve]
+
+        test_rows = []
+        synthetic_match_id = -900000  # negative IDs to avoid collision with real match_ids
+        unmatched_teams = set()
+        for _, player in latest_identity.iterrows():
+            player_team_norm = normalize_team_name(player.get('team', ''))
             fixture_num = 0
+            any_match = False
             for fix in fixture_teams:
-                # Check if player's team matches home or away team
-                if player_team == fix['home_norm'] or player_team in fix['home_norm'] or fix['home_norm'] in player_team:
-                    fixture_num += 1
-                    row = player.to_dict()
-                    row['opponent'] = fix['away_team']
-                    row['is_home'] = 1
-                    row['gameweek'] = gameweek
-                    row['season'] = season
-                    row['fixture_num'] = fixture_num
-                    # Update team features to latest (fixes stale stats for players who missed games)
-                    self._update_team_features(row, player.get('team', ''), team_stats_lookup)
-                    # Update opponent features based on actual opponent
-                    self._update_opponent_features(row, fix['away_team'], team_stats_lookup)
-                    test_rows.append(row)
-                elif player_team == fix['away_norm'] or player_team in fix['away_norm'] or fix['away_norm'] in player_team:
-                    fixture_num += 1
-                    row = player.to_dict()
-                    row['opponent'] = fix['home_team']
-                    row['is_home'] = 0
-                    row['gameweek'] = gameweek
-                    row['season'] = season
-                    row['fixture_num'] = fixture_num
-                    # Update team features to latest (fixes stale stats for players who missed games)
-                    self._update_team_features(row, player.get('team', ''), team_stats_lookup)
-                    # Update opponent features based on actual opponent
-                    self._update_opponent_features(row, fix['home_team'], team_stats_lookup)
-                    test_rows.append(row)
+                is_home_match = (
+                    player_team_norm == fix['home_norm']
+                    or (player_team_norm and fix['home_norm'] and
+                        (player_team_norm in fix['home_norm'] or fix['home_norm'] in player_team_norm))
+                )
+                is_away_match = (not is_home_match) and (
+                    player_team_norm == fix['away_norm']
+                    or (player_team_norm and fix['away_norm'] and
+                        (player_team_norm in fix['away_norm'] or fix['away_norm'] in player_team_norm))
+                )
+                if not (is_home_match or is_away_match):
+                    continue
+                any_match = True
+                fixture_num += 1
+                row = {c: player.get(c) for c in raw_cols}
+                for c in stat_cols:
+                    row[c] = 0  # zero stat cols on synthetic row
+                row['minutes'] = 0
+                row['gameweek'] = gameweek
+                row['season'] = season
+                row['opponent'] = fix['away_team'] if is_home_match else fix['home_team']
+                row['is_home'] = 1 if is_home_match else 0
+                row['match_id'] = synthetic_match_id
+                synthetic_match_id -= 1
+                row['_synthetic'] = True
+                row['_fixture_num'] = fixture_num
+                row['_fpl_chance_of_playing'] = player.get('fpl_chance_of_playing', 100)
+                test_rows.append(row)
+            if not any_match and player_team_norm:
+                unmatched_teams.add(player_team_norm)
 
         if verbose:
             if test_rows:
-                n_players = len(set(r.get('player_id') for r in test_rows))
+                n_players = len(set(r['player_id'] for r in test_rows))
                 n_dgw = len(test_rows) - n_players
                 print(f"Matched {len(test_rows)} player-fixtures to GW{gameweek} ({n_players} players)")
                 if n_dgw > 0:
-                    print(f"  DGW: {n_dgw} players have 2 fixtures")
+                    print(f"  DGW: {n_dgw} extra fixture rows for players with 2 fixtures")
             else:
                 print(f"WARNING: No players matched to GW{gameweek} fixtures!")
-                # Show what team names we have vs fixture teams
-                player_teams = set(normalize_team_name(t) for t in latest['team'].unique())
-                fixture_team_names = set()
-                for fix in fixture_teams:
-                    fixture_team_names.add(fix['home_norm'])
-                    fixture_team_names.add(fix['away_norm'])
-                unmatched = player_teams - fixture_team_names
-                if unmatched:
-                    print(f"  Unmatched player teams: {sorted(unmatched)[:10]}")
-                    print(f"  Fixture teams: {sorted(fixture_team_names)}")
+                if unmatched_teams:
+                    print(f"  Unmatched player teams (sample): {sorted(unmatched_teams)[:10]}")
+                return pd.DataFrame()
 
-        if test_rows:
-            return pd.DataFrame(test_rows)
-        else:
-            # Don't return stale opponents from historical data
-            latest['opponent'] = 'Unknown'
-            latest['is_home'] = 0
-            latest['fixture_num'] = 1
-            return latest
+        synthetic_df = pd.DataFrame(test_rows)
+
+        # Append synthetic rows to full raw (incl. any already-played target-GW rows)
+        raw_full = self.raw_df.copy()
+        raw_full['_synthetic'] = False
+        raw_full['_fixture_num'] = 1
+        raw_full['_fpl_chance_of_playing'] = 100
+
+        augmented = pd.concat([raw_full, synthetic_df], ignore_index=True, sort=False)
+
+        # Recompute all rolling features on the augmented dataset. At each
+        # synthetic row, shift(1).rolling(N) over player/team/opponent groups
+        # yields the mean of the N most recent actual matches.
+        augmented = compute_rolling_features(augmented, verbose=False)
+
+        test_df = augmented[augmented['_synthetic'] == True].copy()
+        test_df = test_df.rename(columns={
+            '_fixture_num': 'fixture_num',
+            '_fpl_chance_of_playing': 'fpl_chance_of_playing',
+        })
+        test_df = test_df.drop(columns=['_synthetic'], errors='ignore')
+
+        return test_df
     
     def _build_team_stats_lookup(self) -> dict:
         """Build lookup of latest team stats (offensive + defensive) for feature updates."""

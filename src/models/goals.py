@@ -55,6 +55,10 @@ class GoalsModel(BaseModel):
 
         # Match context
         'is_home',
+
+        # Manager embeddings (8-dim PCA over rolling-20-prior manager stats: minutes/GF/GA/formation)
+        'manager_emb_0', 'manager_emb_1', 'manager_emb_2', 'manager_emb_3',
+        'manager_emb_4', 'manager_emb_5', 'manager_emb_6', 'manager_emb_7',
     ]
 
     TARGET = 'goals'
