@@ -74,7 +74,11 @@ def _build_metrics_html(metrics):
 
 
 def _build_calibration_svg(calibration):
-    """Render predicted-vs-actual calibration as a side-by-side bar SVG."""
+    """Render predicted-vs-actual calibration as overlaid line plots.
+
+    One line per series (predicted mean, actual mean) across pred-points
+    buckets. Well-calibrated => the two lines overlap.
+    """
     if not calibration:
         return ''
 
@@ -85,7 +89,12 @@ def _build_calibration_svg(calibration):
     pad_t, pad_b = 30, 60
     plot_w = W - pad_l - pad_r
     plot_h = H - pad_t - pad_b
-    band = plot_w / max(n, 1)
+    # Center each bucket on its own slot
+    if n > 1:
+        slot = plot_w / (n - 1)
+        x_at = lambda i: pad_l + i * slot
+    else:
+        x_at = lambda i: pad_l + plot_w / 2
 
     max_val = max(max(b['pred'], b['actual']) for b in calibration)
     y_max = max(max_val * 1.15, 4.0)
@@ -104,35 +113,42 @@ def _build_calibration_svg(calibration):
             f'<text x="{pad_l-6}" y="{y_to(v)+4:.1f}" text-anchor="end" font-size="10" fill="#8b949e">{v:.1f}</text>'
         )
 
-    bars = []
+    pred_pts = [(x_at(i), y_to(b['pred'])) for i, b in enumerate(calibration)]
+    actual_pts = [(x_at(i), y_to(b['actual'])) for i, b in enumerate(calibration)]
+
+    def _polyline(pts, color):
+        d = ' '.join(f'{px:.1f},{py:.1f}' for px, py in pts)
+        return (
+            f'<polyline points="{d}" fill="none" stroke="{color}" '
+            f'stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>'
+        )
+
+    def _dots(pts, color):
+        return ''.join(
+            f'<circle cx="{px:.1f}" cy="{py:.1f}" r="3.5" fill="{color}" stroke="#1a1a2e" stroke-width="1"/>'
+            for px, py in pts
+        )
+
+    pred_line = _polyline(pred_pts, '#58a6ff') + _dots(pred_pts, '#58a6ff')
+    actual_line = _polyline(actual_pts, '#3fb950') + _dots(actual_pts, '#3fb950')
+
     labels = []
     for i, b in enumerate(calibration):
-        cx = pad_l + i * band
-        bw = band / 2 - 3
-        # Predicted bar (blue, drawn on left of band)
-        py = y_to(b['pred'])
-        bars.append(
-            f'<rect x="{cx+1:.1f}" y="{py:.1f}" width="{bw:.1f}" '
-            f'height="{(pad_t+plot_h-py):.1f}" fill="#58a6ff" opacity="0.85"/>'
-        )
-        # Actual bar (green, drawn on right of band)
-        ay = y_to(b['actual'])
-        bars.append(
-            f'<rect x="{cx+bw+4:.1f}" y="{ay:.1f}" width="{bw:.1f}" '
-            f'height="{(pad_t+plot_h-ay):.1f}" fill="#3fb950" opacity="0.85"/>'
+        x = x_at(i)
+        labels.append(
+            f'<text x="{x:.1f}" y="{H - pad_b + 16}" text-anchor="middle" font-size="10" fill="#c9d1d9">{b["bucket"]}</text>'
         )
         labels.append(
-            f'<text x="{cx + band/2:.1f}" y="{H - pad_b + 16}" text-anchor="middle" font-size="10" fill="#c9d1d9">{b["bucket"]}</text>'
-        )
-        labels.append(
-            f'<text x="{cx + band/2:.1f}" y="{H - pad_b + 30}" text-anchor="middle" font-size="9" fill="#484f58">n={b["n"]:,}</text>'
+            f'<text x="{x:.1f}" y="{H - pad_b + 30}" text-anchor="middle" font-size="9" fill="#484f58">n={b["n"]:,}</text>'
         )
 
     legend = (
-        f'<rect x="{W/2 - 100}" y="6" width="11" height="11" fill="#58a6ff" opacity="0.85"/>'
-        f'<text x="{W/2 - 84}" y="16" font-size="11" fill="#c9d1d9">Predicted (mean)</text>'
-        f'<rect x="{W/2 + 22}" y="6" width="11" height="11" fill="#3fb950" opacity="0.85"/>'
-        f'<text x="{W/2 + 38}" y="16" font-size="11" fill="#c9d1d9">Actual (mean)</text>'
+        f'<line x1="{W/2 - 110}" x2="{W/2 - 90}" y1="11" y2="11" stroke="#58a6ff" stroke-width="2"/>'
+        f'<circle cx="{W/2 - 100}" cy="11" r="3.5" fill="#58a6ff" stroke="#1a1a2e" stroke-width="1"/>'
+        f'<text x="{W/2 - 84}" y="15" font-size="11" fill="#c9d1d9">Predicted (mean)</text>'
+        f'<line x1="{W/2 + 22}" x2="{W/2 + 42}" y1="11" y2="11" stroke="#3fb950" stroke-width="2"/>'
+        f'<circle cx="{W/2 + 32}" cy="11" r="3.5" fill="#3fb950" stroke="#1a1a2e" stroke-width="1"/>'
+        f'<text x="{W/2 + 48}" y="15" font-size="11" fill="#c9d1d9">Actual (mean)</text>'
     )
 
     return f'''
@@ -142,12 +158,13 @@ def _build_calibration_svg(calibration):
     <svg viewBox="0 0 {W} {H}" style="width:100%;height:auto;display:block" preserveAspectRatio="xMidYMid meet">
       {legend}
       {''.join(grid)}
-      {''.join(bars)}
+      {pred_line}
+      {actual_line}
       {''.join(labels)}
       <text x="{W/2}" y="{H-4}" text-anchor="middle" font-size="11" fill="#8b949e">Predicted points bucket</text>
       <text x="14" y="{pad_t + plot_h/2}" text-anchor="middle" font-size="11" fill="#8b949e" transform="rotate(-90 14 {pad_t + plot_h/2})">Mean points</text>
     </svg>
-    <p style="font-size:11px;color:#8b949e;text-align:center;margin-top:6px">Each bucket aggregates test-set rows whose predicted FPL points (inc-bonus) fall in that range. Well-calibrated &rArr; bars match in height.</p>
+    <p style="font-size:11px;color:#8b949e;text-align:center;margin-top:6px">Each bucket aggregates test-set rows whose predicted FPL points (inc-bonus) fall in that range. Well-calibrated &rArr; the two lines overlap.</p>
   </div>
 </div>'''
 
