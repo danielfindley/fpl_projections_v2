@@ -1773,9 +1773,6 @@ with open(r"{temp_result_path}", 'w') as f:
                     print(f"{'':<15} {'naive(med)':<15} {naive:<12.4f}  (predict {median:.1f} for all)")
                 if fpl_mae.get('spearman_inc_bonus') is not None:
                     print(f"{'':<15} {'Spearman':<15} {fpl_mae['spearman_inc_bonus']:<12.4f}")
-                if fpl_mae.get('captain_hit_rate_top5') is not None:
-                    n = fpl_mae.get('captain_top_n', 5)
-                    print(f"{'':<15} {f'Top-{n} Cap hit':<15} {fpl_mae['captain_hit_rate_top5']*100:<12.2f}%")
                 if 'bonus_mae' in fpl_mae:
                     print(f"{'BONUS':<15} {'MAE':<15} {fpl_mae['bonus_mae']:<12.4f}")
 
@@ -1981,23 +1978,6 @@ with open(r"{temp_result_path}", 'w') as f:
         else:
             spearman_inc = None
 
-        # Top-N captain hit rate: per test gameweek, did the actual top-scorer land
-        # in our top-N predicted (by pred_fpl_pts_inc_bonus)? Captain decisions are
-        # the highest-leverage choice in FPL, so this stresses top-end discrimination.
-        N_CAPTAIN = 5
-        captain_hit_rate = None
-        if 'gameweek' in played.columns and len(played):
-            hit = total = 0
-            for _, grp in played.groupby('gameweek'):
-                if len(grp) < N_CAPTAIN:
-                    continue
-                actual_top_idx = grp['actual_fpl_pts'].idxmax()
-                pred_topN = set(grp.nlargest(N_CAPTAIN, 'pred_fpl_pts_inc_bonus').index)
-                if actual_top_idx in pred_topN:
-                    hit += 1
-                total += 1
-            captain_hit_rate = hit / total if total else None
-
         # Calibration buckets: group rows by predicted-points bucket and compare
         # mean predicted vs mean actual. Reveals systematic over/under-prediction.
         bucket_edges = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5),
@@ -2021,8 +2001,6 @@ with open(r"{temp_result_path}", 'w') as f:
             'poisson_dev_inc_bonus': poisson_dev_inc,
             'poisson_dev_naive_median': poisson_dev_naive,
             'spearman_inc_bonus': spearman_inc,
-            'captain_hit_rate_top5': captain_hit_rate,
-            'captain_top_n': N_CAPTAIN,
             'naive_median_value': median_val,
             'calibration_inc_bonus': calibration,
         }
@@ -2481,12 +2459,6 @@ with open(r"{temp_result_path}", 'w') as f:
                 overall_rows.append({'metric': 'Poisson Deviance', 'score': f"{fpl['poisson_dev_inc_bonus']:.4f}"})
             if fpl.get('spearman_inc_bonus') is not None:
                 overall_rows.append({'metric': 'Spearman ρ (rank corr)', 'score': f"{fpl['spearman_inc_bonus']:.4f}"})
-            if fpl.get('captain_hit_rate_top5') is not None:
-                n = fpl.get('captain_top_n', 5)
-                overall_rows.append({
-                    'metric': f'Top-{n} Captain Hit Rate',
-                    'score': f"{fpl['captain_hit_rate_top5']*100:.1f}%",
-                })
             if fpl.get('bonus_mae') is not None:
                 overall_rows.append({'metric': 'Bonus MAE', 'score': f"{fpl['bonus_mae']:.4f}"})
             calibration = fpl.get('calibration_inc_bonus') or None
