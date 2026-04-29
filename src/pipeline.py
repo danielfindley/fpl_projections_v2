@@ -418,7 +418,7 @@ class FPLPipeline:
             fpl_mae_dict = test_metrics.pop('_fpl_points_mae', None)
             fpl_ex = fpl_mae_dict['mae_ex_bonus'] if isinstance(fpl_mae_dict, dict) else fpl_mae_dict
             fpl_inc = fpl_mae_dict['mae_inc_bonus'] if isinstance(fpl_mae_dict, dict) else None
-            fpl_top25 = fpl_mae_dict.get('mae_top25_inc_bonus') if isinstance(fpl_mae_dict, dict) else None
+            fpl_top25 = None  # deprecated; column kept for schema compat
             run_id = log_experiment(
                 data_dir=str(self.data_dir),
                 n_iter=n_iter,
@@ -1764,17 +1764,24 @@ with open(r"{temp_result_path}", 'w') as f:
                     print(f"  {'Sub Reg':<13} {'MAE':<15} {metrics['sub_MAE']:<12.4f}")
             if fpl_mae is not None:
                 print("-" * 54)
-                print(f"{'FPL POINTS':<15} {'ex-bonus MAE':<15} {fpl_mae['mae_ex_bonus']:<12.4f}")
-                print(f"{'':<15} {'inc-bonus MAE':<15} {fpl_mae['mae_inc_bonus']:<12.4f}")
-                if fpl_mae.get('mae_top25_inc_bonus') is not None:
-                    print(f"{'':<15} {'top25 inc MAE':<15} {fpl_mae['mae_top25_inc_bonus']:<12.4f}")
+                print(f"{'FPL POINTS':<15} {'inc-bonus MAE':<15} {fpl_mae['mae_inc_bonus']:<12.4f}")
+                if fpl_mae.get('poisson_dev_inc_bonus') is not None:
+                    print(f"{'':<15} {'Poisson Dev':<15} {fpl_mae['poisson_dev_inc_bonus']:<12.4f}")
+                if fpl_mae.get('poisson_dev_naive_median') is not None:
+                    naive = fpl_mae['poisson_dev_naive_median']
+                    median = fpl_mae.get('naive_median_value', 0)
+                    print(f"{'':<15} {'naive(med)':<15} {naive:<12.4f}  (predict {median:.1f} for all)")
+                if fpl_mae.get('spearman_inc_bonus') is not None:
+                    print(f"{'':<15} {'Spearman':<15} {fpl_mae['spearman_inc_bonus']:<12.4f}")
+                if fpl_mae.get('captain_hit_rate_top5') is not None:
+                    n = fpl_mae.get('captain_top_n', 5)
+                    print(f"{'':<15} {f'Top-{n} Cap hit':<15} {fpl_mae['captain_hit_rate_top5']*100:<12.2f}%")
                 if 'bonus_mae' in fpl_mae:
                     print(f"{'BONUS':<15} {'MAE':<15} {fpl_mae['bonus_mae']:<12.4f}")
 
             # Add context for interpretation
-            print("\n(Lower is better for all metrics)")
-            print("ex-bonus: FPL points excluding bonus on both sides")
-            print("inc-bonus: FPL points with bonus on both sides (pred bonus vs actual bonus)")
+            print("\n(Lower is better for MAE / Poisson Deviance; higher is better for Spearman & captain hit rate)")
+            print("inc-bonus: predicted vs actual FPL points with bonus on both sides")
 
         test_metrics['_fpl_points_mae'] = fpl_mae
         return test_metrics
@@ -1794,8 +1801,8 @@ with open(r"{temp_result_path}", 'w') as f:
             mae_ex_bonus: MAE excluding bonus from both sides (apples-to-apples)
             mae_inc_bonus: MAE with actual bonus included (shows full gap)
         """
-        from sklearn.metrics import mean_absolute_error
-        from scipy.stats import poisson as _poisson, nbinom as _nbinom
+        from sklearn.metrics import mean_absolute_error, mean_poisson_deviance
+        from scipy.stats import poisson as _poisson, nbinom as _nbinom, spearmanr
 
         POS_MAP = {0: 'GK', 1: 'DEF', 2: 'MID', 3: 'FWD'}
         _defcon_r = pred_store.get('defcon', {}).get('dispersion_r', None)
@@ -1950,27 +1957,74 @@ with open(r"{temp_result_path}", 'w') as f:
         mask = (df['minutes'] >= 1) & df['actual_pts_ex_bonus'].notna() & df['pred_fpl_pts'].notna()
         played = df.loc[mask]
 
-        # Top-25 per gameweek inc-bonus MAE: ranks players by predicted points within
-        # each test GW, keeps the top 25, and averages absolute error over those rows.
-        # Captures prediction quality where it matters (the players a manager would
-        # actually pick) rather than diluting across hundreds of bench/sub players.
-        if 'gameweek' in played.columns and len(played):
-            top25_rows = (
-                played.assign(_pred=played['pred_fpl_pts_inc_bonus'])
-                      .sort_values(['gameweek', '_pred'], ascending=[True, False])
-                      .groupby('gameweek', group_keys=False)
-                      .head(25)
-            )
-            mae_top25_inc = mean_absolute_error(
-                top25_rows['actual_fpl_pts'], top25_rows['pred_fpl_pts_inc_bonus']
-            ) if len(top25_rows) else None
+        # --- Overall-points metrics on the inc-bonus side ---
+        y_true = played['actual_fpl_pts'].values.astype(float)
+        y_pred = played['pred_fpl_pts_inc_bonus'].values.astype(float)
+
+        # Poisson deviance: clip true >= 0 (FPL pts can be negative due to cards/conceded)
+        # and clip pred to a tiny positive (deviance is undefined at 0).
+        y_true_nn = np.maximum(y_true, 0.0)
+        y_pred_pos = np.maximum(y_pred, 1e-3)
+        poisson_dev_inc = mean_poisson_deviance(y_true_nn, y_pred_pos) if len(y_true) else None
+
+        # Naive baseline: predict the median of actual points for everyone.
+        median_val = float(np.median(y_true_nn)) if len(y_true_nn) else 0.0
+        y_pred_naive = np.full(len(y_true_nn), max(median_val, 1e-3))
+        poisson_dev_naive = (
+            mean_poisson_deviance(y_true_nn, y_pred_naive) if len(y_true_nn) else None
+        )
+
+        # Spearman rank correlation
+        if len(y_true) > 1:
+            sp_corr, _ = spearmanr(y_true, y_pred)
+            spearman_inc = float(sp_corr) if not np.isnan(sp_corr) else None
         else:
-            mae_top25_inc = None
+            spearman_inc = None
+
+        # Top-N captain hit rate: per test gameweek, did the actual top-scorer land
+        # in our top-N predicted (by pred_fpl_pts_inc_bonus)? Captain decisions are
+        # the highest-leverage choice in FPL, so this stresses top-end discrimination.
+        N_CAPTAIN = 5
+        captain_hit_rate = None
+        if 'gameweek' in played.columns and len(played):
+            hit = total = 0
+            for _, grp in played.groupby('gameweek'):
+                if len(grp) < N_CAPTAIN:
+                    continue
+                actual_top_idx = grp['actual_fpl_pts'].idxmax()
+                pred_topN = set(grp.nlargest(N_CAPTAIN, 'pred_fpl_pts_inc_bonus').index)
+                if actual_top_idx in pred_topN:
+                    hit += 1
+                total += 1
+            captain_hit_rate = hit / total if total else None
+
+        # Calibration buckets: group rows by predicted-points bucket and compare
+        # mean predicted vs mean actual. Reveals systematic over/under-prediction.
+        bucket_edges = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5),
+                        (5, 6), (6, 8), (8, 10), (10, 50)]
+        calibration = []
+        for lo, hi in bucket_edges:
+            mask_b = (played['pred_fpl_pts_inc_bonus'] >= lo) & (played['pred_fpl_pts_inc_bonus'] < hi)
+            n = int(mask_b.sum())
+            if n == 0:
+                continue
+            calibration.append({
+                'bucket': f'{lo}-{hi}' if hi < 50 else f'{lo}+',
+                'n': n,
+                'pred': float(played.loc[mask_b, 'pred_fpl_pts_inc_bonus'].mean()),
+                'actual': float(played.loc[mask_b, 'actual_fpl_pts'].mean()),
+            })
 
         result = {
             'mae_ex_bonus': mean_absolute_error(played['actual_pts_ex_bonus'], played['pred_fpl_pts']),
             'mae_inc_bonus': mean_absolute_error(played['actual_fpl_pts'], played['pred_fpl_pts_inc_bonus']),
-            'mae_top25_inc_bonus': mae_top25_inc,
+            'poisson_dev_inc_bonus': poisson_dev_inc,
+            'poisson_dev_naive_median': poisson_dev_naive,
+            'spearman_inc_bonus': spearman_inc,
+            'captain_hit_rate_top5': captain_hit_rate,
+            'captain_top_n': N_CAPTAIN,
+            'naive_median_value': median_val,
+            'calibration_inc_bonus': calibration,
         }
 
         # Standalone bonus MAE (predicted bonus vs actual bonus)
@@ -2398,33 +2452,54 @@ with open(r"{temp_result_path}", 'w') as f:
         return result
 
     def get_viz_metrics(self):
-        """Format last_test_metrics for generate_distribution_html(metrics=...)."""
+        """Format last_test_metrics for generate_distribution_html(metrics=...).
+
+        Returns a dict ``{'sections': [...], 'calibration': [...]}`` with two
+        sections — sub-models and overall FPL points — plus calibration buckets.
+        """
         if not hasattr(self, 'last_test_metrics') or not self.last_test_metrics:
             return None
-        result = []
+
+        sub_rows = []
         for model_name, m in self.last_test_metrics.items():
             if model_name.startswith('_'):
                 continue
             if isinstance(m, dict) and 'metric_name' in m and 'primary' in m:
-                result.append({
+                sub_rows.append({
                     'model': model_name.capitalize(),
                     'metric': m['metric_name'],
                     'score': f"{m['primary']:.4f}",
                 })
-        # Add FPL points MAE if available
+
+        overall_rows = []
+        calibration = None
         fpl = self.last_test_metrics.get('_fpl_points_mae')
-        if fpl and isinstance(fpl, dict):
-            if fpl.get('mae_ex_bonus') is not None:
-                result.append({'model': 'FPL Points', 'metric': 'MAE (ex-bonus)', 'score': f"{fpl['mae_ex_bonus']:.4f}"})
+        if isinstance(fpl, dict):
             if fpl.get('mae_inc_bonus') is not None:
-                result.append({'model': 'FPL Points', 'metric': 'MAE (inc-bonus)', 'score': f"{fpl['mae_inc_bonus']:.4f}"})
-            if fpl.get('mae_top25_inc_bonus') is not None:
-                result.append({'model': 'FPL Points', 'metric': 'MAE top-25/GW (inc-bonus)', 'score': f"{fpl['mae_top25_inc_bonus']:.4f}"})
+                overall_rows.append({'metric': 'MAE (inc-bonus)', 'score': f"{fpl['mae_inc_bonus']:.4f}"})
+            if fpl.get('poisson_dev_inc_bonus') is not None:
+                overall_rows.append({'metric': 'Poisson Deviance', 'score': f"{fpl['poisson_dev_inc_bonus']:.4f}"})
+            if fpl.get('spearman_inc_bonus') is not None:
+                overall_rows.append({'metric': 'Spearman ρ (rank corr)', 'score': f"{fpl['spearman_inc_bonus']:.4f}"})
+            if fpl.get('captain_hit_rate_top5') is not None:
+                n = fpl.get('captain_top_n', 5)
+                overall_rows.append({
+                    'metric': f'Top-{n} Captain Hit Rate',
+                    'score': f"{fpl['captain_hit_rate_top5']*100:.1f}%",
+                })
             if fpl.get('bonus_mae') is not None:
-                result.append({'model': 'Bonus', 'metric': 'MAE', 'score': f"{fpl['bonus_mae']:.4f}"})
-        elif fpl is not None:
-            result.append({'model': 'FPL Points', 'metric': 'MAE (ex-bonus)', 'score': f"{fpl:.4f}"})
-        return result or None
+                overall_rows.append({'metric': 'Bonus MAE', 'score': f"{fpl['bonus_mae']:.4f}"})
+            calibration = fpl.get('calibration_inc_bonus') or None
+
+        sections = []
+        if sub_rows:
+            sections.append({'title': 'Sub-Models (Holdout Test Set)', 'rows': sub_rows})
+        if overall_rows:
+            sections.append({'title': 'Overall FPL Points (Holdout Test Set)', 'rows': overall_rows})
+
+        if not sections and not calibration:
+            return None
+        return {'sections': sections, 'calibration': calibration}
 
     def save_run(self, predictions: pd.DataFrame, gameweek: int, season: str = '2025/2026',
                  description: str = '', verbose: bool = True) -> Path:
@@ -2507,8 +2582,13 @@ with open(r"{temp_result_path}", 'w') as f:
             print(f"  tuned_params.json: {len(self.tuned_params)} models")
             if hasattr(self, 'last_test_metrics') and self.last_test_metrics:
                 fpl = self.last_test_metrics.get('_fpl_points_mae', {})
-                if isinstance(fpl, dict):
-                    print(f"  FPL MAE: ex-bonus={fpl.get('mae_ex_bonus', '?'):.4f}, inc-bonus={fpl.get('mae_inc_bonus', '?'):.4f}")
+                if isinstance(fpl, dict) and fpl.get('mae_inc_bonus') is not None:
+                    parts = [f"inc-bonus MAE={fpl['mae_inc_bonus']:.4f}"]
+                    if fpl.get('poisson_dev_inc_bonus') is not None:
+                        parts.append(f"PoissonDev={fpl['poisson_dev_inc_bonus']:.4f}")
+                    if fpl.get('spearman_inc_bonus') is not None:
+                        parts.append(f"Spearman={fpl['spearman_inc_bonus']:.4f}")
+                    print(f"  FPL points: {', '.join(parts)}")
 
         return run_dir
 

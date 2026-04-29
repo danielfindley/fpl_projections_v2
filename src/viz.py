@@ -12,25 +12,144 @@ from pathlib import Path
 
 
 def _build_metrics_html(metrics):
-    """Build an HTML table for model accuracy metrics."""
+    """Build HTML for sub-model + overall-points metrics + calibration plot.
+
+    Accepts either the legacy list-of-rows format (single section, no
+    calibration) or the new dict ``{'sections': [...], 'calibration': [...]}``.
+    """
     if not metrics:
         return ''
-    rows = ''
-    for m in metrics:
-        rows += f'<tr><td>{m["model"]}</td><td>{m["metric"]}</td><td>{m["score"]}</td></tr>\n'
-    return f'''
-<div style="max-width:500px;margin:40px auto;padding:0 16px">
-  <h3 style="color:#e0e0e0;text-align:center;margin-bottom:12px;font-size:14px">Model Accuracy (Holdout Test Set)</h3>
+
+    if isinstance(metrics, list):
+        sections = [{'title': 'Model Accuracy (Holdout Test Set)', 'rows': metrics}]
+        calibration = None
+    else:
+        sections = metrics.get('sections') or []
+        calibration = metrics.get('calibration')
+
+    parts = ['<div style="max-width:620px;margin:32px auto 16px;padding:0 16px">']
+    for section in sections:
+        rows = section.get('rows') or []
+        if not rows:
+            continue
+        show_model = any(r.get('model') for r in rows)
+        body = ''
+        for r in rows:
+            if show_model:
+                body += (
+                    f'<tr><td style="padding:6px 12px">{r.get("model","")}</td>'
+                    f'<td style="padding:6px 12px">{r["metric"]}</td>'
+                    f'<td style="padding:6px 12px;text-align:right;font-variant-numeric:tabular-nums">{r["score"]}</td></tr>\n'
+                )
+            else:
+                body += (
+                    f'<tr><td style="padding:6px 12px">{r["metric"]}</td>'
+                    f'<td style="padding:6px 12px;text-align:right;font-variant-numeric:tabular-nums">{r["score"]}</td></tr>\n'
+                )
+        if show_model:
+            head = (
+                '<th style="padding:8px 12px;text-align:left">Model</th>'
+                '<th style="padding:8px 12px;text-align:left">Metric</th>'
+                '<th style="padding:8px 12px;text-align:right">Test</th>'
+            )
+        else:
+            head = (
+                '<th style="padding:8px 12px;text-align:left">Metric</th>'
+                '<th style="padding:8px 12px;text-align:right">Test</th>'
+            )
+        parts.append(f'''
+<div style="margin:18px 0 0">
+  <h3 style="color:#e0e0e0;text-align:center;margin-bottom:10px;font-size:14px;font-weight:600">{section["title"]}</h3>
   <table style="width:100%;border-collapse:collapse;font-size:13px;color:#ccc;background:#1a1a2e;border-radius:8px;overflow:hidden">
-    <thead><tr style="background:#16213e;color:#7fdbca">
-      <th style="padding:8px 12px;text-align:left">Model</th>
-      <th style="padding:8px 12px;text-align:left">Metric</th>
-      <th style="padding:8px 12px;text-align:right">Test Score</th>
-    </tr></thead>
-    <tbody>{rows}</tbody>
+    <thead><tr style="background:#16213e;color:#7fdbca">{head}</tr></thead>
+    <tbody>{body}</tbody>
   </table>
-</div>
-'''
+</div>''')
+
+    if calibration:
+        parts.append(_build_calibration_svg(calibration))
+
+    parts.append('</div>')
+    return '\n'.join(parts)
+
+
+def _build_calibration_svg(calibration):
+    """Render predicted-vs-actual calibration as a side-by-side bar SVG."""
+    if not calibration:
+        return ''
+
+    n = len(calibration)
+    W = 580
+    H = 280
+    pad_l, pad_r = 40, 14
+    pad_t, pad_b = 30, 60
+    plot_w = W - pad_l - pad_r
+    plot_h = H - pad_t - pad_b
+    band = plot_w / max(n, 1)
+
+    max_val = max(max(b['pred'], b['actual']) for b in calibration)
+    y_max = max(max_val * 1.15, 4.0)
+
+    def y_to(v):
+        return pad_t + plot_h - (v / y_max) * plot_h
+
+    grid = []
+    for i in range(6):
+        v = i * y_max / 5
+        grid.append(
+            f'<line x1="{pad_l}" x2="{W-pad_r}" y1="{y_to(v):.1f}" y2="{y_to(v):.1f}" '
+            f'stroke="#21262d" stroke-dasharray="2,3"/>'
+        )
+        grid.append(
+            f'<text x="{pad_l-6}" y="{y_to(v)+4:.1f}" text-anchor="end" font-size="10" fill="#8b949e">{v:.1f}</text>'
+        )
+
+    bars = []
+    labels = []
+    for i, b in enumerate(calibration):
+        cx = pad_l + i * band
+        bw = band / 2 - 3
+        # Predicted bar (blue, drawn on left of band)
+        py = y_to(b['pred'])
+        bars.append(
+            f'<rect x="{cx+1:.1f}" y="{py:.1f}" width="{bw:.1f}" '
+            f'height="{(pad_t+plot_h-py):.1f}" fill="#58a6ff" opacity="0.85"/>'
+        )
+        # Actual bar (green, drawn on right of band)
+        ay = y_to(b['actual'])
+        bars.append(
+            f'<rect x="{cx+bw+4:.1f}" y="{ay:.1f}" width="{bw:.1f}" '
+            f'height="{(pad_t+plot_h-ay):.1f}" fill="#3fb950" opacity="0.85"/>'
+        )
+        labels.append(
+            f'<text x="{cx + band/2:.1f}" y="{H - pad_b + 16}" text-anchor="middle" font-size="10" fill="#c9d1d9">{b["bucket"]}</text>'
+        )
+        labels.append(
+            f'<text x="{cx + band/2:.1f}" y="{H - pad_b + 30}" text-anchor="middle" font-size="9" fill="#484f58">n={b["n"]:,}</text>'
+        )
+
+    legend = (
+        f'<rect x="{W/2 - 100}" y="6" width="11" height="11" fill="#58a6ff" opacity="0.85"/>'
+        f'<text x="{W/2 - 84}" y="16" font-size="11" fill="#c9d1d9">Predicted (mean)</text>'
+        f'<rect x="{W/2 + 22}" y="6" width="11" height="11" fill="#3fb950" opacity="0.85"/>'
+        f'<text x="{W/2 + 38}" y="16" font-size="11" fill="#c9d1d9">Actual (mean)</text>'
+    )
+
+    return f'''
+<div style="margin:24px 0 0">
+  <h3 style="color:#e0e0e0;text-align:center;margin-bottom:8px;font-size:14px;font-weight:600">Points Calibration: Predicted vs Actual by Bucket</h3>
+  <div style="background:#1a1a2e;border-radius:8px;padding:12px">
+    <svg viewBox="0 0 {W} {H}" style="width:100%;height:auto;display:block" preserveAspectRatio="xMidYMid meet">
+      {legend}
+      {''.join(grid)}
+      {''.join(bars)}
+      {''.join(labels)}
+      <text x="{W/2}" y="{H-4}" text-anchor="middle" font-size="11" fill="#8b949e">Predicted points bucket</text>
+      <text x="14" y="{pad_t + plot_h/2}" text-anchor="middle" font-size="11" fill="#8b949e" transform="rotate(-90 14 {pad_t + plot_h/2})">Mean points</text>
+    </svg>
+    <p style="font-size:11px;color:#8b949e;text-align:center;margin-top:6px">Each bucket aggregates test-set rows whose predicted FPL points (inc-bonus) fall in that range. Well-calibrated &rArr; bars match in height.</p>
+  </div>
+</div>'''
 
 
 FPL_GOAL_PTS = {'GK': 6, 'DEF': 6, 'MID': 5, 'FWD': 4}
