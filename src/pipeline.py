@@ -1980,8 +1980,9 @@ with open(r"{temp_result_path}", 'w') as f:
 
         # Calibration buckets: group rows by predicted-points bucket and compare
         # mean predicted vs mean actual. Reveals systematic over/under-prediction.
-        bucket_edges = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5),
-                        (5, 6), (6, 8), (8, 10), (10, 50)]
+        bucket_edges = [(1, 1.5), (1.5, 2), (2, 2.5), (2.5, 3), (3, 3.5),
+                        (3.5, 4), (4, 4.5), (4.5, 5), (5, 5.5), (5.5, 6),
+                        (6, 6.5), (6.5, 50)]
         calibration = []
         for lo, hi in bucket_edges:
             mask_b = (played['pred_fpl_pts_inc_bonus'] >= lo) & (played['pred_fpl_pts_inc_bonus'] < hi)
@@ -2448,6 +2449,13 @@ with open(r"{temp_result_path}", 'w') as f:
                     'metric': m['metric_name'],
                     'score': f"{m['primary']:.4f}",
                 })
+        fpl_bonus = self.last_test_metrics.get('_fpl_points_mae')
+        if isinstance(fpl_bonus, dict) and fpl_bonus.get('bonus_mae') is not None:
+            sub_rows.append({
+                'model': 'Bonus',
+                'metric': 'MAE',
+                'score': f"{fpl_bonus['bonus_mae']:.4f}",
+            })
 
         overall_rows = []
         calibration = None
@@ -2459,8 +2467,6 @@ with open(r"{temp_result_path}", 'w') as f:
                 overall_rows.append({'metric': 'Poisson Deviance', 'score': f"{fpl['poisson_dev_inc_bonus']:.4f}"})
             if fpl.get('spearman_inc_bonus') is not None:
                 overall_rows.append({'metric': 'Spearman ρ (rank corr)', 'score': f"{fpl['spearman_inc_bonus']:.4f}"})
-            if fpl.get('bonus_mae') is not None:
-                overall_rows.append({'metric': 'Bonus MAE', 'score': f"{fpl['bonus_mae']:.4f}"})
             calibration = fpl.get('calibration_inc_bonus') or None
 
         sections = []
