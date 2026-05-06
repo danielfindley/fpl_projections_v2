@@ -769,10 +769,11 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
 
         # Goals conceded = opponent's player goals + this team's own goals
         # own goals by this team are in the original (pre-swap) match_results
-        team_og = match_results[['team_norm', 'season', 'gameweek', 'own_goal']].rename(
-            columns={'own_goal': 'self_own_goals'}
+        # Include opponent_norm in key to prevent cartesian product for DGW teams
+        team_og = match_results[['team_norm', 'opponent_norm', 'season', 'gameweek', 'own_goal']].rename(
+            columns={'own_goal': 'self_own_goals', 'opponent_norm': 'opponent_temp_norm'}
         )
-        team_conceded = team_conceded.merge(team_og, on=['team_norm', 'season', 'gameweek'], how='left')
+        team_conceded = team_conceded.merge(team_og, on=['team_norm', 'opponent_temp_norm', 'season', 'gameweek'], how='left')
         team_conceded['self_own_goals'] = team_conceded['self_own_goals'].fillna(0)
         team_conceded['goals_conceded'] = team_conceded['opp_goals'] + team_conceded['self_own_goals']
         team_conceded = team_conceded.sort_values(['team_norm', 'season', 'gameweek'])
@@ -794,10 +795,14 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
             )
 
         # Merge team defensive stats (dynamic column selection)
+        # Deduplicate per (team, season, gameweek) to avoid cartesian for DGW teams
         team_def_cols = [c for c in team_conceded.columns
                         if any(c.startswith(p) for p in ['team_conceded_roll', 'team_xga_roll', 'team_cs_rate_roll'])]
+        team_conceded_dedup = team_conceded[['team_norm', 'season', 'gameweek'] + team_def_cols].drop_duplicates(
+            subset=['team_norm', 'season', 'gameweek'], keep='first'
+        )
         df = df.merge(
-            team_conceded[['team_norm', 'season', 'gameweek'] + team_def_cols],
+            team_conceded_dedup,
             on=['team_norm', 'season', 'gameweek'], how='left'
         )
 
@@ -845,8 +850,11 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
         opp_defense = opp_defense.rename(columns=rename_map)
 
         opp_def_merged_cols = [c for c in opp_defense.columns if c.startswith('opp_')]
+        opp_defense_dedup = opp_defense[['opponent_norm', 'season', 'gameweek'] + opp_def_merged_cols].drop_duplicates(
+            subset=['opponent_norm', 'season', 'gameweek'], keep='first'
+        )
         df = df.merge(
-            opp_defense[['opponent_norm', 'season', 'gameweek'] + opp_def_merged_cols],
+            opp_defense_dedup,
             on=['opponent_norm', 'season', 'gameweek'], how='left'
         )
 
