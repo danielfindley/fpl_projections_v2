@@ -73,6 +73,7 @@ Goals, Assists, and Defcon models output expected match counts directly (no per-
 - GK-specific models (Saves) filter to `is_gk == 1`
 - Training samples weighted by minutes played relative to mean
 - `use_subprocess=True` in tune() for memory isolation
+- **Do not create new files** unless explicitly asked — use existing files, inline scripts (`python -c` or stdin heredoc), or the notebook
 
 ## Testing
 
@@ -109,6 +110,35 @@ For agent-driven experimentation workflow, see `AGENTS.md`.
 ### FPL API data integration
 `load_data()` automatically fetches yellow/red card data from the FPL API (`fetch_fpl_actual_points()`) and merges it into the training DataFrame by matching player name + team + gameweek. This enriches the FotMob data (which lacks card columns) with actual FPL yellow_cards and red_cards for the current season. The merge is cached to `data/fpl_actual_points.csv`. If the API is unreachable, `load_data()` will raise — internet access is required on first run (cached thereafter).
 
+## Visualization (src/viz.py)
+
+`generate_distribution_html()` produces a standalone HTML file (`distributions.html`) with:
+- D3.js ridge plot showing Monte Carlo points distributions for top outfield players
+- Sub-model metrics table, overall FPL points metrics, and a calibration plot (predicted vs actual by bucket)
+- Responsive layout — desktop ridge plot and mobile card layout are both embedded; the correct one is selected at load time based on viewport width
+
+The viz is fed by `pipeline.get_viz_metrics()` (formats `last_test_metrics` into sections + calibration buckets) and `pipeline.last_simulations` (Monte Carlo simulation arrays from BonusModel).
+
+## Weekly Deploy Workflow
+
+Use the `/deploy-predictions` skill (Claude Code slash command) to run the full weekly pipeline. It automates:
+1. **Detect next gameweek** — queries FPL API for latest finished GW, compares against scraped data
+2. **Scrape** — `python scrape_update_data.py --auto` (Playwright + Cloudflare bypass on FotMob)
+3. **Tune** (optional, ~30-60 min) — asks whether to retune or reuse cached params from latest run
+4. **Train + predict + viz** — loads tuned params, trains on all data, predicts next GW, generates `distributions.html`
+5. **Save run** — `pipeline.save_run()` persists predictions, simulations, tuned params, and metrics to `data/runs/gw{N}_{timestamp}/`
+6. **Deploy** — copies `distributions.html` to `C:/Users/dpfin/repos/danielfindley.com/projects/`, commits, pushes (asks before push)
+
+When tuning is split from training (steps 3a/3b in the skill), tuned params are serialized to `data/_latest_tuned_params.json` so a crash in the training step doesn't lose the tuning work.
+
+### Run directory structure (`data/runs/gw{N}_{timestamp}/`)
+- `predictions.csv` — full prediction table
+- `simulations/` — Monte Carlo simulation arrays (`.npy`)
+- `tuned_params.json` — Optuna-selected hyperparams + features per model
+- `test_metrics.json` — holdout test set metrics (sub-model + FPL points)
+- `viz_metrics.json` — formatted metrics for the HTML viz
+- `meta.json` — run metadata (description, timestamp)
+
 ## Data
 
 - `data/players/player_stats.csv`: Player-match level FotMob stats (gitignored)
@@ -117,5 +147,6 @@ For agent-driven experimentation workflow, see `AGENTS.md`.
 - `data/tuning_results/`: Cached Optuna tuning results (JSON)
 - `data/predictions/`: Output CSVs per gameweek (gitignored)
 - `data/experiments.db`: Experiment log (SQLite, gitignored)
+- `data/runs/`: Saved pipeline runs with predictions, simulations, params, metrics (gitignored)
 - `data/matches/raw/{match_id}.json.gz`: Full FotMob match-details payloads, gzipped. Written by `scrape_update_data.py` on every fetch (both `--gameweek N` and `--auto` modes call `save_raw_match()`). Source of truth for fields not flattened into `player_stats.csv` — currently used by the manager-embedding feature to extract `content.lineup.{home,away}Team.coach` and `.formation`.
 - `data/match_managers.csv`: Cache of (match_id, home/away team, manager id+name, formation) parsed from the raw JSONs. Rebuildable from raw at any time. Consumed by `add_manager_embeddings()` in `src/features.py`.

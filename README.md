@@ -196,3 +196,63 @@ Predictions saved to `data/predictions/gw{N}_{season}.csv` with columns:
 - Player info: `player_name`, `team`, `fpl_position`, `opponent`, `is_home`
 - Predictions: `pred_minutes`, `pred_exp_goals`, `pred_exp_assists`, `pred_cs_prob`, `pred_defcon_prob`, `pred_exp_saves`, `pred_yellow_prob`, `pred_red_prob`, `pred_bonus`
 - Points breakdown: `exp_goals_pts`, `exp_assists_pts`, `exp_cs_pts`, `exp_conceded_penalty`, `exp_saves_pts`, `exp_defcon_pts`, `exp_bonus_pts`, `exp_yellow_pts`, `exp_red_pts`, `exp_total_pts`
+
+## Visualization
+
+`src/viz.py` generates a standalone HTML file (`distributions.html`) with:
+
+- **D3.js ridge plot** showing Monte Carlo points distributions for top outfield players
+- **Metrics dashboard** — sub-model holdout metrics, overall FPL points MAE/Poisson deviance/Spearman, and a calibration plot (predicted vs actual by bucket)
+- **Responsive layout** — desktop ridge plot and mobile card layout embedded in a single file, selected at load time based on viewport width
+
+Generated via:
+```python
+from src.viz import generate_distribution_html
+
+viz_metrics = pipeline.get_viz_metrics()
+generate_distribution_html(
+    predictions,
+    pipeline.last_simulations,
+    output_path='distributions.html',
+    top_n=100,
+    gameweek=32,
+    metrics=viz_metrics,
+)
+```
+
+## Weekly Deploy Workflow
+
+The full weekly workflow (scrape, train, predict, generate viz, deploy to [danielfindley.com](https://danielfindley.com)) is automated via a Claude Code slash command (`/deploy-predictions`). The workflow:
+
+1. **Detect next gameweek** — queries the FPL API for the latest finished GW and compares against scraped data
+2. **Scrape** — `python scrape_update_data.py --auto` (Playwright + Cloudflare bypass on FotMob)
+3. **Tune** (optional, ~30-60 min) — asks whether to retune hyperparameters or reuse cached params from the latest saved run
+4. **Train + predict + viz** — loads tuned params, trains on all data, predicts next GW, generates `distributions.html`
+5. **Save run** — `pipeline.save_run()` persists predictions, simulations, tuned params, and metrics to `data/runs/gw{N}_{timestamp}/`
+6. **Deploy** — copies `distributions.html` to the website repo, commits, and pushes
+
+### Saved runs (`data/runs/`)
+
+Each `save_run()` creates a timestamped directory containing:
+
+```
+data/runs/gw32_20260323_235026/
+├── predictions.csv          # Full prediction table
+├── simulations/             # Monte Carlo arrays (.npy)
+├── tuned_params.json        # Optuna-selected hyperparams + features
+├── test_metrics.json        # Holdout test set metrics
+├── viz_metrics.json         # Formatted metrics for the HTML viz
+└── meta.json                # Run metadata (description, timestamp)
+```
+
+Previous runs can be used to regenerate the viz or load tuned params without retraining.
+
+## Experiment Tracking
+
+All tuning runs are auto-logged to `data/experiments.db` (SQLite). See `AGENTS.md` for the full experimentation workflow.
+
+```bash
+python scripts/experiment.py --history             # all runs
+python scripts/experiment.py --best                # best per model
+python scripts/experiment.py --compare 3           # compare last 3 runs
+```
