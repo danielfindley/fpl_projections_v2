@@ -85,7 +85,9 @@ def _compute_calendar_minutes_features(df: pd.DataFrame) -> pd.DataFrame:
     grid['appeared'] = grid['appeared'].fillna(0).astype(int)
 
     grid = grid.sort_values(['player_id', 'season', 'gameweek']).reset_index(drop=True)
-    g = grid.groupby(['player_id', 'season'])
+    # Rolling state carries across seasons: at GW1 a player's features come from
+    # the end of their previous season instead of resetting to zero.
+    g = grid.groupby('player_id')
 
     grid['last_minutes'] = g['minutes'].shift(1)
     grid['last_was_starter'] = g['was_starter'].shift(1).fillna(0)
@@ -102,12 +104,15 @@ def _compute_calendar_minutes_features(df: pd.DataFrame) -> pd.DataFrame:
             lambda x: x.shift(1).rolling(window, min_periods=1).mean()
         )
 
-    # Weeks since last appearance: gameweek minus the most-recent prior gameweek where appeared=1.
-    last_app_gw = grid['gameweek'].where(grid['appeared'] == 1)
-    grid['_last_app_gw'] = last_app_gw.groupby([grid['player_id'], grid['season']]).transform(
+    # Weeks since last appearance, on a cross-season ordinal (seasons stacked at
+    # 38 GWs) so GW38 -> GW1 of the next season counts as a gap of 1.
+    season_rank = {s: i for i, s in enumerate(sorted(grid['season'].dropna().unique()))}
+    ordinal = grid['season'].map(season_rank) * 38 + pd.to_numeric(grid['gameweek'], errors='coerce')
+    last_app_ord = ordinal.where(grid['appeared'] == 1)
+    grid['_last_app_ord'] = last_app_ord.groupby(grid['player_id']).transform(
         lambda x: x.shift(1).ffill()
     )
-    grid['gw_gap_since_last_appearance'] = grid['gameweek'] - grid['_last_app_gw']
+    grid['gw_gap_since_last_appearance'] = ordinal - grid['_last_app_ord']
 
     feature_cols = (
         ['last_minutes', 'last_was_starter', 'last_was_full_90', 'gw_gap_since_last_appearance']
@@ -857,6 +862,46 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
             opp_defense_dedup,
             on=['opponent_norm', 'season', 'gameweek'], how='left'
         )
+
+        # ================================================================
+        # PROMOTED-TEAM PRIOR
+        # Teams with no PL history in the dataset (newly promoted sides)
+        # produce NaN team/opponent rolling stats, which the blanket fill
+        # below would turn into 0 ("never scores, never concedes"). Fill
+        # them instead with the promoted-cohort average: the early-season
+        # (GW<=10) rolling values of previously promoted teams.
+        # ================================================================
+        seasons_sorted = sorted(df['season'].dropna().unique())
+        promoted_pairs = set()
+        for prev_s, cur_s in zip(seasons_sorted, seasons_sorted[1:]):
+            prev_teams = set(df.loc[df['season'] == prev_s, 'team_norm'].unique())
+            cur_teams = set(df.loc[df['season'] == cur_s, 'team_norm'].unique())
+            promoted_pairs |= {(t, cur_s) for t in cur_teams - prev_teams}
+
+        team_roll_prior_cols = [c for c in df.columns if c.startswith('team_') and '_roll' in c]
+        opp_roll_cols = [c for c in df.columns if c.startswith('opp_') and '_roll' in c]
+
+        if promoted_pairs:
+            gw_num = pd.to_numeric(df['gameweek'], errors='coerce')
+            is_promoted_row = pd.Series(
+                list(zip(df['team_norm'], df['season'])), index=df.index
+            ).isin(promoted_pairs)
+            cohort = df[is_promoted_row & (gw_num <= 10)]
+            prior = {c: cohort[c].mean() for c in team_roll_prior_cols}
+
+            for c in team_roll_prior_cols:
+                v = prior.get(c)
+                if v is not None and not np.isnan(v):
+                    df[c] = df[c].fillna(v)
+            for c in opp_roll_cols:
+                team_c = (c.replace('opp_conceded_', 'team_conceded_')
+                           .replace('opp_xga_', 'team_xga_')
+                           .replace('opp_cs_rate_', 'team_cs_rate_')
+                           .replace('opp_goals_', 'team_goals_')
+                           .replace('opp_xg_', 'team_xg_'))
+                v = prior.get(team_c)
+                if v is not None and not np.isnan(v):
+                    df[c] = df[c].fillna(v)
 
         # Clean up temporary normalized columns
         df = df.drop(columns=['team_norm', 'opponent_norm'], errors='ignore')

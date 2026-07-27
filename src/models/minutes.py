@@ -354,10 +354,17 @@ class MinutesModel:
         current_season_apps = df['current_season_apps'].fillna(0).values
         current_season_mins_per_app = df['current_season_mins_per_app'].fillna(0).values
         roll5 = df['minutes_roll5'].fillna(60).values
+        # gw gap is 0-filled upstream, so 0 = no prior appearance; real gaps are >= 1
+        gw_gap = df['gw_gap_since_last_appearance'].fillna(0).values if 'gw_gap_since_last_appearance' in df.columns else np.zeros(len(preds))
 
         for i in range(len(preds)):
             if current_season_apps[i] == 0:
-                preds[i] = min(preds[i], 30)
+                # Season opener for a recently active player (e.g. played the end
+                # of last season): trust rolling form instead of the cold-start cap
+                if 1 <= gw_gap[i] <= 3 and roll5[i] > 0:
+                    preds[i] = min(preds[i], max(roll5[i] * 1.2, 30))
+                else:
+                    preds[i] = min(preds[i], 30)
             elif current_season_apps[i] >= 1 and current_season_mins[i] < 90:
                 max_reasonable = max(current_season_mins_per_app[i] * 1.2, 15)
                 preds[i] = min(preds[i], max_reasonable)

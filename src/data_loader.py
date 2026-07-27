@@ -38,9 +38,19 @@ def load_player_stats(data_dir: Path, verbose: bool = True) -> pd.DataFrame:
     
     df = pd.read_csv(player_file, on_bad_lines='skip')
     
+    # Reconstruct total_shots from breakdown when FotMob only provides components
+    _has_breakdown = df["total_shots"].isna() & (
+        df["shots_on_target"].notna() | df["shots_off_target"].notna()
+    )
+    df.loc[_has_breakdown, "total_shots"] = (
+        df.loc[_has_breakdown, "shots_on_target"].fillna(0)
+        + df.loc[_has_breakdown, "shots_off_target"].fillna(0)
+        + df.loc[_has_breakdown, "blocked_shots"].fillna(0)
+    )
+
     # Rename columns
     df = df.rename(columns=COLUMN_MAP)
-    
+
     # Ensure numeric columns
     numeric_cols = ['minutes', 'goals', 'assists', 'xg', 'xa', 'shots', 'key_passes',
                     'tackles', 'interceptions', 'clearances', 'blocks', 'recoveries',
@@ -240,6 +250,48 @@ def get_fpl_availability() -> dict:
         return {}
 
 
+def normalize_player_name(name) -> str:
+    """Lowercase, accent-stripped player name for FPL<->FotMob matching."""
+    import unicodedata
+    if pd.isna(name):
+        return ''
+    stripped = ''.join(
+        c for c in unicodedata.normalize('NFD', str(name))
+        if unicodedata.category(c) != 'Mn'
+    )
+    return stripped.lower().strip()
+
+
+def get_fpl_current_squads() -> dict:
+    """Fetch current FPL squads from bootstrap-static.
+
+    Returns two dicts (full_names, variants): normalized name -> FPL team name.
+    full_names uses only 'first second' full names; variants adds web_name and
+    second_name. Names that map to more than one team are dropped from both.
+    """
+    import requests
+    bootstrap = requests.get(
+        "https://fantasy.premierleague.com/api/bootstrap-static/", timeout=15
+    ).json()
+    teams_map = {t['id']: t['name'] for t in bootstrap['teams']}
+
+    full_names = {}
+    variants = {}
+    for p in bootstrap['elements']:
+        team = teams_map.get(p['team'], '')
+        full = normalize_player_name(f"{p['first_name']} {p['second_name']}")
+        if full:
+            full_names.setdefault(full, set()).add(team)
+        for name in (full, normalize_player_name(p['web_name']),
+                     normalize_player_name(p['second_name'])):
+            if name:
+                variants.setdefault(name, set()).add(team)
+
+    full_names = {k: next(iter(v)) for k, v in full_names.items() if len(v) == 1}
+    variants = {k: next(iter(v)) for k, v in variants.items() if len(v) == 1}
+    return full_names, variants
+
+
 def fetch_fpl_actual_points(gameweeks: list = None, cache_dir: str = None,
                             verbose: bool = True) -> pd.DataFrame:
     """Fetch actual FPL points from the FPL API for all completed gameweeks.
@@ -268,6 +320,16 @@ def fetch_fpl_actual_points(gameweeks: list = None, cache_dir: str = None,
 
     teams_map = {t['id']: t['name'] for t in bootstrap['teams']}
 
+    # Current FPL season label from GW1 deadline (the API rolls over in summer,
+    # so gameweek numbers alone are ambiguous across seasons)
+    try:
+        deadline = bootstrap['events'][0]['deadline_time']
+        y, m = int(deadline[:4]), int(deadline[5:7])
+        start_year = y if m >= 6 else y - 1
+    except Exception:
+        start_year = pd.Timestamp.now().year
+    api_season = f"{start_year}/{start_year + 1}"
+
     # Build player lookup
     player_lookup = {}
     for p in bootstrap['elements']:
@@ -283,17 +345,22 @@ def fetch_fpl_actual_points(gameweeks: list = None, cache_dir: str = None,
     if gameweeks is None:
         gameweeks = [ev['id'] for ev in bootstrap['events'] if ev.get('finished')]
 
-    if verbose:
+    if verbose and gameweeks:
         print(f"Fetching actual FPL points for GW {min(gameweeks)}-{max(gameweeks)} ({len(gameweeks)} GWs)...")
+    elif verbose:
+        print(f"No finished gameweeks in FPL API for {api_season} — using cache only")
 
-    # Check cache for already-fetched GWs
+    # Check cache for already-fetched GWs (cache is per-season; GW numbers repeat)
     cached_df = None
     cached_gws = set()
     if cache_path and cache_path.exists():
         cached_df = pd.read_csv(cache_path)
-        cached_gws = set(cached_df['gameweek'].unique())
+        if 'season' not in cached_df.columns:
+            # Cache predates the season column; all rows were fetched in 2025/26
+            cached_df['season'] = '2025/2026'
+        cached_gws = set(cached_df.loc[cached_df['season'] == api_season, 'gameweek'].unique())
         if verbose:
-            print(f"  Cache has {len(cached_gws)} GWs already")
+            print(f"  Cache has {len(cached_gws)} GWs already for {api_season}")
 
     gws_to_fetch = [gw for gw in gameweeks if gw not in cached_gws]
 
@@ -313,6 +380,7 @@ def fetch_fpl_actual_points(gameweeks: list = None, cache_dir: str = None,
                     'web_name': pinfo.get('web_name', ''),
                     'team': pinfo.get('team', ''),
                     'fpl_position': pinfo.get('position', 'MID'),
+                    'season': api_season,
                     'gameweek': gw,
                     'actual_total_points': stats.get('total_points', 0),
                     'minutes': stats.get('minutes', 0),
@@ -434,6 +502,8 @@ def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
 
     # Prepare FPL side: normalize names and teams
     fpl_df = fpl_df.copy()
+    if 'season' not in fpl_df.columns:
+        fpl_df['season'] = '2025/2026'
     fpl_df['_name_norm'] = fpl_df['player_name'].apply(_norm_name)
     fpl_df['_team_norm'] = fpl_df['team'].apply(_norm_team)
     fpl_df['gameweek'] = pd.to_numeric(fpl_df['gameweek'], errors='coerce')
@@ -456,11 +526,11 @@ def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
             'bonus': row.get('bonus', 0),
             'actual_total_points': row.get('actual_total_points', 0),
         }
-        key = (row['_name_norm'], row['_team_norm'], row['gameweek'])
+        key = (row['_name_norm'], row['_team_norm'], row['season'], row['gameweek'])
         fpl_lookup[key] = entry
         # Also add web_name as alternate key
         if '_web_norm' in row.index and row['_web_norm']:
-            alt_key = (row['_web_norm'], row['_team_norm'], row['gameweek'])
+            alt_key = (row['_web_norm'], row['_team_norm'], row['season'], row['gameweek'])
             if alt_key not in fpl_lookup:
                 fpl_lookup[alt_key] = entry
 
@@ -469,7 +539,7 @@ def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
     # attribute which match the yellow came from. Exclude DGW rows from
     # card data (NaN) — the model trains on SGW rows only (binary 0/1).
     df['_gw_num'] = pd.to_numeric(df['gameweek'], errors='coerce')
-    matches_per_gw = df.groupby(['_name_norm', '_team_norm', '_gw_num'])['_gw_num'].transform('size')
+    matches_per_gw = df.groupby(['_name_norm', '_team_norm', 'season', '_gw_num'])['_gw_num'].transform('size')
 
     # Match rows
     yellows = np.full(len(df), np.nan)
@@ -489,13 +559,13 @@ def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
             dgw_skipped += 1
             continue
         # Try full name match
-        key = (row['_name_norm'], row['_team_norm'], gw)
+        key = (row['_name_norm'], row['_team_norm'], row['season'], gw)
         result = fpl_lookup.get(key)
         # Try last-name-only match
         if result is None:
             parts = row['_name_norm'].split()
             if len(parts) > 1:
-                last_key = (parts[-1], row['_team_norm'], gw)
+                last_key = (parts[-1], row['_team_norm'], row['season'], gw)
                 result = fpl_lookup.get(last_key)
         if result is not None:
             yellows[i] = result['yellow_cards']

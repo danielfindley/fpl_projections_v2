@@ -8,7 +8,7 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, Optional
 
-from .data_loader import load_player_stats, load_fixtures, merge_fixtures, get_fpl_positions, map_fpl_position, get_fpl_availability, merge_fpl_card_data
+from .data_loader import load_player_stats, load_fixtures, merge_fixtures, get_fpl_positions, map_fpl_position, get_fpl_availability, merge_fpl_card_data, get_fpl_current_squads, normalize_player_name
 from .features import compute_rolling_features
 from .models import GoalsModel, AssistsModel, MinutesModel, DefconModel, CleanSheetModel, BonusModel, CardsModel, SavesModel
 from .models.minutes import StarterClassifier, StarterMinutesModel, SubMinutesModel, ALL_FEATURES as MINUTES_ALL_FEATURES, STARTER_FEATURES, SUB_FEATURES
@@ -2648,9 +2648,88 @@ with open(r"{temp_result_path}", 'w') as f:
             prior_raw.sort_values(['player_id', 'season', 'gameweek'])
             .groupby('player_id').last().reset_index()
         )
-        latest_identity = latest_identity[
-            latest_identity['player_id'].isin(self.current_season_players)
-        ].copy()
+
+        # Map from normalized team name -> FotMob team name (latest naming wins).
+        # FPL API names ('Spurs', 'Man City') must be translated to FotMob names
+        # so synthetic rows join team/opponent rolling-stat history.
+        fotmob_by_norm = {}
+        for _, r in self.raw_df[['team', 'season']].dropna().drop_duplicates().sort_values('season').iterrows():
+            fotmob_by_norm[normalize_team_name(r['team'])] = r['team']
+
+        def _to_fotmob(name):
+            return fotmob_by_norm.get(normalize_team_name(name), name)
+
+        # FPL-squad team override: place each player in their CURRENT club's
+        # fixture (summer transfers), and reinstate players on a current FPL
+        # squad whose last FotMob appearance was before this season (e.g.
+        # promoted-team players with prior PL history). Form features are
+        # unaffected — they follow the player's own match history by player_id.
+        in_current = latest_identity['player_id'].isin(self.current_season_players)
+        try:
+            fpl_full_names, fpl_variants = get_fpl_current_squads()
+        except Exception as e:
+            if verbose:
+                print(f"  WARNING: could not fetch FPL squads ({e}); using last observed teams")
+            fpl_full_names, fpl_variants = {}, {}
+
+        if fpl_variants:
+            def _token_subset_team(key):
+                # FotMob 'David Raya' vs FPL 'David Raya Martin': match when the
+                # FotMob tokens are a subset of exactly one FPL full name's tokens
+                toks = set(key.split())
+                if len(toks) < 2:
+                    return None
+                hits = {t for full, t in fpl_full_names.items() if toks <= set(full.split())}
+                return next(iter(hits)) if len(hits) == 1 else None
+
+            def _fpl_team(name, strict=False):
+                key = normalize_player_name(name)
+                if not key:
+                    return None
+                # exact full name, then token subset (handles FPL middle names:
+                # 'Bruno Fernandes' -> 'Bruno Borges Fernandes')
+                team = fpl_full_names.get(key) or _token_subset_team(key)
+                if team or strict:
+                    return team
+                # exact web_name / second_name variant
+                team = fpl_variants.get(key)
+                if team:
+                    return team
+                # last resort: surname — but only if it appears in exactly ONE
+                # FPL full name overall (variant-level uniqueness is not enough:
+                # 'Fernandes' was unique as a web_name yet belongs to two players)
+                if ' ' in key:
+                    last = key.split()[-1]
+                    hits = {t for full, t in fpl_full_names.items() if last in full.split()}
+                    if len(hits) == 1:
+                        return next(iter(hits))
+                return None
+
+            mapped = latest_identity['player_name'].apply(_fpl_team)
+            mapped_fotmob = mapped.dropna().apply(_to_fotmob)
+            changed = mapped_fotmob.index[
+                mapped_fotmob.apply(normalize_team_name)
+                != latest_identity.loc[mapped_fotmob.index, 'team'].apply(normalize_team_name)
+            ]
+            latest_identity.loc[changed, 'team'] = mapped_fotmob[changed]
+
+            # Reinstatement requires an exact full-name match (conservative)
+            strict_match = latest_identity['player_name'].apply(
+                lambda n: _fpl_team(n, strict=True) is not None
+            )
+            # Current players must appear in the FPL bootstrap — a player with no
+            # FPL element (departed/released) can't be picked in FPL at all
+            keep = (in_current & mapped.notna()) | strict_match
+            if verbose:
+                n_transfers = int(in_current.loc[changed].sum())
+                n_reinstated = int((~in_current & strict_match).sum())
+                n_departed = int((in_current & mapped.isna()).sum())
+                print(f"  FPL squad override: {n_transfers} transfers re-teamed, "
+                      f"{n_reinstated} prior-season players reinstated, "
+                      f"{n_departed} not in FPL (departed) dropped")
+            latest_identity = latest_identity[keep].copy()
+        else:
+            latest_identity = latest_identity[in_current].copy()
 
         if verbose:
             print(f"Found {len(latest_identity)} active players with historical data")
@@ -2685,14 +2764,16 @@ with open(r"{temp_result_path}", 'w') as f:
             if verbose and (n_before - len(latest_identity)) > 0:
                 print(f"  Filtered out {n_before - len(latest_identity)} unavailable players (injured/suspended)")
 
-        # Normalize target-GW fixture teams once
+        # Normalize target-GW fixture teams once. Team names are translated to
+        # FotMob naming so synthetic rows' team/opponent values join the
+        # rolling-stat history (FPL API names like 'Spurs' would silently miss).
         fixture_teams = []
         for _, fix in fixtures.iterrows():
             fixture_teams.append({
                 'home_norm': normalize_team_name(fix['home_team']),
                 'away_norm': normalize_team_name(fix['away_team']),
-                'home_team': fix['home_team'],
-                'away_team': fix['away_team'],
+                'home_team': _to_fotmob(fix['home_team']),
+                'away_team': _to_fotmob(fix['away_team']),
             })
 
         # Raw stat columns (everything except identity / fixture-linkage) are
