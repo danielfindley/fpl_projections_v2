@@ -2551,6 +2551,10 @@ with open(r"{temp_result_path}", 'w') as f:
         with open(run_dir / 'meta.json', 'w') as f:
             json.dump(meta, f, indent=2)
 
+        # 7. Resolved FPL name-match table (audit trail for the squad override)
+        if getattr(self, 'last_fpl_name_matches', None) is not None:
+            self.last_fpl_name_matches.to_csv(run_dir / 'fpl_name_matches.csv', index=False)
+
         if verbose:
             print(f"\nRun saved to: {run_dir}")
             print(f"  predictions.csv: {len(predictions)} players")
@@ -2672,6 +2676,17 @@ with open(r"{temp_result_path}", 'w') as f:
                 print(f"  WARNING: could not fetch FPL squads ({e}); using last observed teams")
             fpl_full_names, fpl_variants = {}, {}
 
+        # Manual corrections, checked before any automatic matching.
+        # data/fpl_name_overrides.json: {FotMob name: FPL team name | null}
+        # null = force-exclude (player is not in FPL despite what matching says)
+        import json as _json
+        name_overrides = {}
+        overrides_path = self.data_dir / 'fpl_name_overrides.json'
+        if overrides_path.exists():
+            with open(overrides_path) as f:
+                name_overrides = {normalize_player_name(k): v
+                                  for k, v in _json.load(f).items()}
+
         if fpl_variants:
             def _token_subset_team(key):
                 # FotMob 'David Raya' vs FPL 'David Raya Martin': match when the
@@ -2686,6 +2701,8 @@ with open(r"{temp_result_path}", 'w') as f:
                 key = normalize_player_name(name)
                 if not key:
                     return None
+                if key in name_overrides:
+                    return name_overrides[key]
                 # exact full name, then token subset (handles FPL middle names:
                 # 'Bruno Fernandes' -> 'Bruno Borges Fernandes')
                 team = fpl_full_names.get(key) or _token_subset_team(key)
@@ -2695,17 +2712,22 @@ with open(r"{temp_result_path}", 'w') as f:
                 team = fpl_variants.get(key)
                 if team:
                     return team
-                # last resort: surname — but only if it appears in exactly ONE
-                # FPL full name overall (variant-level uniqueness is not enough:
-                # 'Fernandes' was unique as a web_name yet belongs to two players)
+                # last resort: surname — only if it appears in exactly ONE FPL
+                # full name overall (variant-level uniqueness is not enough:
+                # 'Fernandes' was unique as a web_name yet belongs to two
+                # players) AND the first names are compatible (Yerson Mosquera
+                # is not FPL's Cristhian Mosquera; Danny/Daniel Ings is fine)
                 if ' ' in key:
                     last = key.split()[-1]
-                    hits = {t for full, t in fpl_full_names.items() if last in full.split()}
+                    hits = [(full, t) for full, t in fpl_full_names.items() if last in full.split()]
                     if len(hits) == 1:
-                        return next(iter(hits))
+                        fpl_first, first = hits[0][0].split()[0], key.split()[0]
+                        if fpl_first.startswith(first[:3]) or first.startswith(fpl_first[:3]):
+                            return hits[0][1]
                 return None
 
             mapped = latest_identity['player_name'].apply(_fpl_team)
+            fotmob_team_orig = latest_identity['team'].copy()
             mapped_fotmob = mapped.dropna().apply(_to_fotmob)
             changed = mapped_fotmob.index[
                 mapped_fotmob.apply(normalize_team_name)
@@ -2727,6 +2749,17 @@ with open(r"{temp_result_path}", 'w') as f:
                 print(f"  FPL squad override: {n_transfers} transfers re-teamed, "
                       f"{n_reinstated} prior-season players reinstated, "
                       f"{n_departed} not in FPL (departed) dropped")
+
+            # Persist the resolved name-match table for audit (saved by save_run)
+            self.last_fpl_name_matches = pd.DataFrame({
+                'player_name': latest_identity['player_name'],
+                'fotmob_team': fotmob_team_orig,
+                'fpl_team': mapped,
+                'overridden': latest_identity['player_name'].apply(
+                    lambda n: normalize_player_name(n) in name_overrides),
+                'kept': keep,
+            }).sort_values(['kept', 'player_name'], ascending=[False, True])
+
             latest_identity = latest_identity[keep].copy()
         else:
             latest_identity = latest_identity[in_current].copy()
