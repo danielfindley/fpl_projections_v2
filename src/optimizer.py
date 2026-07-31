@@ -155,7 +155,7 @@ def _bench_weights(p_appear_xi: np.ndarray, n_bench: int = 3) -> np.ndarray:
 
 def optimize_squad(predictions: pd.DataFrame, budget: float = BUDGET,
                    points_col: str = 'exp_total_pts', verbose: bool = True,
-                   max_iter: int = 4) -> dict:
+                   max_iter: int = 25) -> dict:
     """Select the 15 maximising XI points plus probability-weighted bench points.
 
     Bench weights depend on the XI's appearance probabilities, and the XI depends on
