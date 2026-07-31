@@ -73,6 +73,144 @@ def _build_metrics_html(metrics):
     return '\n'.join(parts)
 
 
+
+# Dot colours: DEF/MID/FWD match the ridge-plot legend so the two views agree.
+_POS_COLOR = {'GK': '#a371f7', 'DEF': '#3fb950', 'MID': '#58a6ff', 'FWD': '#d29922'}
+
+
+def _squad_rows(squad_result):
+    """Flatten optimize_squad output into (xi_lines, bench) of plain dicts.
+
+    xi_lines is ordered GK -> DEF -> MID -> FWD so the pitch renders in the shape of
+    the formation that was actually selected.
+    """
+    def to_rows(frame):
+        out = []
+        for _, r in frame.iterrows():
+            name = r.get('web_name') or r.get('player_name', '')
+            if not isinstance(name, str) or not name:
+                name = str(r.get('player_name', ''))
+            out.append({
+                'name': name,
+                'full_name': str(r.get('player_name', '')),
+                'pos': r.get('fpl_position', 'MID'),
+                'team': str(r.get('team', '')),
+                'price': float(r.get('price', 0) or 0),
+                'pts': float(r.get('exp_pts_uncond', r.get('exp_total_pts', 0)) or 0),
+                'appear': float(r.get('pred_appear_prob', float('nan'))),
+            })
+        return out
+
+    xi = to_rows(squad_result['xi'])
+    bench = to_rows(squad_result['bench'])
+    lines = [[p for p in xi if p['pos'] == pos] for pos in ('GK', 'DEF', 'MID', 'FWD')]
+    return [ln for ln in lines if ln], bench
+
+
+def _player_dot(p, captain=None, bench_weight=None):
+    is_cap = captain is not None and p['full_name'] == captain
+    color = _POS_COLOR.get(p['pos'], '#8b949e')
+    appear = '' if p['appear'] != p['appear'] else f"{p['appear'] * 100:.0f}% to play"
+    title = f"{p['full_name']} — {p['team']} — £{p['price']:.1f}m — {p['pts']:.2f} xPts"
+    if appear:
+        title += f" — {appear}"
+    if bench_weight is not None:
+        title += f" — slot used {bench_weight * 100:.0f}% of the time"
+    cap = '<span class="sq-cap">C</span>' if is_cap else ''
+    return (
+        f'<div class="sq-plr" title="{title}">'
+        f'<span class="sq-dot" style="background:{color}">{cap}</span>'
+        f'<span class="sq-nm">{p["name"]}</span>'
+        f'<span class="sq-sub">£{p["price"]:.1f} &middot; {p["pts"]:.1f}</span>'
+        f'</div>'
+    )
+
+
+def _build_squad_html(squad_result, gameweek=None):
+    """Render the optimized 15 as a pitch in its own formation shape."""
+    if not squad_result:
+        return ''
+
+    lines, bench = _squad_rows(squad_result)
+    if not lines:
+        return ''
+
+    captain = squad_result.get('captain')
+    gw = f'GW{gameweek} &middot; ' if gameweek else ''
+    weights = list(squad_result.get('bench_weights') or [])
+    gk_w = squad_result.get('gk_bench_weight')
+
+    pitch = ''.join(
+        '<div class="sq-line">' + ''.join(_player_dot(p, captain) for p in line) + '</div>'
+        for line in lines
+    )
+
+    bench_cells = []
+    out_i = 0
+    for p in bench:
+        if p['pos'] == 'GK':
+            w = gk_w
+        else:
+            w = weights[out_i] if out_i < len(weights) else None
+            out_i += 1
+        bench_cells.append(_player_dot(p, captain, bench_weight=w))
+
+    cost = squad_result.get('total_cost', 0.0)
+    left = squad_result.get('budget_left', 0.0)
+    bench_cost = squad_result.get('bench_cost', 0.0)
+
+    return f'''
+<div class="sq-wrap">
+  <h3 class="sq-title">Optimal Squad</h3>
+  <div class="sq-meta">{gw}{squad_result.get('formation', '')} &middot; &pound;{cost:.1f}m
+    <span class="sq-dim">(&pound;{left:.1f}m free)</span></div>
+  <div class="sq-pitch">{pitch}</div>
+  <div class="sq-bench">
+    <div class="sq-bench-hd">Bench &middot; &pound;{bench_cost:.1f}m</div>
+    <div class="sq-line">{''.join(bench_cells)}</div>
+  </div>
+  <div class="sq-note">Bench spend is weighted by how often each slot actually comes on&nbsp;&mdash;
+    P(a starter blanks), from the appearance model. Hover any player for detail.</div>
+</div>'''
+
+
+_SQUAD_CSS = '''
+.sq-wrap{background:#161b22;border:1px solid #21262d;border-radius:10px;padding:14px 12px 12px}
+.sq-title{color:#e6edf3;font-size:14px;font-weight:600;text-align:center;margin-bottom:2px}
+.sq-meta{color:#8b949e;font-size:12px;text-align:center;margin-bottom:10px}
+.sq-dim{color:#6e7681}
+.sq-pitch{
+  background:linear-gradient(#122b1a,#0f2417);border:1px solid #1c3b26;border-radius:8px;
+  padding:14px 6px;display:flex;flex-direction:column;gap:12px;
+}
+.sq-line{display:flex;justify-content:center;gap:4px;flex-wrap:wrap}
+.sq-plr{
+  display:flex;flex-direction:column;align-items:center;gap:3px;
+  width:62px;cursor:default;
+}
+.sq-dot{
+  width:22px;height:22px;border-radius:50%;border:2px solid rgba(255,255,255,.22);
+  display:flex;align-items:center;justify-content:center;position:relative;
+}
+.sq-cap{
+  position:absolute;top:-5px;right:-6px;background:#f0883e;color:#0d1117;
+  font-size:8px;font-weight:700;width:12px;height:12px;border-radius:50%;
+  display:flex;align-items:center;justify-content:center;
+}
+.sq-nm{
+  font-size:10px;color:#e6edf3;font-weight:600;line-height:1.15;text-align:center;
+  max-width:62px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.sq-sub{font-size:9px;color:#8b949e;font-variant-numeric:tabular-nums}
+.sq-bench{margin-top:10px;background:#0d1117;border:1px dashed #21262d;border-radius:8px;padding:8px 4px}
+.sq-bench-hd{
+  font-size:10px;color:#8b949e;text-align:center;margin-bottom:7px;
+  text-transform:uppercase;letter-spacing:.06em;
+}
+.sq-note{margin-top:9px;font-size:10px;line-height:1.5;color:#6e7681;text-align:center}
+'''
+
+
 def _build_calibration_svg(calibration):
     """Render predicted-vs-actual calibration as overlaid line plots.
 
@@ -382,6 +520,7 @@ def generate_distribution_html(
     gameweek=None,
     metrics=None,
     predictions_per_fixture=None,
+    squad=None,
 ):
     """Generate a self-contained responsive HTML file.
 
@@ -417,6 +556,11 @@ def generate_distribution_html(
     html = html.replace('__MOBILE_SCRIPT__', m_script)
     html = html.replace('/*__DATA__*/null', json.dumps(data))
     html = html.replace('<!--__METRICS__-->', _build_metrics_html(metrics))
+    # Both templates carry a __SQUAD__ slot; only the active one is rendered, so the
+    # same markup serves the desktop right-hand column and the mobile lead block.
+    html = html.replace('<!--__SQUAD__-->', _build_squad_html(squad, gameweek))
+    if squad:
+        html = html.replace('</style>', _SQUAD_CSS + '</style>', 1)
 
     Path(output_path).write_text(html, encoding='utf-8')
     print(f"Distribution visualization saved to: {output_path}")
@@ -500,6 +644,16 @@ h1{font-size:22px;font-weight:700;color:#e6edf3;margin-bottom:4px}
 .method-body strong{color:#c9d1d9}
 .method-body ul{margin:4px 0 8px 18px}
 .method-body li{margin-bottom:3px}
+/* body is display:flex, so this column is a sibling of .container and lands to the
+   right of the ridge plot — which is already where the metrics tables render. The
+   squad sits at the top of that column, above them. The mobile template stacks
+   instead, putting the squad first on the page. */
+.side-col{
+  display:flex;flex-direction:column;align-items:stretch;
+  flex:0 0 340px;min-width:0;margin-left:18px;
+}
+.side-squad{margin-top:4px}
+.side-col > div[style]{max-width:100% !important;margin-left:0 !important;margin-right:0 !important}
 </style>
 </head>
 <body>
@@ -785,7 +939,10 @@ if (document.readyState === 'loading') {
 }
 window.addEventListener('resize', render);
 </script>
-<!--__METRICS__-->
+<div class="side-col">
+  <div class="side-squad"><!--__SQUAD__--></div>
+  <!--__METRICS__-->
+</div>
 </body>
 </html>
 """
@@ -884,6 +1041,7 @@ body{
 .prob-cell{
   background:#1c2128;border-radius:8px;padding:8px 6px;text-align:center;
 }
+.mob-squad{padding:0 10px;margin-bottom:14px}
 .prob-cell .threshold{font-size:11px;color:#8b949e}
 .prob-cell .pct{font-size:16px;font-weight:700;color:#e6edf3}
 .prob-cell .bar{
@@ -900,6 +1058,7 @@ body{
   <h1 id="title">FPL Points Distribution</h1>
   <p>Monte Carlo Simulation &middot; Tap card for details</p>
 </div>
+<div class="mob-squad"><!--__SQUAD__--></div>
 <!--__METRICS__-->
 <div class="controls">
   <div class="pill active" data-pos="ALL">All</div>

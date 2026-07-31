@@ -37,7 +37,8 @@ PER90_CAPS = {
 MIN_MINUTES_FOR_PER90 = 20
 
 
-def _compute_calendar_minutes_features(df: pd.DataFrame) -> pd.DataFrame:
+def _compute_calendar_minutes_features(df: pd.DataFrame,
+                                       include_appeared: bool = False) -> pd.DataFrame:
     """Build a complete (player_id, season, gameweek) timeline filling missed gameweeks
     with 0 minutes, then compute calendar-aware minutes / starter / full-90 rolling features
     plus weeks-since-last-appearance.
@@ -46,6 +47,11 @@ def _compute_calendar_minutes_features(df: pd.DataFrame) -> pd.DataFrame:
     Use to replace the appearances-only versions, which over-credit players with sparse
     appearances (e.g., a player who started one match 7 GWs ago looks identical to a
     regular starter in the appearance-only rolling).
+
+    With ``include_appeared``, the 0-minute rows are kept along with the ``appeared``
+    flag so the grid can be used as a training set for P(appears). The default drops
+    it: on played rows ``appeared`` is always 1, so merging it back would add a
+    constant column and leak the target into the per-match feature frame.
     """
     base = df[['player_id', 'season', 'gameweek', 'minutes']].copy()
     base['minutes'] = pd.to_numeric(base['minutes'], errors='coerce').fillna(0)
@@ -120,7 +126,65 @@ def _compute_calendar_minutes_features(df: pd.DataFrame) -> pd.DataFrame:
         + [f'starter_rate_roll{w}' for w in ROLLING_WINDOWS]
         + [f'full90_rate_roll{w}' for w in ROLLING_WINDOWS]
     )
+    if include_appeared:
+        feature_cols = feature_cols + ['appeared']
     return grid[['player_id', 'season', 'gameweek'] + feature_cols]
+
+
+# Features the appearance model trains on. Restricted to the calendar grid, which is
+# the only feature set defined on a week the player did not play — anything derived
+# from match events (xG, touches, opponent stats) simply does not exist on those rows.
+APPEARANCE_FEATURES = (
+    ['last_minutes', 'last_was_starter', 'last_was_full_90', 'gw_gap_since_last_appearance']
+    + [f'minutes_roll{w}' for w in ROLLING_WINDOWS]
+    + [f'starter_rate_roll{w}' for w in ROLLING_WINDOWS]
+    + [f'full90_rate_roll{w}' for w in ROLLING_WINDOWS]
+    + ['is_gk', 'is_def', 'is_mid', 'is_fwd']
+)
+
+
+def build_appearance_grid(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
+    """Training set for P(appears): one row per (player, season, gameweek) the player
+    was at a Premier League club, including the weeks they did not play.
+
+    The per-match frame only ever contains games a player featured in, so no model in
+    the pipeline currently sees a single non-appearance. This grid restores them.
+
+    Span is each player's first-to-last appearance within a season, which keeps
+    rotation calls and mid-season injury gaps (a player appearing in GW1 and GW30 has
+    every intervening blank) while excluding weeks before a mid-season signing arrived
+    or after a departure — weeks they could not have been picked by anyone.
+
+    Target column is ``appeared`` (minutes > 0).
+    """
+    grid = _compute_calendar_minutes_features(df, include_appeared=True)
+
+    # Drop each player-season's opening row. The span starts at their first appearance,
+    # so that row always has appeared == 1 — and it carries the cross-season gap, the
+    # largest gw_gap value in the data. Left in, it teaches the exact inverse of the
+    # truth: that a player absent for 40+ gameweeks is certain to feature. Removing it
+    # keeps long gaps associated only with genuine mid-season absences.
+    first = grid.groupby(['player_id', 'season'])['gameweek'].transform('min')
+    n_before = len(grid)
+    grid = grid[grid['gameweek'] > first].copy()
+
+    # Position is a player attribute, not a per-match one; carry it over from any
+    # match row so the grid's 0-minute weeks still get position dummies.
+    pos_cols = [c for c in ('is_gk', 'is_def', 'is_mid', 'is_fwd') if c in df.columns]
+    if pos_cols:
+        pos = df.groupby('player_id')[pos_cols].max().reset_index()
+        grid = grid.merge(pos, on='player_id', how='left')
+    for c in ('is_gk', 'is_def', 'is_mid', 'is_fwd'):
+        if c not in grid.columns:
+            grid[c] = 0
+        grid[c] = grid[c].fillna(0).astype(int)
+
+    if verbose:
+        n_zero = int((grid['appeared'] == 0).sum())
+        print(f"  Appearance grid: {len(grid):,} player-gameweeks "
+              f"({n_zero:,} non-appearances, base rate {grid['appeared'].mean():.3f}; "
+              f"dropped {n_before - len(grid):,} season-opening rows)")
+    return grid
 
 
 def _parse_formation(formation_str):

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from .data_loader import load_player_stats, load_fixtures, merge_fixtures, get_fpl_positions, map_fpl_position, get_fpl_availability, merge_fpl_card_data, get_fpl_current_squads, normalize_player_name
-from .features import compute_rolling_features
+from .features import compute_rolling_features, build_appearance_grid
 from .models import GoalsModel, AssistsModel, MinutesModel, DefconModel, CleanSheetModel, BonusModel, CardsModel, SavesModel
 from .models.minutes import StarterClassifier, StarterMinutesModel, SubMinutesModel, ALL_FEATURES as MINUTES_ALL_FEATURES, STARTER_FEATURES, SUB_FEATURES
 from .experiment_log import log_experiment, get_history, get_best_run, log_predictions, get_predictions, clear_experiments
@@ -161,10 +161,12 @@ class FPLPipeline:
                 print("(using default hyperparameters)")
             print("=" * 60)
         
-        # Minutes model (independent)
+        # Minutes model (independent). The appearance grid adds the weeks players did
+        # not feature — rows that exist nowhere in self.df, which only holds appearances.
         mins_params = self.tuned_params.get('minutes', {})
         self.models['minutes'] = MinutesModel(**mins_params)
-        self.models['minutes'].fit(self.df, verbose)
+        self.appearance_grid = build_appearance_grid(self.df, verbose)
+        self.models['minutes'].fit(self.df, verbose, appearance_grid=self.appearance_grid)
         
         # Clean sheet model FIRST (needed for pred_team_goals feature)
         cs_params = self.tuned_params.get('clean_sheet', {})
@@ -2271,7 +2273,21 @@ with open(r"{temp_result_path}", 'w') as f:
         
         # Generate predictions
         test_df['pred_minutes'] = self.models['minutes'].predict(test_df)
-        
+
+        # P(features at all). Separate from pred_minutes, which is E[minutes | appears]
+        # and so says nothing about the chance of not being picked. Blended with the
+        # live FPL status: the model reads rotation risk from playing history, the API
+        # is authoritative on injuries and suspensions it cannot know about.
+        if self.models['minutes'].appear_is_fitted:
+            appear = self.models['minutes'].predict_appear_proba(test_df)
+            chance = pd.to_numeric(
+                test_df.get('fpl_chance_of_playing', 100), errors='coerce'
+            ).fillna(100).values / 100.0
+            test_df['pred_appear_prob'] = np.clip(appear * chance, 0.0, 1.0)
+        else:
+            test_df['pred_appear_prob'] = np.nan
+
+
         # Clean sheet / goals against FIRST (needed for pred_team_goals feature)
         cs_probs, two_plus_probs, pred_goals_against = self._predict_clean_sheet(test_df, gameweek, season, verbose)
         test_df['pred_cs_prob'] = cs_probs
@@ -2479,6 +2495,33 @@ with open(r"{temp_result_path}", 'w') as f:
             return None
         return {'sections': sections, 'calibration': calibration}
 
+    def optimize_squad(self, predictions: pd.DataFrame, gameweek: int = None,
+                       season: str = '2026/2027', budget: float = 100.0,
+                       snapshot: bool = True, verbose: bool = True) -> dict:
+        """Pick the best 15 under a budget, weighting bench spend by P(appears).
+
+        Prices are fetched live — nothing in the repo stores them — and snapshotted to
+        data/fpl_prices.csv, since the FPL API drops per-gameweek price history at
+        season rollover and it cannot be reconstructed afterwards.
+
+        Requires a pred_appear_prob column, which predict() produces once the
+        MinutesModel has fitted its AppearClassifier.
+        """
+        from .optimizer import fetch_fpl_prices, snapshot_prices, attach_prices, optimize_squad
+
+        if verbose:
+            print("\n" + "=" * 60)
+            print(f"OPTIMIZING SQUAD (budget £{budget:.1f}m)")
+            print("=" * 60)
+
+        prices = fetch_fpl_prices(verbose=verbose)
+        if snapshot and gameweek is not None:
+            snapshot_prices(prices, gameweek, season, str(self.data_dir), verbose)
+        priced = attach_prices(predictions, prices, verbose=verbose)
+        result = optimize_squad(priced, budget=budget, verbose=verbose)
+        self.last_squad = result
+        return result
+
     def save_run(self, predictions: pd.DataFrame, gameweek: int, season: str = '2025/2026',
                  description: str = '', verbose: bool = True) -> Path:
         """Save a complete run: predictions, simulations, tuned params, metrics.
@@ -2527,6 +2570,14 @@ with open(r"{temp_result_path}", 'w') as f:
                 serializable[model_name] = {k: _convert(v) for k, v in params.items()}
             with open(run_dir / 'tuned_params.json', 'w') as f:
                 json.dump(serializable, f, indent=2, default=_convert)
+
+        # 3b. Optimized squad
+        if getattr(self, 'last_squad', None):
+            sq = self.last_squad
+            sq['squad'].to_csv(run_dir / 'squad.csv', index=False)
+            with open(run_dir / 'squad_meta.json', 'w') as f:
+                json.dump({k: v for k, v in sq.items()
+                           if k not in ('squad', 'xi', 'bench')}, f, indent=2)
 
         # 4. Test metrics
         if hasattr(self, 'last_test_metrics') and self.last_test_metrics:

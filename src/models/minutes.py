@@ -1,5 +1,6 @@
 """Minutes prediction model — two-stage architecture.
 
+AppearClassifier: predicts P(minutes >= 1) — the only model trained on non-appearances
 StarterClassifier: predicts P(starter) via XGBClassifier
 StarterMinutesModel: regressor for 60+ minute players
 SubMinutesModel: regressor for 1-59 minute players
@@ -9,7 +10,10 @@ import pandas as pd
 import numpy as np
 import xgboost as xgb
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_absolute_error
+from sklearn.isotonic import IsotonicRegression
+from sklearn.metrics import mean_absolute_error, roc_auc_score
+
+from ..features import APPEARANCE_FEATURES
 
 
 # Shared feature list (classifier uses all, regressors use subsets)
@@ -95,6 +99,104 @@ SUB_FEATURES = [
     'manager_emb_0', 'manager_emb_1', 'manager_emb_2', 'manager_emb_3',
     'manager_emb_4', 'manager_emb_5', 'manager_emb_6', 'manager_emb_7',
 ]
+
+
+class AppearClassifier:
+    """XGBClassifier predicting P(minutes >= 1) — whether a player features at all.
+
+    Unlike every other model in the pipeline, this one trains on the calendar grid
+    from ``features.build_appearance_grid`` rather than the per-match frame, so it
+    sees the weeks a player was available and not picked. Those rows are the entire
+    signal: a frame of appearances only has no counterexamples.
+
+    Kept separate from ``MinutesModel.predict``, which stays conditional on playing
+    (E[minutes | appears]). Folding P(appears) into pred_minutes would change the
+    meaning of a feature that goals/assists/defcon/saves/bonus were all tuned
+    against, forcing a full retune.
+    """
+
+    FEATURES = APPEARANCE_FEATURES
+    TARGET = 'appeared'
+
+    def __init__(self, **xgb_params):
+        self.selected_features = xgb_params.pop('selected_features', None)
+        default_params = {
+            'n_estimators': 300,
+            'max_depth': 5,
+            'learning_rate': 0.05,
+            'random_state': 42,
+            'min_child_weight': 10,
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+            'eval_metric': 'logloss',
+        }
+        default_params.update(xgb_params)
+        self.model = xgb.XGBClassifier(**default_params)
+        self.scaler = StandardScaler()
+        self.calibrator = None
+        self.is_fitted = False
+
+    @property
+    def features_to_use(self):
+        return self.selected_features if self.selected_features else self.FEATURES
+
+    def _prepare_X(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        for feat in self.features_to_use:
+            if feat not in df.columns:
+                df[feat] = 0
+        return df[self.features_to_use].fillna(0).astype(float)
+
+    def fit(self, grid: pd.DataFrame, verbose: bool = True):
+        """Train on the appearance grid. Expects an ``appeared`` column.
+
+        Raw XGB output is badly calibrated in the region that matters here: on a
+        2025/26 holdout it put P(blank) at .090 for likely starters whose actual
+        blank rate was .050, which would roughly double every bench weight. So the
+        most recent season is held out to fit an isotonic map, then the booster is
+        refit on everything and the map applied on top.
+        """
+        y_all = grid[self.TARGET].astype(int).values
+        if verbose:
+            print(f"  AppearClassifier: {len(grid):,} player-gameweeks, {y_all.mean():.1%} appeared")
+
+        seasons = sorted(grid['season'].dropna().unique()) if 'season' in grid.columns else []
+        if len(seasons) >= 2:
+            holdout = seasons[-1]
+            core = grid[grid['season'] != holdout]
+            calib = grid[grid['season'] == holdout]
+            scaler = StandardScaler()
+            pre = xgb.XGBClassifier(**self.model.get_params())
+            pre.fit(scaler.fit_transform(self._prepare_X(core)),
+                    core[self.TARGET].astype(int).values)
+            p_cal = pre.predict_proba(scaler.transform(self._prepare_X(calib)))[:, 1]
+            self.calibrator = IsotonicRegression(out_of_bounds='clip').fit(
+                p_cal, calib[self.TARGET].astype(int).values
+            )
+            if verbose:
+                print(f"    isotonic calibration fit on {holdout} ({len(calib):,} rows)")
+
+        X_scaled = self.scaler.fit_transform(self._prepare_X(grid))
+        self.model.fit(X_scaled, y_all)
+        self.is_fitted = True
+
+        if verbose:
+            try:
+                auc = roc_auc_score(y_all, self.model.predict_proba(X_scaled)[:, 1])
+                print(f"    train AUC: {auc:.3f}")
+            except ValueError:
+                pass
+        return self
+
+    def predict_proba(self, df: pd.DataFrame) -> np.ndarray:
+        """Return P(plays >= 1 minute) for each row."""
+        if not self.is_fitted:
+            raise ValueError("AppearClassifier not fitted")
+        X = self._prepare_X(df)
+        p = self.model.predict_proba(self.scaler.transform(X))[:, 1]
+        if self.calibrator is not None:
+            p = self.calibrator.predict(p)
+        return np.clip(p, 0.0, 1.0)
 
 
 class StarterClassifier:
@@ -294,7 +396,9 @@ class MinutesModel:
         self.classifier = StarterClassifier(**cls_params)
         self.starter_model = StarterMinutesModel(**starter_params)
         self.sub_model = SubMinutesModel(**sub_params)
+        self.appear_model = AppearClassifier(**params.get('appear_params', {}))
         self.is_fitted = False
+        self.appear_is_fitted = False
 
         # Store selected_features for compatibility (not used directly)
         self.selected_features = None
@@ -303,8 +407,13 @@ class MinutesModel:
     def features_to_use(self):
         return self.FEATURES
 
-    def fit(self, df: pd.DataFrame, verbose: bool = True):
-        """Train all three sub-models."""
+    def fit(self, df: pd.DataFrame, verbose: bool = True, appearance_grid: pd.DataFrame = None):
+        """Train all three sub-models, plus the appearance model when a grid is given.
+
+        ``appearance_grid`` comes from ``features.build_appearance_grid`` and is the
+        only input here containing non-appearances. Without it the minutes models
+        still train exactly as before and ``predict_appear_proba`` is unavailable.
+        """
         if verbose:
             print(f"Training MinutesModel (two-stage) on {len(df[df['minutes'] >= 1]):,} samples...")
 
@@ -312,6 +421,10 @@ class MinutesModel:
         self.starter_model.fit(df, verbose)
         self.sub_model.fit(df, verbose)
         self.is_fitted = True
+
+        if appearance_grid is not None and len(appearance_grid):
+            self.appear_model.fit(appearance_grid, verbose)
+            self.appear_is_fitted = True
 
         if verbose:
             # Report combined training MAE
@@ -330,6 +443,14 @@ class MinutesModel:
         preds = self._blend(df)
         preds = self._apply_caps(df, preds)
         return np.clip(preds, 1, 90)
+
+    def predict_appear_proba(self, df: pd.DataFrame) -> np.ndarray:
+        """P(plays >= 1 minute). Complements predict(), which is E[minutes | appears]."""
+        if not self.appear_is_fitted:
+            raise ValueError(
+                "AppearClassifier not fitted — pass appearance_grid to MinutesModel.fit()"
+            )
+        return self.appear_model.predict_proba(df)
 
     def _blend(self, df: pd.DataFrame) -> np.ndarray:
         """Sigmoid-sharpened blend: push P(start) toward 0/1 before weighting."""

@@ -37,6 +37,7 @@ Data scraping: `python scrape_update_data.py --gameweek 28` or `--auto`
 - **BaseModel** (`base.py`): Abstract class with XGBoost + minute-weighted training (no scaler — trees don't need it). Subclasses define `FEATURES`, `TARGET`, and `_get_y_max()`.
 - **BaseModel subclasses**: GoalsModel (Poisson objective on raw match counts), AssistsModel (Poisson objective on raw match counts), DefconModel (Poisson objective on raw defensive contribution counts, uses `pred_minutes` as feature), SavesModel — all follow the same fit/predict pattern.
 - **CardsModel** (`cards.py`): XGBoost binary classifier (`binary:logistic`) on actual yellow card data from the FPL API. Requires `yellow_cards` column — `load_data()` merges this via `merge_fpl_card_data()` and will raise if the FPL API is unreachable. Red cards use fouls-based prediction (too rare for classification). Not part of the tuning loop.
+- **AppearClassifier** (`minutes.py`): XGBoost binary classifier for P(minutes >= 1) — the only model trained on non-appearances. Its training set is the calendar grid from `features.build_appearance_grid()`, not the per-match frame, because a frame of appearances contains no counterexamples. Isotonic-calibrated against the most recent season (raw XGB put P(blank) at .090 for likely starters whose actual rate was .050, which would double every bench weight). Exposed via `MinutesModel.predict_appear_proba()`; `predict()` is untouched and still returns E[minutes | appears], so no downstream model needs retuning. Not part of the tuning loop.
 - **Custom models** (don't inherit BaseModel): MinutesModel (custom capping logic), CleanSheetModel (Poisson regression for goals-against lambda, raw Poisson CS probs with prior_lambda anchor, home/away split season stats, team-level aggregates), BonusModel (Monte Carlo BPS simulation — simulates goals, assists, clean sheets, **and yellow cards** per match, then ranks BPS to award 3-2-1 bonus).
 
 ### Feature engineering (src/features.py)
@@ -110,9 +111,25 @@ For agent-driven experimentation workflow, see `AGENTS.md`.
 ### FPL API data integration
 `load_data()` automatically fetches yellow/red card data from the FPL API (`fetch_fpl_actual_points()`) and merges it into the training DataFrame by matching player name + team + gameweek. This enriches the FotMob data (which lacks card columns) with actual FPL yellow_cards and red_cards for the current season. The merge is cached to `data/fpl_actual_points.csv`. If the API is unreachable, `load_data()` will raise — internet access is required on first run (cached thereafter).
 
+## Squad optimization (src/optimizer.py)
+
+`pipeline.optimize_squad(predictions, gameweek, season)` picks the best 15 under a £100.0m budget, solved exactly as a MILP via `scipy.optimize.milp` (no new dependency; `pulp` is not installed). Constraints: 2/5/5/3 by position, max 3 per club, valid XI shape, and starters must be in the squad.
+
+Two things drive the objective:
+- **Unconditional expected points.** `exp_total_pts` is built from `pred_minutes`, which is E[minutes | appears], so it is really E[points | appears] and overstates a fringe player by `1/p_appear`. The optimizer multiplies by `pred_appear_prob` first (column `exp_pts_uncond`).
+- **Bench slots weighted by how often they actually play.** An outfield bench slot only scores via autosub, which needs a starter to blank, so slot *k* is weighted by P(at least *k* starters blank) — the exact Poisson-binomial tail over the XI's appearance probabilities. The backup GK is weighted separately by `1 - p_appear(GK1)`, which is why it converges to the £4.0m floor. Since the weights depend on the XI and the XI depends on the weights, the MILP is re-solved until the squad stops changing (typically 3 iterations).
+
+Captain is reported as the highest-EP starter but is **not** doubled in the objective, which would bias the squad toward a single premium.
+
+### Prices
+Prices exist **only in the FPL API** (`bootstrap-static` → `now_cost`, in tenths); nothing in the repo stores them, and `fetch_fpl_prices()` requires internet. Joined to predictions by name via the same exact → web_name/second_name → token-subset cascade used for card data (~98.6% match; unmatched players are excluded and printed).
+
+`snapshot_prices()` appends every fetch to `data/fpl_prices.csv` keyed by `(season, gameweek, fpl_id)`. **This is not recoverable retroactively** — the API serves per-gameweek price history only for the current season and drops it at rollover, keeping just `start_cost`/`end_cost` per player in `history_past`. Weekly snapshots are the only way to build price history.
+
 ## Visualization (src/viz.py)
 
 `generate_distribution_html()` produces a standalone HTML file (`distributions.html`) with:
+- Optimal-squad pitch (`squad=` arg), laid out in the shape of the formation it selected — a colored dot per player with name and price below, bench in autosub order. Desktop `body` is `display:flex`, so the side column sits to the right of the ridge plot with the squad above the metrics tables; the mobile template stacks it first on the page.
 - D3.js ridge plot showing Monte Carlo points distributions for top outfield players
 - Sub-model metrics table, overall FPL points metrics, and a calibration plot (predicted vs actual by bucket)
 - Responsive layout — desktop ridge plot and mobile card layout are both embedded; the correct one is selected at load time based on viewport width
@@ -133,6 +150,7 @@ When tuning is split from training (steps 3a/3b in the skill), tuned params are 
 
 ### Run directory structure (`data/runs/gw{N}_{timestamp}/`)
 - `predictions.csv` — full prediction table
+- `squad.csv` / `squad_meta.json` — optimized 15 with an `is_starter` flag, plus formation, cost, and the bench weights used
 - `simulations/` — Monte Carlo simulation arrays (`.npy`)
 - `tuned_params.json` — Optuna-selected hyperparams + features per model
 - `test_metrics.json` — holdout test set metrics (sub-model + FPL points)
@@ -144,6 +162,7 @@ When tuning is split from training (steps 3a/3b in the skill), tuned params are 
 - `data/players/player_stats.csv`: Player-match level FotMob stats (gitignored)
 - `data/fixtures.csv`: Match schedule with gameweeks
 - `data/fpl_actual_points.csv`: Cached FPL API data with yellow/red cards per gameweek
+- `data/fpl_prices.csv`: Weekly price snapshots keyed by (season, gameweek, fpl_id). Append-only; cannot be backfilled after a season rolls over.
 - `data/tuning_results/`: Cached Optuna tuning results (JSON)
 - `data/predictions/`: Output CSVs per gameweek (gitignored)
 - `data/experiments.db`: Experiment log (SQLite, gitignored)
