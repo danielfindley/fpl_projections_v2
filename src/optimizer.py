@@ -198,13 +198,25 @@ def optimize_squad(predictions: pd.DataFrame, budget: float = BUDGET,
         if len(pos_idx[p]) < need:
             raise ValueError(f"Only {len(pos_idx[p])} priced {p} available, need {need}")
 
-    # Variables: [squad_0..squad_n-1, start_0..start_n-1]
+    # Variables: [squad_0..n-1, start_0..n-1, slot_{k,j}] where slot_{k,j} = 1 when the
+    # j-th outfield player occupies bench slot k. The slots carry very different
+    # weights (~.40 / ~.09 / ~.01), so which seat a benched player takes has to be a
+    # decision the solver makes, not something averaged over afterwards — otherwise
+    # slot 3 gets valued ~15x too high and the optimiser overpays for a seat that
+    # never plays.
+    out_idx = np.where(pos != 'GK')[0]
+    m = len(out_idx)
+    N_BENCH = 3
+    n_var = 2 * n + N_BENCH * m
     S, X = slice(0, n), slice(n, 2 * n)
+
+    def slot_pos(k, j):
+        return 2 * n + k * m + j
 
     constraints = []
 
     def row(squad_coef=None, start_coef=None):
-        r = np.zeros(2 * n)
+        r = np.zeros(n_var)
         if squad_coef is not None:
             r[S] = squad_coef
         if start_coef is not None:
@@ -226,13 +238,30 @@ def optimize_squad(predictions: pd.DataFrame, budget: float = BUDGET,
         constraints.append(LinearConstraint(row(squad_coef=sel), 0, MAX_PER_TEAM))
 
     # A starter must be in the squad: start_i - squad_i <= 0
-    link = np.zeros((n, 2 * n))
+    link = np.zeros((n, n_var))
     link[np.arange(n), np.arange(n)] = -1.0
     link[np.arange(n), n + np.arange(n)] = 1.0
     constraints.append(LinearConstraint(link, -np.inf, 0))
 
-    integrality = np.ones(2 * n)
-    bounds = Bounds(np.zeros(2 * n), np.ones(2 * n))
+    # Each bench slot is filled by exactly one outfield player.
+    for k in range(N_BENCH):
+        r = np.zeros(n_var)
+        r[slot_pos(k, 0):slot_pos(k, m - 1) + 1] = 1.0
+        constraints.append(LinearConstraint(r, 1, 1))
+
+    # An outfield player sits in exactly one slot iff they are squadded but not
+    # starting: sum_k slot_{k,j} - squad_j + start_j = 0. With 15 squad / 11 XI and
+    # exactly one GK benched, this leaves exactly 3 outfield players to seat.
+    seat = np.zeros((m, n_var))
+    for j, i in enumerate(out_idx):
+        for k in range(N_BENCH):
+            seat[j, slot_pos(k, j)] = 1.0
+        seat[j, i] = -1.0
+        seat[j, n + i] = 1.0
+    constraints.append(LinearConstraint(seat, 0, 0))
+
+    integrality = np.ones(n_var)
+    bounds = Bounds(np.zeros(n_var), np.ones(n_var))
 
     # Seed weights: bench value before any XI is known. Deliberately small.
     weights = np.array([0.18, 0.09, 0.04])
@@ -240,22 +269,28 @@ def optimize_squad(predictions: pd.DataFrame, budget: float = BUDGET,
     squad_idx = None
 
     for it in range(max_iter):
-        # Bench contribution is (squad - start); each position's bench weight is the
-        # average slot weight, since which bench slot a player lands in is decided
-        # after selection by expected points order.
-        w_out = float(np.mean(weights))
-        bench_w = np.where(pos == 'GK', gk_bench_weight, w_out)
-        bench_value = ep * bench_w
+        # Starters score in full. A benched GK is worth their points times the chance
+        # the first-choice keeper blanks. A benched outfielder is worth their points
+        # times the weight of whichever slot the solver seats them in.
+        is_gk = (pos == 'GK').astype(float)
+        gk_bench_value = ep * is_gk * gk_bench_weight
 
-        c = np.zeros(2 * n)
-        c[S] = -bench_value                     # counted for everyone in the squad…
-        c[X] = -(ep - bench_value)              # …upgraded to full value when starting
+        c = np.zeros(n_var)
+        c[S] = -gk_bench_value                  # GK bench value applies on squad…
+        c[X] = -(ep - gk_bench_value)           # …and is upgraded to full when starting
+        for k in range(N_BENCH):
+            for j, i in enumerate(out_idx):
+                c[slot_pos(k, j)] = -ep[i] * weights[k]
+
         res = milp(c=c, constraints=constraints, integrality=integrality, bounds=bounds)
         if not res.success:
             raise RuntimeError(f"MILP failed: {res.message}")
 
         new_squad = np.where(res.x[S] > 0.5)[0]
         new_start = np.where(res.x[X] > 0.5)[0]
+        # Bench order straight from the solver's slot assignment
+        slot_order = [int(out_idx[j]) for k in range(N_BENCH) for j in range(m)
+                      if res.x[slot_pos(k, j)] > 0.5]
 
         outfield_xi = [i for i in new_start if pos[i] != 'GK']
         weights = _bench_weights(p_appear[outfield_xi], n_bench=3)
@@ -274,9 +309,11 @@ def optimize_squad(predictions: pd.DataFrame, budget: float = BUDGET,
 
     xi = squad[squad['is_starter']].sort_values('exp_pts_uncond', ascending=False)
     bench = squad[~squad['is_starter']].copy()
-    # Autosub order: GK first (only replaces the GK), then outfield by expected points
+    # Autosub order: GK first (they only ever replace the GK), then outfield in the
+    # slot order the solver chose.
     bench_gk = bench[bench['fpl_position'] == 'GK']
-    bench_out = bench[bench['fpl_position'] != 'GK'].sort_values('exp_pts_uncond', ascending=False)
+    bench_out = df.loc[slot_order].copy()
+    bench_out['is_starter'] = False
     bench = pd.concat([bench_gk, bench_out])
 
     formation = {p: int((xi['fpl_position'] == p).sum()) for p in POSITIONS}
