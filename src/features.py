@@ -120,8 +120,18 @@ def _compute_calendar_minutes_features(df: pd.DataFrame,
     )
     grid['gw_gap_since_last_appearance'] = ordinal - grid['_last_app_ord']
 
+    # The ordinal stacks seasons end-to-end, so GW38 -> GW1 is a gap of 1 and the
+    # model cannot distinguish "started last week" from "started before a
+    # three-month summer break". This flag marks rows whose carried-over rolling
+    # form crossed a season boundary, so trees can learn to discount last_minutes /
+    # minutes_roll* there instead of treating May form as current.
+    grid['last_app_prev_season'] = (
+        ((grid['_last_app_ord'] - 1) // 38) < ((ordinal - 1) // 38)
+    ).fillna(False).astype(int)
+
     feature_cols = (
-        ['last_minutes', 'last_was_starter', 'last_was_full_90', 'gw_gap_since_last_appearance']
+        ['last_minutes', 'last_was_starter', 'last_was_full_90',
+         'gw_gap_since_last_appearance', 'last_app_prev_season']
         + [f'minutes_roll{w}' for w in ROLLING_WINDOWS]
         + [f'starter_rate_roll{w}' for w in ROLLING_WINDOWS]
         + [f'full90_rate_roll{w}' for w in ROLLING_WINDOWS]

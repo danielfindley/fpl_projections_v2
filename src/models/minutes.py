@@ -32,7 +32,7 @@ ALL_FEATURES = [
 
     # Current season
     'current_season_minutes', 'current_season_apps', 'current_season_mins_per_app',
-    'gw_gap_since_last_appearance',
+    'gw_gap_since_last_appearance', 'last_app_prev_season',
 
     # Goal involvement (key players play more)
     'goals_roll2', 'goals_roll3', 'goals_roll5', 'goals_roll7', 'goals_roll10',
@@ -73,7 +73,7 @@ STARTER_FEATURES = [
     'last_was_full_90',
     'lifetime_mins_per_app',
     'current_season_mins_per_app', 'current_season_apps',
-    'gw_gap_since_last_appearance',
+    'gw_gap_since_last_appearance', 'last_app_prev_season',
     'goals_roll2', 'goals_roll3', 'goals_roll5', 'goals_roll7', 'goals_roll10',
     'goal_involvements_roll5',
     'is_gk', 'is_def', 'is_mid', 'is_fwd',
@@ -92,7 +92,7 @@ SUB_FEATURES = [
     'last_was_starter',
     'lifetime_mins_per_app',
     'current_season_mins_per_app', 'current_season_apps',
-    'gw_gap_since_last_appearance',
+    'gw_gap_since_last_appearance', 'last_app_prev_season',
     'is_gk', 'is_def', 'is_mid', 'is_fwd',
     'minutes_trend',
     'is_home',
