@@ -654,28 +654,35 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     # LIFETIME PLAYER PROFILE
     # =========================================================================
 
-    df = df.sort_values(['player_name', 'season', 'gameweek']).reset_index(drop=True)
+    # Keyed on player_id, not player_name: FotMob re-spells players mid-history
+    # (Pascal Gross -> Pascal Groß, Bruno Guimaraes -> Bruno Guimarães, 60 players
+    # / 5.6% of rows), which splits one career into two lifetime profiles, and it
+    # reuses names across different players (Aaron Ramsey, Danilo, Joshua King),
+    # which merges two careers into one. Every other rolling feature already keys
+    # on player_id. The sort has to match the grouping — expanding() depends on
+    # row order, and sorting by name would interleave a re-spelled player's blocks.
+    df = df.sort_values(['player_id', 'season', 'gameweek']).reset_index(drop=True)
 
     # Offensive stats
     for stat in ['goals', 'assists', 'xg', 'xa', 'minutes', 'shots']:
         if stat in df.columns:
-            df[f'lifetime_{stat}'] = df.groupby('player_name')[stat].transform(
+            df[f'lifetime_{stat}'] = df.groupby('player_id')[stat].transform(
                 lambda x: x.shift(1).expanding().sum()
             )
 
     # Goalkeeper stats (lifetime)
     for stat in ['saves', 'xgot_faced']:
         if stat in df.columns:
-            df[f'lifetime_{stat}'] = df.groupby('player_name')[stat].transform(
+            df[f'lifetime_{stat}'] = df.groupby('player_id')[stat].transform(
                 lambda x: x.shift(1).expanding().sum()
             )
 
     # Defensive stats (lifetime)
-    df['lifetime_defcon'] = df.groupby('player_name')['defcon'].transform(
+    df['lifetime_defcon'] = df.groupby('player_id')['defcon'].transform(
         lambda x: x.shift(1).expanding().sum()
     )
     for col in ['tackles', 'interceptions', 'clearances', 'blocks', 'recoveries', 'fouls_committed']:
-        df[f'lifetime_{col}'] = df.groupby('player_name')[col].transform(
+        df[f'lifetime_{col}'] = df.groupby('player_id')[col].transform(
             lambda x: x.shift(1).expanding().sum()
         )
 
@@ -711,7 +718,7 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
 
     # Lifetime yellow card per 90 (if yellow_cards column exists)
     if 'yellow_cards' in df.columns:
-        df['lifetime_yellow_cards'] = df.groupby('player_name')['yellow_cards'].transform(
+        df['lifetime_yellow_cards'] = df.groupby('player_id')['yellow_cards'].transform(
             lambda x: x.shift(1).expanding().sum()
         ).fillna(0)
         df['lifetime_yellow_cards_per90'] = np.where(
@@ -727,7 +734,7 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
         0
     )
 
-    df['lifetime_appearances'] = df.groupby('player_name').cumcount()
+    df['lifetime_appearances'] = df.groupby('player_id').cumcount()
     df['lifetime_mins_per_app'] = np.where(
         df['lifetime_appearances'] > 0,
         df['lifetime_minutes'] / df['lifetime_appearances'],
