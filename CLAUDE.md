@@ -124,7 +124,9 @@ For agent-driven experimentation workflow, see `AGENTS.md`.
 
 **Hedging is applied to minutes, not to `p_start`** (`lineup_weight=0.7`). `_sharpen(temp=0.3)` is nearly a step function, so blending probabilities collapses back to the feed's answer and gives no hedge — the whole range `p_in` 0.75–0.99 moves blended minutes by 1.6 min, while `lineup_weight` moves it by 23.5. **Tune the weight, not the probabilities.**
 
-**Benching is inferred from absence, so it is guarded.** A club is only safe to bench if every unmatched starter has no surname collision in our squad for that club — meaning they're genuinely outside our data (promoted-club player, new signing) rather than a name we failed to recognise. A collision means we might bench the very player who is starting; those clubs get positive starter overrides only. An earlier version without this turned Bruno Guimarães into a 39-minute sub.
+**Benching is inferred from absence, so it is guarded.** A name that fails to match falls into the same bucket as a genuinely benched player, and the two causes are very different: either the player is outside our data entirely (promoted-club squad, new signing), in which case benching the rest of the club is fine — or he is in our data under a different spelling, in which case he is actually *starting* and we would be about to project a nailed starter as a 20-minute sub.
+
+The surname test separates them. A club is safe to bench only if every unmatched starter has no surname collision in our squad for that club; a collision means it is ambiguous, and those clubs get positive starter overrides only. As of GW1 2026/27 there were **0 collisions across all 31 unmatched starters**, so this guard is precautionary and has not yet fired in practice.
 
 **Names** come from the anchor `title` attribute (full name) plus a stable RotoWire id, never the abbreviated display text. `_fold()` extends `normalize_player_name` for letters NFD cannot decompose (ø, ß, æ, å, đ, ł) — without it Odegaard never matches Ødegaard.
 

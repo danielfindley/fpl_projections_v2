@@ -192,7 +192,14 @@ Tune the weight, not the probabilities.
 
 ### Safety: benching is inferred from absence
 
-A club is only safe to bench if every unmatched starter has **no surname collision** in our squad for that club — meaning they're genuinely outside our data (promoted-club player, new signing), not a name we failed to recognise. A collision means we might bench the very player who is starting, so those clubs get positive starter overrides only. An earlier version without this guard turned a club captain into a 39-minute sub.
+A name that fails to match falls into the same bucket as a genuinely benched player, and the two causes are very different:
+
+- **Player is outside our data entirely** (promoted-club squad, new signing) → benching the rest of that club is fine
+- **Player is in our data under a different spelling** → he is actually *starting*, and we would be about to project a nailed starter as a 20-minute sub
+
+The surname test separates them. A club is safe to bench only if every unmatched starter has **no surname collision** in our squad for that club; a collision is ambiguous, so those clubs get positive starter overrides only.
+
+As of GW1 2026/27 there were **0 collisions across all 31 unmatched starters** — every unmatched name was a promoted-club player or a signing we have no history for. The guard is precautionary and has not yet fired in practice.
 
 Names come from the anchor `title` attribute (full name) plus a stable RotoWire id, never the abbreviated display text (`R. Calafiori`). `_fold()` extends `normalize_player_name` for letters NFD cannot decompose — ø, ß, æ, å, đ, ł — without which Odegaard never matches Ødegaard.
 
