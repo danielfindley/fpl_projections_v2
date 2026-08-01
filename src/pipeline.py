@@ -2302,11 +2302,15 @@ with open(r"{temp_result_path}", 'w') as f:
         else:
             test_df['pred_appear_prob'] = np.nan
 
-        # OUT / SUS on the lineup page is harder evidence than FPL's chance_of_playing,
-        # which lags team news.
+        # OUT / SUS / QUES on the lineup page is harder evidence than FPL's
+        # chance_of_playing, which lags team news. Scales P(appears): 0 rules a player
+        # out entirely, a doubt discounts them.
         if lineup_available is not None:
-            out_mask = lineup_available == 0.0
-            test_df.loc[out_mask, 'pred_appear_prob'] = 0.0
+            have = ~np.isnan(lineup_available)
+            if have.any():
+                test_df.loc[have, 'pred_appear_prob'] = (
+                    test_df.loc[have, 'pred_appear_prob'].values * lineup_available[have]
+                )
 
 
         # Clean sheet / goals against FIRST (needed for pred_team_goals feature)
@@ -2525,12 +2529,22 @@ with open(r"{temp_result_path}", 'w') as f:
         of hitting the network. Snapshots to data/lineups/ because RotoWire serves
         only the current slate and the history cannot be recovered afterwards.
         """
-        from .lineups import fetch_lineups, parse_lineups, save_lineups, match_lineups
+        from .lineups import (fetch_lineups, parse_lineups, save_lineups,
+                              evaluate_snapshots)
 
         if verbose:
             print("\n" + "=" * 60)
             print("PREDICTED LINEUPS")
             print("=" * 60)
+
+        # Score every past snapshot against real minutes before adding a new one, so
+        # the feed's accuracy is reported on every deploy rather than taken on trust.
+        if self.df is not None:
+            try:
+                self.last_lineup_accuracy = evaluate_snapshots(
+                    self.df, str(self.data_dir), verbose=verbose)
+            except Exception as exc:
+                print(f"  (lineup accuracy check skipped: {type(exc).__name__}: {exc})")
 
         raw = parse_lineups(html if html is not None else fetch_lineups())
         if raw.empty:

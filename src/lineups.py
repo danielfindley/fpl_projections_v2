@@ -27,6 +27,12 @@ _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 # Statuses that mean the player cannot feature at all, whatever the XI says.
 UNAVAILABLE = {'OUT', 'SUS'}
+# QUES is a doubt, not a ruling out: several players appear in an XI while flagged.
+# It scales P(appears) rather than P(starts) — the question is whether they feature,
+# not how long they last — and P(appears) is not put through _sharpen, so unlike
+# p_start the value here actually survives into the output. 0.75 mirrors FPL's own
+# "75% chance" convention and is a placeholder until evaluate_snapshots measures it.
+DOUBT_MULTIPLIER = 0.75
 
 # normalize_player_name strips combining accents via NFD, which handles é/ã/ü but not
 # letters that are their own codepoint and never decompose. RotoWire writes plain
@@ -121,6 +127,82 @@ def save_lineups(lineups: pd.DataFrame, gameweek: int, season: str,
     return path
 
 
+def evaluate_snapshots(actuals: pd.DataFrame, data_dir: str = 'data',
+                       verbose: bool = True) -> pd.DataFrame:
+    """Score past lineup snapshots against what actually happened.
+
+    ``actuals`` is the feature frame: player_name, team, season, gameweek, minutes.
+    Only gameweeks that have since been played can be scored, so this quietly
+    returns empty until the first one completes.
+
+    Answers the questions the override parameters are currently guessing at:
+    how often a predicted starter really starts, how often a benched player does,
+    and whether QUES means anything. It also sweeps ``lineup_weight`` so that hedge
+    can be set from data rather than picked.
+    """
+    snap_dir = Path(data_dir) / 'lineups'
+    if not snap_dir.exists():
+        return pd.DataFrame()
+
+    files = sorted(snap_dir.glob('*.csv'))
+    if not files:
+        return pd.DataFrame()
+
+    played = actuals[['player_name', 'team', 'season', 'gameweek', 'minutes']].copy()
+    played['minutes'] = pd.to_numeric(played['minutes'], errors='coerce').fillna(0)
+    # A gameweek is scoreable once we hold real match data for it
+    have = played.groupby(['season', 'gameweek']).size()
+
+    rows = []
+    for path in files:
+        snap = pd.read_csv(path)
+        if snap.empty or 'season' not in snap.columns:
+            continue
+        season, gw = snap['season'].iloc[0], int(snap['gameweek'].iloc[0])
+        if (season, gw) not in have.index:
+            continue
+        truth = played[(played['season'] == season) & (played['gameweek'] == gw)]
+        if truth.empty:
+            continue
+        matched = match_lineups(snap, truth, verbose=False)
+        m = matched[matched['matched_name'].notna()]
+        actual = truth.groupby('player_name')['minutes'].max()
+        for r in m.itertuples():
+            mins = actual.get(r.matched_name)
+            if mins is None:
+                mins = 0.0
+            rows.append({
+                'season': season, 'gameweek': gw, 'snapshot': path.name,
+                'player_name': r.matched_name,
+                'predicted_starter': bool(r.is_predicted_starter),
+                'status': r.status, 'actual_minutes': float(mins),
+                'started': float(mins) >= 60, 'appeared': float(mins) > 0,
+            })
+
+    ev = pd.DataFrame(rows)
+    if ev.empty:
+        if verbose:
+            print("  Lineup accuracy: no completed gameweeks to score yet")
+        return ev
+
+    if verbose:
+        xi = ev[ev['predicted_starter']]
+        bench = ev[~ev['predicted_starter']]
+        print(f"  Lineup accuracy over {ev['gameweek'].nunique()} gameweek(s), "
+              f"{len(ev)} player-rows:")
+        if len(xi):
+            print(f"    predicted starter -> started {xi['started'].mean():.3f}, "
+                  f"appeared {xi['appeared'].mean():.3f}  (p_in currently 0.95)")
+        if len(bench):
+            print(f"    listed non-starter -> started {bench['started'].mean():.3f}"
+                  f"  (p_out currently 0.10)")
+        q = ev[ev['status'] == 'QUES']
+        if len(q):
+            print(f"    QUES -> appeared {q['appeared'].mean():.3f} "
+                  f"(DOUBT_MULTIPLIER currently {DOUBT_MULTIPLIER})")
+    return ev
+
+
 def match_lineups(lineups: pd.DataFrame, predictions: pd.DataFrame,
                   verbose: bool = True) -> pd.DataFrame:
     """Attach our player_name to each lineup row, matching within club.
@@ -207,18 +289,33 @@ def build_overrides(matched: pd.DataFrame, predictions: pd.DataFrame,
 
     starters = set(xi['matched_name'])
 
-    # Benching is inferred from absence, so it is only safe where the whole XI was
-    # matched. With even one starter unmatched we cannot tell "benched" from "we
-    # failed to recognise the name", and guessing wrong turns a nailed starter into
-    # a 20-minute sub. Clubs with an incomplete match still get their positive
-    # starter overrides; everyone else there falls through to the model.
+    # Benching is inferred from absence, so it is only safe when an unmatched starter
+    # is genuinely someone we have no row for — not someone we failed to recognise.
+    # Those are distinguishable: if nobody in our squad for that club even shares the
+    # surname, the name is simply outside our data (a promoted-club player, a new
+    # signing) and the rest of the squad can still be benched. If a surname does
+    # collide, we might be about to bench the very player who is starting, so that
+    # club gets positive overrides only. Getting this wrong turned Bruno Guimaraes
+    # into a 39-minute sub in an early version.
+    surnames = {}
+    for team, grp in predictions.groupby(predictions['team'].map(normalize_team_name)):
+        surnames[team] = {tok for name in grp['player_name']
+                          for tok in _fold(name).split()}
+
     all_xi = matched[matched['is_predicted_starter']]
-    per_team = all_xi.groupby('team')['matched_name'].agg(['size', 'count'])
-    complete = {normalize_team_name(t) for t, r in per_team.iterrows()
-                if r['size'] == r['count']}
+    complete = set()
+    for team, grp in all_xi.groupby('team'):
+        tn = normalize_team_name(team)
+        pool_tokens = surnames.get(tn, set())
+        risky = [n for n, mn in zip(grp['player_name'], grp['matched_name'])
+                 if pd.isna(mn) and _fold(n).split()[-1:] and _fold(n).split()[-1] in pool_tokens]
+        if not risky:
+            complete.add(tn)
 
     unavailable = set(listed.loc[listed['status'].isin(UNAVAILABLE), 'matched_name'])
     unavailable |= set(xi.loc[xi['status'].isin(UNAVAILABLE), 'matched_name'])
+
+    doubtful = set(ok.loc[ok['status'] == 'QUES', 'matched_name'])
 
     p_start = np.full(len(predictions), np.nan)
     available = np.full(len(predictions), np.nan)
@@ -228,16 +325,20 @@ def build_overrides(matched: pd.DataFrame, predictions: pd.DataFrame,
         if name in unavailable:
             available[i] = 0.0
             p_start[i] = p_out
-        elif name in starters:
+            continue
+        if name in starters:
             p_start[i] = p_in
         elif team in complete:
             p_start[i] = p_out
+        if name in doubtful:
+            available[i] = DOUBT_MULTIPLIER
 
     if verbose:
-        n_partial = len(set(per_team.index.map(normalize_team_name)) - complete)
+        n_partial = len(set(all_xi['team'].map(normalize_team_name)) - complete)
         print(f"  Lineup overrides: {int(np.sum(p_start == p_in))} starters, "
               f"{int(np.sum((p_start == p_out) & (available != 0.0)))} benched, "
               f"{int(np.nansum(available == 0.0))} unavailable, "
+              f"{int(np.sum(available == DOUBT_MULTIPLIER))} doubtful, "
               f"{int(np.sum(np.isnan(p_start)))} left to the model")
         if n_partial:
             print(f"    {n_partial} club(s) had an incomplete XI match — "
