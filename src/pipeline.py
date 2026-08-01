@@ -45,6 +45,7 @@ TEAM_NAME_MAP = {
     'newcastle': 'newcastle united',
     'leicester': 'leicester city',
     'leeds': 'leeds united',
+    'afc bournemouth': 'bournemouth',
 }
 
 
@@ -2271,8 +2272,22 @@ with open(r"{temp_result_path}", 'w') as f:
             print("WARNING: No players found for prediction")
             return pd.DataFrame()
         
+        # Predicted lineups, when supplied, answer the one question the model is
+        # worst at: who actually starts. Everything downstream consumes pred_minutes
+        # as a feature, so correcting it here propagates through goals, assists,
+        # defcon, saves and bonus without any of them changing.
+        lineup_p_start, lineup_available = None, None
+        if getattr(self, 'last_lineups', None) is not None:
+            from .lineups import match_lineups, build_overrides
+            matched = match_lineups(self.last_lineups, test_df, verbose=verbose)
+            ov = build_overrides(matched, test_df, verbose=verbose)
+            lineup_p_start = ov['lineup_p_start'].values
+            lineup_available = ov['lineup_available'].values
+
         # Generate predictions
-        test_df['pred_minutes'] = self.models['minutes'].predict(test_df)
+        test_df['pred_minutes'] = self.models['minutes'].predict(
+            test_df, lineup_p_start=lineup_p_start
+        )
 
         # P(features at all). Separate from pred_minutes, which is E[minutes | appears]
         # and so says nothing about the chance of not being picked. Blended with the
@@ -2286,6 +2301,12 @@ with open(r"{temp_result_path}", 'w') as f:
             test_df['pred_appear_prob'] = np.clip(appear * chance, 0.0, 1.0)
         else:
             test_df['pred_appear_prob'] = np.nan
+
+        # OUT / SUS on the lineup page is harder evidence than FPL's chance_of_playing,
+        # which lags team news.
+        if lineup_available is not None:
+            out_mask = lineup_available == 0.0
+            test_df.loc[out_mask, 'pred_appear_prob'] = 0.0
 
 
         # Clean sheet / goals against FIRST (needed for pred_team_goals feature)
@@ -2494,6 +2515,40 @@ with open(r"{temp_result_path}", 'w') as f:
         if not sections and not calibration:
             return None
         return {'sections': sections, 'calibration': calibration}
+
+    def load_lineups(self, gameweek: int = None, season: str = '2026/2027',
+                     snapshot: bool = True, html: str = None,
+                     verbose: bool = True) -> pd.DataFrame:
+        """Fetch predicted lineups and arm them for the next predict() call.
+
+        Must be called before predict(). Pass ``html`` to parse a cached page instead
+        of hitting the network. Snapshots to data/lineups/ because RotoWire serves
+        only the current slate and the history cannot be recovered afterwards.
+        """
+        from .lineups import fetch_lineups, parse_lineups, save_lineups, match_lineups
+
+        if verbose:
+            print("\n" + "=" * 60)
+            print("PREDICTED LINEUPS")
+            print("=" * 60)
+
+        raw = parse_lineups(html if html is not None else fetch_lineups())
+        if raw.empty:
+            print("  WARNING: no lineups parsed — page layout may have changed. "
+                  "Predictions will fall back to the model.")
+            self.last_lineups = None
+            return raw
+
+        xi = raw[raw['is_predicted_starter']]
+        if verbose:
+            print(f"  {raw['fixture'].nunique()} fixtures, {xi['team'].nunique()} teams, "
+                  f"{len(xi)} predicted starters"
+                  f"{' (CONFIRMED)' if raw['confirmed'].any() else ' (predicted, not confirmed)'}")
+        if snapshot and gameweek is not None:
+            save_lineups(raw, gameweek, season, str(self.data_dir), verbose)
+
+        self.last_lineups = raw
+        return raw
 
     def optimize_squad(self, predictions: pd.DataFrame, gameweek: int = None,
                        season: str = '2026/2027', budget: float = 100.0,

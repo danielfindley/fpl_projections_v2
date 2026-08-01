@@ -435,14 +435,48 @@ class MinutesModel:
 
         return self
 
-    def predict(self, df: pd.DataFrame) -> np.ndarray:
-        """Blend predictions: P(start)*starter_pred + (1-P(start))*sub_pred, then cap."""
+    def predict(self, df: pd.DataFrame, lineup_p_start: np.ndarray = None,
+                lineup_weight: float = 0.7) -> np.ndarray:
+        """Blend predictions: P(start)*starter_pred + (1-P(start))*sub_pred, then cap.
+
+        ``lineup_p_start`` optionally supplies P(starts) from a predicted-lineup feed,
+        NaN where the feed says nothing. Two things change for those rows:
+
+        - P(start) comes from the feed instead of the classifier, which at a season
+          opener knows far more than three-month-old rolling form does.
+        - A confirmed starter skips the cold-start cap. That cap exists to stop the
+          model over-trusting a stale appearance, but a feed naming the player in the
+          XI is strictly better evidence than the heuristic it stands in for, and it
+          otherwise pins players to minutes_roll5 * 1.2 regardless.
+
+        Hedging happens on minutes rather than on P(start), because _sharpen is close
+        to a step function — blending probabilities barely moves the result, so a
+        wrong feed would be committed to in full.
+        """
         if not self.is_fitted:
             raise ValueError("Model not fitted")
 
-        preds = self._blend(df)
-        preds = self._apply_caps(df, preds)
-        return np.clip(preds, 1, 90)
+        preds = np.clip(self._apply_caps(df, self._blend(df)), 1, 90)
+        if lineup_p_start is None:
+            return preds
+
+        lineup_p_start = np.asarray(lineup_p_start, dtype=float)
+        have = ~np.isnan(lineup_p_start)
+        if not have.any():
+            return preds
+
+        p_start = np.where(have, lineup_p_start, self.classifier.predict_proba(df))
+        p_sharp = self._sharpen(p_start, temp=0.3)
+        raw = np.clip(p_sharp * self.starter_model.predict(df)
+                      + (1 - p_sharp) * self.sub_model.predict(df), 1, 90)
+        capped = np.clip(self._apply_caps(df, raw.copy()), 1, 90)
+        starts = have & (lineup_p_start >= 0.5)
+        lineup_preds = np.where(starts, raw, capped)
+
+        out = preds.copy()
+        out[have] = (lineup_weight * lineup_preds[have]
+                     + (1 - lineup_weight) * preds[have])
+        return np.clip(out, 1, 90)
 
     def predict_appear_proba(self, df: pd.DataFrame) -> np.ndarray:
         """P(plays >= 1 minute). Complements predict(), which is E[minutes | appears]."""
