@@ -250,8 +250,24 @@ def get_fpl_availability() -> dict:
         return {}
 
 
+# NFD decomposition strips combining accents (é, ã, ü) but not letters that are their
+# own codepoint and never decompose. FotMob writes these plainly while FPL keeps the
+# native spelling, so without folding, Kadioglu never matches Kadıoğlu and Petrovic
+# never matches Petrović — and the squad override then drops the player as departed.
+# Đ/đ transliterates to "dj" rather than "d" (Đorđe -> Djordje).
+_LETTER_FOLD = str.maketrans({
+    'ø': 'o', 'æ': 'ae', 'å': 'a', 'ß': 'ss', 'đ': 'dj', 'ð': 'd',
+    'ł': 'l', 'þ': 'th', 'ħ': 'h', 'ı': 'i', 'œ': 'oe', 'ŋ': 'n',
+})
+
+
 def normalize_player_name(name) -> str:
-    """Lowercase, accent-stripped player name for FPL<->FotMob matching."""
+    """Lowercase, accent-stripped, letter-folded player name for FPL<->FotMob matching.
+
+    Hyphens become spaces so a compound surname tokenises: FPL stores Solanke as
+    'Dominic Solanke-Mitchell', and without this 'solanke' is not a token of
+    'solanke-mitchell', so the token-subset pass finds nothing.
+    """
     import unicodedata
     if pd.isna(name):
         return ''
@@ -259,7 +275,8 @@ def normalize_player_name(name) -> str:
         c for c in unicodedata.normalize('NFD', str(name))
         if unicodedata.category(c) != 'Mn'
     )
-    return stripped.lower().strip()
+    stripped = stripped.lower().translate(_LETTER_FOLD)
+    return ' '.join(stripped.replace('-', ' ').split())
 
 
 def get_fpl_current_squads() -> dict:

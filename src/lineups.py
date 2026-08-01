@@ -34,18 +34,10 @@ UNAVAILABLE = {'OUT', 'SUS'}
 # "75% chance" convention and is a placeholder until evaluate_snapshots measures it.
 DOUBT_MULTIPLIER = 0.75
 
-# normalize_player_name strips combining accents via NFD, which handles é/ã/ü but not
-# letters that are their own codepoint and never decompose. RotoWire writes plain
-# ASCII, so without these Odegaard never matches Ødegaard and Gross never matches Groß.
-_LETTER_FOLD = str.maketrans({
-    'ø': 'o', 'æ': 'ae', 'å': 'a', 'ß': 'ss', 'đ': 'd', 'ð': 'd',
-    'ł': 'l', 'þ': 'th', 'ħ': 'h', 'ı': 'i', 'œ': 'oe',
-})
-
-
 def _fold(name) -> str:
-    """Normalised name with non-decomposing letters folded to ASCII."""
-    return normalize_player_name(name).translate(_LETTER_FOLD)
+    """Normalised name. Letter folding and hyphen splitting now live in
+    normalize_player_name, so every FPL/FotMob/RotoWire join shares one rule."""
+    return normalize_player_name(name)
 
 _BOX = re.compile(r'lineup__box"(.*?)(?=lineup__box"|\Z)', re.S)
 _TEAM_HOME = re.compile(r'lineup__mteam is-home">\s*([^<]+?)\s*<', re.S)
