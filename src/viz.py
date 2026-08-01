@@ -97,6 +97,10 @@ def _squad_rows(squad_result):
                 'team': str(r.get('team', '')),
                 'price': float(r.get('price', 0) or 0),
                 'pts': float(r.get('exp_pts_uncond', r.get('exp_total_pts', 0)) or 0),
+                # Ridge plot shows exp_total_pts, which is E[pts | he plays]. The pitch
+                # shows it discounted by P(appears) because that is what the optimiser
+                # maximises — carry both so the tooltip can show the arithmetic.
+                'pts_raw': float(r.get('exp_total_pts', 0) or 0),
                 'appear': float(r.get('pred_appear_prob', float('nan'))),
             })
         return out
@@ -110,10 +114,13 @@ def _squad_rows(squad_result):
 def _player_dot(p, captain=None, bench_weight=None):
     is_cap = captain is not None and p['full_name'] == captain
     color = _POS_COLOR.get(p['pos'], '#8b949e')
-    appear = '' if p['appear'] != p['appear'] else f"{p['appear'] * 100:.0f}% to play"
-    title = f"{p['full_name']} — {p['team']} — £{p['price']:.1f}m — {p['pts']:.2f} xPts"
-    if appear:
-        title += f" — {appear}"
+    title = f"{p['full_name']} — {p['team']} — £{p['price']:.1f}m"
+    if p['appear'] == p['appear'] and p.get('pts_raw'):
+        # Spell out the discount: the ridge plot's number is the first term here
+        title += (f" — {p['pts']:.2f} adjusted xPts "
+                  f"({p['pts_raw']:.2f} if he plays × {p['appear'] * 100:.0f}% to play)")
+    else:
+        title += f" — {p['pts']:.2f} xPts"
     if bench_weight is not None:
         title += f" — slot used {bench_weight * 100:.0f}% of the time"
     cap = '<span class="sq-cap">C</span>' if is_cap else ''
@@ -121,7 +128,7 @@ def _player_dot(p, captain=None, bench_weight=None):
         f'<div class="sq-plr" title="{title}">'
         f'<span class="sq-dot" style="background:{color}">{cap}</span>'
         f'<span class="sq-nm">{p["name"]}</span>'
-        f'<span class="sq-sub">£{p["price"]:.1f} &middot; {p["pts"]:.1f}</span>'
+        f'<span class="sq-sub">£{p["price"]:.1f} &middot; {p["pts"]:.1f} adj</span>'
         f'</div>'
     )
 
@@ -169,8 +176,10 @@ def _build_squad_html(squad_result, gameweek=None):
     <div class="sq-bench-hd">Bench &middot; &pound;{bench_cost:.1f}m</div>
     <div class="sq-line">{''.join(bench_cells)}</div>
   </div>
-  <div class="sq-note">Bench spend is weighted by how often each slot actually comes on&nbsp;&mdash;
-    P(a starter blanks), from the appearance model. Hover any player for detail.</div>
+  <div class="sq-note">Points shown are <strong>adjusted</strong>: each player&rsquo;s projection
+    multiplied by their chance of featuring, so they sit slightly below the figures in the
+    chart below (which assume the player starts). Bench spend is weighted by how often each
+    slot actually comes on&nbsp;&mdash; P(a starter blanks). Hover any player for the arithmetic.</div>
 </div>'''
 
 
