@@ -155,7 +155,7 @@ def _bench_weights(p_appear_xi: np.ndarray, n_bench: int = 3) -> np.ndarray:
 
 def optimize_squad(predictions: pd.DataFrame, budget: float = BUDGET,
                    points_col: str = 'exp_total_pts', verbose: bool = True,
-                   max_iter: int = 25) -> dict:
+                   max_iter: int = 25, captain_multiplier: float = 2.0) -> dict:
     """Select the 15 maximising XI points plus probability-weighted bench points.
 
     Bench weights depend on the XI's appearance probabilities, and the XI depends on
@@ -207,8 +207,15 @@ def optimize_squad(predictions: pd.DataFrame, budget: float = BUDGET,
     out_idx = np.where(pos != 'GK')[0]
     m = len(out_idx)
     N_BENCH = 3
-    n_var = 2 * n + N_BENCH * m
+    # The armband is part of the objective because you always captain someone, so
+    # those points are real; leaving it out systematically undervalues premiums.
+    # On GW1 2026/27 it is the difference between Haaland being unaffordable at
+    # 1x and being both picked and captained at 2x. Set to 1.0 to disable, 3.0
+    # for Triple Captain.
+    use_captain = captain_multiplier > 1.0
+    n_var = 2 * n + N_BENCH * m + (n if use_captain else 0)
     S, X = slice(0, n), slice(n, 2 * n)
+    C = slice(2 * n + N_BENCH * m, n_var)
 
     def slot_pos(k, j):
         return 2 * n + k * m + j
@@ -260,6 +267,16 @@ def optimize_squad(predictions: pd.DataFrame, budget: float = BUDGET,
         seat[j, n + i] = 1.0
     constraints.append(LinearConstraint(seat, 0, 0))
 
+    if use_captain:
+        # Exactly one captain, who must be a starter.
+        r = np.zeros(n_var)
+        r[C] = 1.0
+        constraints.append(LinearConstraint(r, 1, 1))
+        cap_link = np.zeros((n, n_var))
+        cap_link[np.arange(n), 2 * n + N_BENCH * m + np.arange(n)] = 1.0
+        cap_link[np.arange(n), n + np.arange(n)] = -1.0
+        constraints.append(LinearConstraint(cap_link, -np.inf, 0))
+
     integrality = np.ones(n_var)
     bounds = Bounds(np.zeros(n_var), np.ones(n_var))
 
@@ -281,6 +298,9 @@ def optimize_squad(predictions: pd.DataFrame, budget: float = BUDGET,
         for k in range(N_BENCH):
             for j, i in enumerate(out_idx):
                 c[slot_pos(k, j)] = -ep[i] * weights[k]
+        if use_captain:
+            # start_i already counts 1x, so the armband adds the extra multiple
+            c[C] = -ep * (captain_multiplier - 1.0)
 
         res = milp(c=c, constraints=constraints, integrality=integrality, bounds=bounds)
         if not res.success:
@@ -288,6 +308,7 @@ def optimize_squad(predictions: pd.DataFrame, budget: float = BUDGET,
 
         new_squad = np.where(res.x[S] > 0.5)[0]
         new_start = np.where(res.x[X] > 0.5)[0]
+        captain_idx = int(np.argmax(res.x[C])) if use_captain else None
         # Bench order straight from the solver's slot assignment
         slot_order = [int(out_idx[j]) for k in range(N_BENCH) for j in range(m)
                       if res.x[slot_pos(k, j)] > 0.5]
@@ -327,10 +348,14 @@ def optimize_squad(predictions: pd.DataFrame, budget: float = BUDGET,
         'total_cost': float(squad['price'].sum()),
         'budget_left': float(budget - squad['price'].sum()),
         'xi_points': float(xi['exp_pts_uncond'].sum()),
+        'captain_bonus': (float(df.iloc[captain_idx]['exp_pts_uncond'])
+                          * (captain_multiplier - 1.0)) if captain_idx is not None else 0.0,
         'bench_cost': float(bench['price'].sum()),
         'bench_weights': weights.tolist(),
         'gk_bench_weight': gk_bench_weight,
-        'captain': xi.iloc[0]['player_name'] if len(xi) else None,
+        'captain': (df.iloc[captain_idx]['player_name'] if captain_idx is not None
+                    else (xi.iloc[0]['player_name'] if len(xi) else None)),
+        'captain_multiplier': captain_multiplier,
     }
 
     if verbose:

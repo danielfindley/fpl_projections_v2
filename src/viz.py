@@ -114,13 +114,12 @@ def _squad_rows(squad_result):
 def _player_dot(p, captain=None, bench_weight=None):
     is_cap = captain is not None and p['full_name'] == captain
     color = _POS_COLOR.get(p['pos'], '#8b949e')
-    title = f"{p['full_name']} — {p['team']} — £{p['price']:.1f}m"
-    if p['appear'] == p['appear'] and p.get('pts_raw'):
-        # Spell out the discount: the ridge plot's number is the first term here
-        title += (f" — {p['pts']:.2f} adjusted xPts "
-                  f"({p['pts_raw']:.2f} if he plays × {p['appear'] * 100:.0f}% to play)")
-    else:
-        title += f" — {p['pts']:.2f} xPts"
+    # Show the straight projection so the pitch agrees with the ridge plot below.
+    # The optimiser still ranks on the appearance-adjusted value internally.
+    shown = p.get('pts_raw') or p['pts']
+    title = f"{p['full_name']} — {p['team']} — £{p['price']:.1f}m — {shown:.2f} xPts"
+    if p['appear'] == p['appear']:
+        title += f" — {p['appear'] * 100:.0f}% to play"
     if bench_weight is not None:
         title += f" — slot used {bench_weight * 100:.0f}% of the time"
     cap = '<span class="sq-cap">C</span>' if is_cap else ''
@@ -128,7 +127,7 @@ def _player_dot(p, captain=None, bench_weight=None):
         f'<div class="sq-plr" title="{title}">'
         f'<span class="sq-dot" style="background:{color}">{cap}</span>'
         f'<span class="sq-nm">{p["name"]}</span>'
-        f'<span class="sq-sub">£{p["price"]:.1f} &middot; {p["pts"]:.1f} adj</span>'
+        f'<span class="sq-sub">£{p["price"]:.1f} &middot; {shown:.1f}</span>'
         f'</div>'
     )
 
@@ -176,10 +175,6 @@ def _build_squad_html(squad_result, gameweek=None):
     <div class="sq-bench-hd">Bench &middot; &pound;{bench_cost:.1f}m</div>
     <div class="sq-line">{''.join(bench_cells)}</div>
   </div>
-  <div class="sq-note">Points shown are <strong>adjusted</strong>: each player&rsquo;s projection
-    multiplied by their chance of featuring, so they sit slightly below the figures in the
-    chart below (which assume the player starts). Bench spend is weighted by how often each
-    slot actually comes on&nbsp;&mdash; P(a starter blanks). Hover any player for the arithmetic.</div>
 </div>'''
 
 
@@ -216,7 +211,6 @@ _SQUAD_CSS = '''
   font-size:10px;color:#8b949e;text-align:center;margin-bottom:7px;
   text-transform:uppercase;letter-spacing:.06em;
 }
-.sq-note{margin-top:9px;font-size:10px;line-height:1.5;color:#6e7681;text-align:center}
 '''
 
 
