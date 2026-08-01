@@ -29,7 +29,7 @@ Data scraping: `python scrape_update_data.py --gameweek 28` or `--auto`
 ## Architecture
 
 ### Pipeline stages (src/pipeline.py)
-`load_data()` → `compute_features()` → `tune()` → `train()` → `predict()`
+`load_data()` → `compute_features()` → `tune()` → `train()` → [`load_lineups()`] → `predict()` → [`optimize_squad()`]
 
 **Dependency order matters in both tuning and training**: MinutesModel first (generates `pred_minutes`), then CleanSheetModel (generates `pred_team_goals` via TimeSeriesSplit OOF). Goals and Assists models consume both `pred_minutes` and `pred_team_goals` as features. During tuning, OOF predictions from minutes and clean_sheet are generated on the training set so downstream models tune against realistic (noisy) feature values rather than ground truth.
 
@@ -111,6 +111,27 @@ For agent-driven experimentation workflow, see `AGENTS.md`.
 ### FPL API data integration
 `load_data()` automatically fetches yellow/red card data from the FPL API (`fetch_fpl_actual_points()`) and merges it into the training DataFrame by matching player name + team + gameweek. This enriches the FotMob data (which lacks card columns) with actual FPL yellow_cards and red_cards for the current season. The merge is cached to `data/fpl_actual_points.csv`. If the API is unreachable, `load_data()` will raise — internet access is required on first run (cached thereafter).
 
+## Predicted lineups (src/lineups.py)
+
+`pipeline.load_lineups(gameweek, season)` scrapes RotoWire's predicted XIs and **must be called before `predict()`**. Inference-only — no model is retrained and no feature changes, so `experiments.db` stays comparable.
+
+**Why it exists.** At a season opener every feature is three months stale, so the minutes model cannot separate a nailed starter from a squad player and hedges on both. On GW1 2026/27 it projected Chelsea's backup striker at 65 minutes and the first-choice striker at 62, because the latter's late-season injury both idled him and depressed the rolling form the cap is computed from. A lineup feed supplies the one missing fact.
+
+**How it injects.** Three points, all at predict time:
+1. **`p_start` override** in `MinutesModel._blend` — the feed replaces the classifier's guess (0.95 in the XI, 0.10 benched). The two minute regressors are untouched; only the weight between them changes.
+2. **Cold-start cap bypass** for confirmed starters. `_apply_caps` pins GW1 players to `minutes_roll5 * 1.2` and binds on 168/419 rows; a published XI is better evidence than the heuristic it substitutes for.
+3. **`pred_appear_prob` scaling** from the status column — `OUT`/`SUS` → 0, `QUES` → `DOUBT_MULTIPLIER` (0.75).
+
+**Hedging is applied to minutes, not to `p_start`** (`lineup_weight=0.7`). `_sharpen(temp=0.3)` is nearly a step function, so blending probabilities collapses back to the feed's answer and gives no hedge — the whole range `p_in` 0.75–0.99 moves blended minutes by 1.6 min, while `lineup_weight` moves it by 23.5. **Tune the weight, not the probabilities.**
+
+**Benching is inferred from absence, so it is guarded.** A club is only safe to bench if every unmatched starter has no surname collision in our squad for that club — meaning they're genuinely outside our data (promoted-club player, new signing) rather than a name we failed to recognise. A collision means we might bench the very player who is starting; those clubs get positive starter overrides only. An earlier version without this turned Bruno Guimarães into a 39-minute sub.
+
+**Names** come from the anchor `title` attribute (full name) plus a stable RotoWire id, never the abbreviated display text. `_fold()` extends `normalize_player_name` for letters NFD cannot decompose (ø, ß, æ, å, đ, ł) — without it Odegaard never matches Ødegaard.
+
+**Validation runs automatically.** `evaluate_snapshots()` fires inside `load_lineups()`, joins past snapshots to real FotMob minutes, and reports `P(started | predicted starter)`, `P(started | listed non-starter)` and `P(appeared | QUES)` — the three quantities `p_in`/`p_out`/`DOUBT_MULTIPLIER` are guessing at. Quiet until a gameweek completes.
+
+Snapshots go to `data/lineups/gw{N}_{timestamp}.csv`. RotoWire serves only the current slate, so **this history cannot be recovered later** — same constraint as prices. Scrape as late as possible before the deadline; late-kickoff fixtures are guesswork at deadline time.
+
 ## Squad optimization (src/optimizer.py)
 
 `pipeline.optimize_squad(predictions, gameweek, season)` picks the best 15 under a £100.0m budget, solved exactly as a MILP via `scipy.optimize.milp` (no new dependency; `pulp` is not installed). Constraints: 2/5/5/3 by position, max 3 per club, valid XI shape, and starters must be in the squad.
@@ -119,7 +140,7 @@ Two things drive the objective:
 - **Unconditional expected points.** `exp_total_pts` is built from `pred_minutes`, which is E[minutes | appears], so it is really E[points | appears] and overstates a fringe player by `1/p_appear`. The optimizer multiplies by `pred_appear_prob` first (column `exp_pts_uncond`).
 - **Bench slots weighted by how often they actually play.** An outfield bench slot only scores via autosub, which needs a starter to blank, so slot *k* is weighted by P(at least *k* starters blank) — the exact Poisson-binomial tail over the XI's appearance probabilities. The backup GK is weighted separately by `1 - p_appear(GK1)`, which is why it converges to the £4.0m floor. Since the weights depend on the XI and the XI depends on the weights, the MILP is re-solved until the squad stops changing (typically 3 iterations).
 
-Captain is reported as the highest-EP starter but is **not** doubled in the objective, which would bias the squad toward a single premium.
+**Captain is doubled in the objective** (`captain_multiplier=2.0`; set 1.0 to disable, 3.0 for Triple Captain). A binary captain variable, constrained to exactly one starter, contributes the extra multiple. You always captain someone, so those points are real and omitting them systematically undervalues premiums — on GW1 2026/27 it is the difference between Haaland being unaffordable at 1x and being picked and captained at 2x.
 
 ### Prices
 Prices exist **only in the FPL API** (`bootstrap-static` → `now_cost`, in tenths); nothing in the repo stores them, and `fetch_fpl_prices()` requires internet. Joined to predictions by name via the same exact → web_name/second_name → token-subset cascade used for card data (~98.6% match; unmatched players are excluded and printed).
@@ -163,6 +184,7 @@ When tuning is split from training (steps 3a/3b in the skill), tuned params are 
 - `data/fixtures.csv`: Match schedule with gameweeks
 - `data/fpl_actual_points.csv`: Cached FPL API data with yellow/red cards per gameweek
 - `data/fpl_prices.csv`: Weekly price snapshots keyed by (season, gameweek, fpl_id). Append-only; cannot be backfilled after a season rolls over.
+- `data/lineups/gw{N}_{timestamp}.csv`: RotoWire predicted-XI snapshots (team, player, position code, is_predicted_starter, OUT/QUES/SUS status). Timestamped so repeated scrapes across a week can be compared. Also cannot be backfilled — the feed serves only the current slate.
 - `data/tuning_results/`: Cached Optuna tuning results (JSON)
 - `data/predictions/`: Output CSVs per gameweek (gitignored)
 - `data/experiments.db`: Experiment log (SQLite, gitignored)
