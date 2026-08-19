@@ -96,6 +96,18 @@ FPL_TO_FOTMOB_TEAMS = {
 # UNDETECTED CHROME BROWSER FOR FOTMOB
 # =============================================================================
 
+def _chrome_major_version():
+    """Installed Chrome's major version. undetected-chromedriver must pin the
+    driver to it, and Chrome auto-updates, so read it instead of hardcoding.
+    Returns None (uc auto-detects) if the registry key is unavailable."""
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Google\Chrome\BLBeacon") as key:
+            return int(winreg.QueryValueEx(key, "version")[0].split('.')[0])
+    except Exception:
+        return None
+
+
 class FotMobBrowser:
     """Context manager that uses undetected-chromedriver to bypass Cloudflare
     Turnstile, then exports cookies for fast requests.Session API calls."""
@@ -106,7 +118,7 @@ class FotMobBrowser:
 
     def __enter__(self):
         print("Launching browser to solve Cloudflare challenge...")
-        self._driver = uc.Chrome(headless=False, version_main=147)
+        self._driver = uc.Chrome(headless=False, version_main=_chrome_major_version())
         self._driver.get("https://www.fotmob.com/")
         time.sleep(5)  # let Turnstile auto-solve
 
