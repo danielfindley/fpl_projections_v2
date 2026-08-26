@@ -7,6 +7,9 @@ import xgboost as xgb
 from scipy.stats import poisson
 from sklearn.metrics import mean_absolute_error
 
+from ..features import (TEAM_NAME_MAP, TEAM_ROLL_MIN_PERIODS, SEASON_STAT_WINDOW,
+                        SEASON_STAT_MIN_GAMES, promoted_team_seasons)
+
 
 class CleanSheetModel:
     """Predicts expected goals against per match, then derives:
@@ -109,6 +112,9 @@ class CleanSheetModel:
         """Normalize team name for consistent matching."""
         if pd.isna(name):
             return ''
+        # 'team' comes from player_stats, 'opponent' from fixtures, and the two
+        # spell Bournemouth and Brighton differently.
+        name = TEAM_NAME_MAP.get(str(name).strip(), name)
         return str(name).lower().replace(' ', '_').replace("'", "").strip()
 
     def prepare_team_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -183,7 +189,7 @@ class CleanSheetModel:
         def _roll(source_col, prefix, windows):
             for w in windows:
                 team_match[f'{prefix}_roll{w}'] = team_match.groupby('team_norm')[source_col].transform(
-                    lambda x: x.shift(1).rolling(w, min_periods=1).mean()
+                    lambda x: x.shift(1).rolling(w, min_periods=min(TEAM_ROLL_MIN_PERIODS, w)).mean()
                 )
 
         # Team defensive
@@ -209,13 +215,24 @@ class CleanSheetModel:
         _roll('accurate_passes', 'team_passes', _PLAYER_WINDOWS)
         _roll('touches', 'team_touches', _PLAYER_WINDOWS)
 
-        # --- Season-to-date team identity features (shifted to avoid leakage) ---
-        team_match['season_cs_rate'] = team_match.groupby(['team_norm', 'season'])['clean_sheet'].transform(
-            lambda x: x.shift(1).expanding(min_periods=1).mean()
-        )
-        team_match['season_xga_per_game'] = team_match.groupby(['team_norm', 'season'])['xga'].transform(
-            lambda x: x.shift(1).expanding(min_periods=1).mean()
-        )
+        # --- Team identity features: rolling ACROSS seasons, not season-to-date ---
+        # Carrying last season's form is the point: in August a season-to-date mean
+        # is a single match. Promoted clubs are masked below and never reach here
+        # with real values.
+        _n_season = team_match.groupby(['team_norm', 'season']).cumcount()
+        _use_std = (_n_season >= SEASON_STAT_MIN_GAMES).values
+
+        def _identity(frame, col, n_season):
+            """Season-to-date once the club has enough games this season, else a
+            cross-season rolling window so last season's form carries in August."""
+            std = frame.groupby(['team_norm', 'season'])[col].transform(
+                lambda x: x.shift(1).expanding(min_periods=1).mean())
+            roll = frame.groupby('team_norm')[col].transform(
+                lambda x: x.shift(1).rolling(SEASON_STAT_WINDOW, min_periods=min(TEAM_ROLL_MIN_PERIODS, SEASON_STAT_WINDOW)).mean())
+            return np.where((n_season >= SEASON_STAT_MIN_GAMES).values, std, roll)
+
+        team_match['season_cs_rate'] = _identity(team_match, 'clean_sheet', _n_season)
+        team_match['season_xga_per_game'] = _identity(team_match, 'xga', _n_season)
 
         # --- Opponent attacking stats (looked up via team_norm -> opponent_norm) ---
         opp_offense = team_match[['team_norm', 'season', 'gameweek',
@@ -224,16 +241,14 @@ class CleanSheetModel:
                           ('key_passes', 'opp_key_passes'), ('shots_on_target', 'opp_shots_ot')]:
             for w in _PLAYER_WINDOWS:
                 opp_offense[f'{pfx}_roll{w}'] = opp_offense.groupby('team_norm')[col].transform(
-                    lambda x: x.shift(1).rolling(w, min_periods=1).mean()
+                    lambda x: x.shift(1).rolling(w, min_periods=min(TEAM_ROLL_MIN_PERIODS, w)).mean()
                 )
 
-        # Opponent season-level identity (how good/bad they are this season)
-        opp_offense['opp_season_goals_per_game'] = opp_offense.groupby(['team_norm', 'season'])['goals'].transform(
-            lambda x: x.shift(1).expanding(min_periods=1).mean()
-        )
-        opp_offense['opp_season_xg_per_game'] = opp_offense.groupby(['team_norm', 'season'])['xg'].transform(
-            lambda x: x.shift(1).expanding(min_periods=1).mean()
-        )
+        # Opponent scoring identity, rolling across seasons. This is the term that
+        # zeroes prior_lambda when a club blanks, so it must not be a one-match mean.
+        _opp_n_season = opp_offense.groupby(['team_norm', 'season']).cumcount()
+        opp_offense['opp_season_goals_per_game'] = _identity(opp_offense, 'goals', _opp_n_season)
+        opp_offense['opp_season_xg_per_game'] = _identity(opp_offense, 'xg', _opp_n_season)
 
         opp_roll_cols = [c for c in opp_offense.columns
                          if any(c.startswith(p) for p in ['opp_scored_roll', 'opp_xg_roll',
@@ -242,6 +257,88 @@ class CleanSheetModel:
         opp_lookup = opp_offense[['team_norm', 'season', 'gameweek'] + opp_roll_cols].copy()
         opp_lookup = opp_lookup.rename(columns={'team_norm': 'opponent_norm'})
         team_match = team_match.merge(opp_lookup, on=['opponent_norm', 'season', 'gameweek'], how='left')
+
+        # --- League-average fallbacks for unknown teams ---
+        # Aggregates are NaN until a club has TEAM_ROLL_MIN_PERIODS games (and for
+        # newly promoted clubs with no PL history at all). _prepare_X ends in a
+        # blanket fillna(0), which would read as "concedes 0.0 per game" -- better
+        # than any real defence. Anchor the unknowns to league average instead.
+        _lg_conceded = team_match['goals_conceded'].mean()
+        if not np.isfinite(_lg_conceded) or _lg_conceded < 0.5:
+            _lg_conceded = 1.3
+        _lg_cs = team_match['clean_sheet'].mean()
+        if not np.isfinite(_lg_cs):
+            _lg_cs = 0.25
+        _lg_xg = team_match['xg'].mean()
+        if not np.isfinite(_lg_xg) or _lg_xg <= 0:
+            _lg_xg = _lg_conceded
+
+        # A club with fewer than TEAM_ROLL_MIN_PERIODS prior PL games has no
+        # usable history at all: min_periods=min(3, w) still lets roll1 through,
+        # and for a promoted club that single match becomes the only real signal
+        # the model has (Hull's one clean sheet reads as "never concedes" while
+        # every wider window is league average). Blank every aggregate for those
+        # rows -- and for rows whose OPPONENT is that cold -- so the fills below
+        # apply uniformly.
+        # Newly promoted only -- including clubs back after a gap, whose stale
+        # top-flight form is exactly what should not carry into the new season.
+        _promoted = promoted_team_seasons(team_match)
+        team_match['_prior_games'] = team_match.groupby(['team_norm', 'season']).cumcount()
+        _cold = pd.Series([
+            (t, sn) in _promoted and g < TEAM_ROLL_MIN_PERIODS
+            for t, sn, g in zip(team_match['team_norm'], team_match['season'],
+                                team_match['_prior_games'])
+        ], index=team_match.index)
+        team_match['_cold_flag'] = _cold
+        _opp_cold_lookup = team_match[['team_norm', 'season', 'gameweek', '_cold_flag']].rename(
+            columns={'team_norm': 'opponent_norm', '_cold_flag': '_opp_cold_flag'}
+        ).drop_duplicates(subset=['opponent_norm', 'season', 'gameweek'], keep='first')
+        team_match = team_match.merge(_opp_cold_lookup, on=['opponent_norm', 'season', 'gameweek'], how='left')
+        _cold = team_match['_cold_flag'].fillna(False).astype(bool)
+        _opp_cold = team_match['_opp_cold_flag'].fillna(False).astype(bool)
+
+        _team_pfx = ('team_conceded_roll', 'team_xga_roll', 'team_cs_roll', 'team_scored_roll',
+                     'team_xg_scored_roll', 'team_def_actions_roll', 'team_clearances_roll',
+                     'team_shots_faced_roll', 'team_passes_roll', 'team_touches_roll')
+        _opp_pfx = ('opp_scored_roll', 'opp_xg_roll', 'opp_key_passes_roll',
+                    'opp_shots_ot_roll', 'opp_season_')
+        for _c in team_match.columns:
+            if _c.startswith(_team_pfx) or _c in ('team_xga_ewm', 'season_cs_rate', 'season_xga_per_game'):
+                team_match.loc[_cold, _c] = np.nan
+            elif _c.startswith(_opp_pfx):
+                team_match.loc[_opp_cold, _c] = np.nan
+        # Keep the flags: the home/away season splits are built further down and
+        # need the same promoted-club masking.
+        team_match['_is_cold'] = _cold.values
+        team_match = team_match.drop(
+            columns=['_prior_games', '_cold_flag', '_opp_cold_flag'], errors='ignore')
+
+        for _c in team_match.columns:
+            if _c.startswith(('team_conceded_roll', 'team_xga_roll')) or _c == 'team_xga_ewm':
+                team_match[_c] = team_match[_c].fillna(_lg_conceded)
+            elif _c.startswith('team_cs_roll'):
+                team_match[_c] = team_match[_c].fillna(_lg_cs)
+            elif _c.startswith('opp_scored_roll'):
+                team_match[_c] = team_match[_c].fillna(_lg_conceded)
+            elif _c.startswith('opp_xg_roll'):
+                team_match[_c] = team_match[_c].fillna(_lg_xg)
+            elif _c.startswith('team_scored_roll'):
+                team_match[_c] = team_match[_c].fillna(_lg_conceded)
+            elif _c.startswith('team_xg_scored_roll'):
+                team_match[_c] = team_match[_c].fillna(_lg_xg)
+        # Season-to-date is empty for the first TEAM_ROLL_MIN_PERIODS games of every
+        # season, so cascade to the club's CROSS-SEASON rolling value before the
+        # league mean -- otherwise Arsenal enters every August indistinguishable
+        # from a promoted side. For a genuinely new club the rolling value is
+        # itself the prior, so it still lands at league average.
+        team_match['season_xga_per_game'] = (team_match['season_xga_per_game']
+                                             .fillna(team_match['team_xga_roll5'])
+                                             .fillna(_lg_conceded))
+        team_match['season_cs_rate'] = (team_match['season_cs_rate']
+                                        .fillna(team_match['team_cs_roll5'])
+                                        .fillna(_lg_cs))
+        team_match['opp_season_goals_per_game'] = team_match['opp_season_goals_per_game'].fillna(_lg_conceded)
+        team_match['opp_season_xg_per_game'] = team_match['opp_season_xg_per_game'].fillna(_lg_xg)
 
         # --- Interaction and ratio features (computed for all standard windows) ---
         for w in _PLAYER_WINDOWS:
@@ -259,10 +356,15 @@ class CleanSheetModel:
             # Season xGA for this venue only
             team_match[f'{venue}_season_xga'] = np.nan
             team_match[f'{venue}_season_cs_rate'] = np.nan
-            for (tn, s), grp in team_match[venue_mask].groupby(['team_norm', 'season']):
+            for tn, grp in team_match[venue_mask].groupby('team_norm'):
                 idx = grp.index
-                team_match.loc[idx, f'{venue}_season_xga'] = grp['xga'].shift(1).expanding(min_periods=1).mean()
-                team_match.loc[idx, f'{venue}_season_cs_rate'] = grp['clean_sheet'].shift(1).expanding(min_periods=1).mean()
+                _vn = grp.groupby('season').cumcount()
+                for _sfx, _src in (('xga', 'xga'), ('cs_rate', 'clean_sheet')):
+                    _r = grp[_src].shift(1).rolling(SEASON_STAT_WINDOW, min_periods=min(TEAM_ROLL_MIN_PERIODS, SEASON_STAT_WINDOW)).mean()
+                    _sd = grp.groupby('season')[_src].transform(
+                        lambda x: x.shift(1).expanding(min_periods=1).mean())
+                    team_match.loc[idx, f'{venue}_season_{_sfx}'] = np.where(
+                        (_vn >= SEASON_STAT_MIN_GAMES).values, _sd, _r)
 
         # ha_season_xga/cs_rate = the relevant venue's season stat (home stat for home games, away for away)
         team_match['ha_season_xga'] = np.where(
@@ -276,6 +378,11 @@ class CleanSheetModel:
             team_match['away_season_cs_rate']
         )
         # Fill NaN (first game of season at venue) with overall season stat
+        # A promoted club's single home game is not a venue identity either.
+        _cold_rows = team_match['_is_cold'].fillna(False).astype(bool)
+        for _c in ('ha_season_xga', 'ha_season_cs_rate'):
+            team_match.loc[_cold_rows, _c] = np.nan
+
         team_match['ha_season_xga'] = team_match['ha_season_xga'].fillna(team_match['season_xga_per_game'])
         team_match['ha_season_cs_rate'] = team_match['ha_season_cs_rate'].fillna(team_match['season_cs_rate'])
         # Forward-fill venue-specific stats so latest row has both home and away values
@@ -289,10 +396,15 @@ class CleanSheetModel:
             venue_mask = team_match['is_home'] == venue_val
             team_match[f'{venue}_season_goals'] = np.nan
             team_match[f'{venue}_season_xg'] = np.nan
-            for (tn, s), grp in team_match[venue_mask].groupby(['team_norm', 'season']):
+            for tn, grp in team_match[venue_mask].groupby('team_norm'):
                 idx = grp.index
-                team_match.loc[idx, f'{venue}_season_goals'] = grp['goals'].shift(1).expanding(min_periods=1).mean()
-                team_match.loc[idx, f'{venue}_season_xg'] = grp['xg'].shift(1).expanding(min_periods=1).mean()
+                _vn = grp.groupby('season').cumcount()
+                for _sfx, _src in (('goals', 'goals'), ('xg', 'xg')):
+                    _r = grp[_src].shift(1).rolling(SEASON_STAT_WINDOW, min_periods=min(TEAM_ROLL_MIN_PERIODS, SEASON_STAT_WINDOW)).mean()
+                    _sd = grp.groupby('season')[_src].transform(
+                        lambda x: x.shift(1).expanding(min_periods=1).mean())
+                    team_match.loc[idx, f'{venue}_season_{_sfx}'] = np.where(
+                        (_vn >= SEASON_STAT_MIN_GAMES).values, _sd, _r)
 
         # opp_ha = opponent's away stats when we're home, opponent's home stats when we're away
         opp_ha_lookup = team_match[['team_norm', 'season', 'gameweek', 'is_home',
@@ -364,7 +476,7 @@ class CleanSheetModel:
                                                  * team_match['season_cs_rate'].fillna(0.25))
 
         # Drop temp columns
-        team_match = team_match.drop(columns=['team_norm', 'opponent_norm'], errors='ignore')
+        team_match = team_match.drop(columns=['team_norm', 'opponent_norm', '_is_cold'], errors='ignore')
 
         return team_match
 

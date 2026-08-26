@@ -22,6 +22,44 @@ TEAM_NAME_MAP = {
 # Extended windows for team-level stats (includes season-long trend)
 ROLLING_WINDOWS_LONG = [1, 2, 3, 5, 7, 10, 30]
 
+# Team-level rolling stats need a real sample before they mean anything. With
+# min_periods=1 a promoted club's roll5 is just its one played match, so a 3-0
+# opener reads as "scores 3, concedes 0, always clean sheet". Windows shorter
+# than this keep their own length (roll1 is honestly one match).
+TEAM_ROLL_MIN_PERIODS = 3
+
+# Team "identity" stats (scoring rate, xGA, clean-sheet rate) roll over this many
+# matches ACROSS seasons rather than resetting each August. Season-to-date is one
+# match in GW2, and prior_lambda is multiplicative in the opponent's scoring term,
+# so a club that happened to blank in GW1 would read as unable to score at all.
+# Newly promoted clubs are excluded by the cold-start guard and stay on the
+# promoted-cohort prior until they have TEAM_ROLL_MIN_PERIODS games.
+SEASON_STAT_WINDOW = 10
+
+# ...but only while the current season is too thin to speak for itself. Once a club
+# has this many games in the bag, season-to-date is the better estimator: by March
+# it averages 25+ matches, where a 10-game window is just noisier. So the rolling
+# window is an early-season bridge, not a replacement.
+SEASON_STAT_MIN_GAMES = 5
+
+
+def promoted_team_seasons(df, team_col='team_norm', season_col='season'):
+    """(team, season) pairs where the club was absent from the PL the season before.
+
+    Catches clubs returning after a gap (Ipswich, Leeds) as well as clubs that
+    have never been up -- a club promoted after two years away still has stale
+    top-flight form on file, and carrying it into the new season is exactly the
+    error the cold-start guard exists to prevent. The first season in the data
+    has no predecessor, so nothing counts as promoted there.
+    """
+    seasons_sorted = sorted(df[season_col].dropna().unique())
+    pairs = set()
+    for prev_s, cur_s in zip(seasons_sorted, seasons_sorted[1:]):
+        prev_teams = set(df.loc[df[season_col] == prev_s, team_col].unique())
+        cur_teams = set(df.loc[df[season_col] == cur_s, team_col].unique())
+        pairs |= {(t, cur_s) for t in cur_teams - prev_teams}
+    return pairs
+
 # Caps for per90 stats to prevent inflation from low-minutes appearances
 # These represent maximum values a player could achieve per 90 minutes
 PER90_CAPS = {
@@ -780,7 +818,7 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     for col in ['team_goals', 'team_xg', 'team_shots']:
         for window in ROLLING_WINDOWS:
             team_stats[f'{col}_roll{window}'] = team_stats.groupby('team')[col].transform(
-                lambda x: x.shift(1).rolling(window, min_periods=1).mean()
+                lambda x: x.shift(1).rolling(window, min_periods=min(TEAM_ROLL_MIN_PERIODS, window)).mean()
             )
 
     # Merge rolling team offensive stats (dynamic column selection)
@@ -831,6 +869,10 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     def normalize_name(name):
         if pd.isna(name):
             return ''
+        # 'team' comes from player_stats, 'opponent' from fixtures, and the two
+        # spell Bournemouth and Brighton differently. Without this the defensive
+        # stats (keyed by opponent_norm after the swap) never join back.
+        name = TEAM_NAME_MAP.get(str(name).strip(), name)
         return str(name).lower().replace(' ', '_').replace("'", "").strip()
 
     if 'opponent' in df.columns:
@@ -867,17 +909,17 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
         # Rolling goals conceded and xGA (multiple windows for different time horizons)
         for window in ROLLING_WINDOWS_LONG:
             team_conceded[f'team_conceded_roll{window}'] = team_conceded.groupby('team_norm')['goals_conceded'].transform(
-                lambda x: x.shift(1).rolling(window, min_periods=1).mean()
+                lambda x: x.shift(1).rolling(window, min_periods=min(TEAM_ROLL_MIN_PERIODS, window)).mean()
             )
             team_conceded[f'team_xga_roll{window}'] = team_conceded.groupby('team_norm')['xga'].transform(
-                lambda x: x.shift(1).rolling(window, min_periods=1).mean()
+                lambda x: x.shift(1).rolling(window, min_periods=min(TEAM_ROLL_MIN_PERIODS, window)).mean()
             )
 
         # Clean sheet tracking
         team_conceded['clean_sheet'] = (team_conceded['goals_conceded'] == 0).astype(int)
         for window in ROLLING_WINDOWS_LONG:
             team_conceded[f'team_cs_rate_roll{window}'] = team_conceded.groupby('team_norm')['clean_sheet'].transform(
-                lambda x: x.shift(1).rolling(window, min_periods=1).mean()
+                lambda x: x.shift(1).rolling(window, min_periods=min(TEAM_ROLL_MIN_PERIODS, window)).mean()
             )
 
         # Merge team defensive stats (dynamic column selection)
@@ -911,10 +953,10 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
 
         for window in ROLLING_WINDOWS:
             opp_offense[f'opp_goals_roll{window}'] = opp_offense.groupby('opponent_norm')['opp_goals'].transform(
-                lambda x: x.shift(1).rolling(window, min_periods=1).mean()
+                lambda x: x.shift(1).rolling(window, min_periods=min(TEAM_ROLL_MIN_PERIODS, window)).mean()
             )
             opp_offense[f'opp_xg_roll{window}'] = opp_offense.groupby('opponent_norm')['opp_xg'].transform(
-                lambda x: x.shift(1).rolling(window, min_periods=1).mean()
+                lambda x: x.shift(1).rolling(window, min_periods=min(TEAM_ROLL_MIN_PERIODS, window)).mean()
             )
 
         opp_off_roll_cols = [c for c in opp_offense.columns if c.startswith('opp_') and '_roll' in c]
@@ -943,6 +985,42 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
             opp_defense_dedup,
             on=['opponent_norm', 'season', 'gameweek'], how='left'
         )
+
+        # ================================================================
+        # COLD-START GUARD
+        # min_periods=min(3, w) still lets roll1 through, so a club with a
+        # single PL match has that one result as its only real signal while
+        # every wider window is a prior -- Hull's clean sheet reads as
+        # "never concedes", Coventry's 0-3 as "always concedes 3". Blank every
+        # team aggregate until the club has TEAM_ROLL_MIN_PERIODS games, and
+        # every opponent aggregate until the OPPONENT does, so the promoted
+        # prior below covers them uniformly. Only newly promoted clubs qualify --
+        # established clubs keep their cross-season history untouched.
+        # ================================================================
+        _promoted = promoted_team_seasons(df)
+        _tm = df[['team_norm', 'season', 'gameweek']].drop_duplicates().sort_values(
+            ['team_norm', 'season', 'gameweek'])
+        # Games so far THIS season: a club returning after a relegation spell has
+        # plenty of career games but no current-season form, and its old top-flight
+        # numbers are the stale ones we are trying not to carry over.
+        _tm['_prior_games'] = _tm.groupby(['team_norm', 'season']).cumcount()
+        _tm['_cold'] = [
+            (t, sn) in _promoted and g < TEAM_ROLL_MIN_PERIODS
+            for t, sn, g in zip(_tm['team_norm'], _tm['season'], _tm['_prior_games'])
+        ]
+        _tm = _tm.drop(columns=['_prior_games'])
+        df = df.merge(_tm, on=['team_norm', 'season', 'gameweek'], how='left')
+        df = df.merge(
+            _tm.rename(columns={'team_norm': 'opponent_norm', '_cold': '_opp_cold'}),
+            on=['opponent_norm', 'season', 'gameweek'], how='left')
+
+        _cold = df['_cold'].fillna(False).astype(bool)
+        _opp_cold = df['_opp_cold'].fillna(False).astype(bool)
+        for _c in [c for c in df.columns if c.startswith('team_') and '_roll' in c]:
+            df.loc[_cold, _c] = np.nan
+        for _c in [c for c in df.columns if c.startswith('opp_') and '_roll' in c]:
+            df.loc[_opp_cold, _c] = np.nan
+        df = df.drop(columns=['_cold', '_opp_cold'], errors='ignore')
 
         # ================================================================
         # PROMOTED-TEAM PRIOR

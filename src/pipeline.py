@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from .data_loader import load_player_stats, load_fixtures, merge_fixtures, get_fpl_positions, map_fpl_position, get_fpl_availability, merge_fpl_card_data, get_fpl_current_squads, normalize_player_name
-from .features import compute_rolling_features, build_appearance_grid
+from .features import (compute_rolling_features, build_appearance_grid,
+                       TEAM_ROLL_MIN_PERIODS, SEASON_STAT_WINDOW,
+                       SEASON_STAT_MIN_GAMES, promoted_team_seasons)
 from .models import GoalsModel, AssistsModel, MinutesModel, DefconModel, CleanSheetModel, BonusModel, CardsModel, SavesModel
 from .models.minutes import StarterClassifier, StarterMinutesModel, SubMinutesModel, ALL_FEATURES as MINUTES_ALL_FEATURES, STARTER_FEATURES, SUB_FEATURES
 from .experiment_log import log_experiment, get_history, get_best_run, log_predictions, get_predictions, clear_experiments
@@ -2471,6 +2473,89 @@ with open(r"{temp_result_path}", 'w') as f:
 
         return result
 
+    def get_last_gw_review(self, gameweek: int, season: str, top_n: int = 10):
+        """Top-N predicted players from the previous gameweek, with what they actually scored.
+
+        Reads the most recent saved run for ``gameweek - 1`` and joins the FPL
+        actuals cache. Returns None when there is no prior run or no actuals yet
+        (e.g. a season opener, or before the gameweek has been scored).
+        """
+        import unicodedata
+
+        prev_gw = int(gameweek) - 1
+        if prev_gw < 1:
+            return None
+
+        runs = sorted((self.data_dir / 'runs').glob(f'gw{prev_gw}_*')) if (self.data_dir / 'runs').exists() else []
+        if not runs:
+            return None
+        preds_file = runs[-1] / 'predictions.csv'
+        if not preds_file.exists():
+            return None
+
+        preds = pd.read_csv(preds_file)
+        if 'exp_total_pts' not in preds.columns or not len(preds):
+            return None
+        top = preds.nlargest(top_n, 'exp_total_pts')
+
+        actuals_file = self.data_dir / 'fpl_actual_points.csv'
+        if not actuals_file.exists():
+            return None
+        act = pd.read_csv(actuals_file)
+        act = act[(act['season'] == season) & (pd.to_numeric(act['gameweek'], errors='coerce') == prev_gw)]
+        if not len(act):
+            return None
+
+        def _norm(name):
+            if pd.isna(name):
+                return ''
+            return ''.join(
+                c for c in unicodedata.normalize('NFD', str(name))
+                if unicodedata.category(c) != 'Mn'
+            ).lower().strip()
+
+        # name -> row, with web_name and surname as progressively looser keys
+        lookup = {}
+        for _, r in act.iterrows():
+            for key in (_norm(r['player_name']), _norm(r.get('web_name'))):
+                if key:
+                    lookup.setdefault(key, r)
+            parts = _norm(r['player_name']).split()
+            if len(parts) > 1:
+                lookup.setdefault(parts[-1], r)
+
+        pos_names = {0: 'GK', 1: 'DEF', 2: 'MID', 3: 'FWD'}
+        rows = []
+        for _, p in top.iterrows():
+            n = _norm(p['player_name'])
+            hit = lookup.get(n)
+            if hit is None:
+                parts = n.split()
+                if len(parts) > 1:
+                    hit = lookup.get(parts[-1])
+            try:
+                pos = pos_names.get(int(float(p.get('position'))), '')
+            except (TypeError, ValueError):
+                pos = ''
+            rows.append({
+                'player_name': p['player_name'],
+                'team': p.get('team', ''),
+                'position': pos,
+                'predicted': float(p['exp_total_pts']),
+                'actual': None if hit is None else float(hit['actual_total_points']),
+                'minutes': None if hit is None else float(hit['minutes']),
+            })
+
+        matched = [r for r in rows if r['actual'] is not None]
+        if not matched:
+            return None
+        return {
+            'gameweek': prev_gw,
+            'rows': rows,
+            'mean_predicted': sum(r['predicted'] for r in matched) / len(matched),
+            'mean_actual': sum(r['actual'] for r in matched) / len(matched),
+        }
+
     def get_viz_metrics(self):
         """Format last_test_metrics for generate_distribution_html(metrics=...).
 
@@ -3301,13 +3386,36 @@ with open(r"{temp_result_path}", 'w') as f:
         # Also build a lookup for the opponent's season-level scoring identity
         # We need each team's own scoring stats (goals/xG per game this season)
         # These are computed in prepare_team_features as 'goals' per match
-        season_scoring = team_features[team_features['season'] == season].groupby('team').agg(
-            season_goals_per_game=('goals', 'mean'),
-            season_xg_per_game_off=('xg', 'mean'),
-        ).reset_index()
+        # Opponent scoring identity from the CROSS-SEASON rolling window, not a
+        # season-to-date mean. prior_lambda is multiplicative in this term, so at
+        # GW2 -- when a season average is a single match -- a club that happened to
+        # blank in GW1 would zero it and read as unable to score (six clubs blanked
+        # in GW1 2026/27, Man Utd on 1.82 xG among them). prepare_team_features
+        # masks newly promoted clubs, so for them this is the promoted-cohort prior.
+        _lg_xg_off = team_features['xg'].mean()
+        if not np.isfinite(_lg_xg_off) or _lg_xg_off <= 0:
+            _lg_xg_off = league_avg_goals
+        _roll_g_col = f'team_scored_roll{SEASON_STAT_WINDOW}'
+        _roll_x_col = f'team_xg_scored_roll{SEASON_STAT_WINDOW}'
+        # Same rule prepare_team_features uses: season-to-date once the club has
+        # enough games this season, the cross-season window before that.
+        _std = team_features[team_features['season'] == season].groupby('team').agg(
+            _g_std=('goals', 'mean'), _x_std=('xg', 'mean'), _n=('goals', 'size'))
+
+        def _pick(name, std_col, roll_val, fallback):
+            if name in _std.index and int(_std.at[name, '_n']) >= SEASON_STAT_MIN_GAMES:
+                v = _std.at[name, std_col]
+            else:
+                v = roll_val
+            return float(v) if v is not None and pd.notna(v) and np.isfinite(v) else fallback
+
         scoring_lookup = {}
-        for _, r in season_scoring.iterrows():
-            scoring_lookup[str(r['team']).lower()] = r
+        for _, t in latest_team.iterrows():
+            _name = str(t['team'])
+            scoring_lookup[_name.lower()] = pd.Series({
+                'season_goals_per_game': _pick(_name, '_g_std', t.get(_roll_g_col), league_avg_goals),
+                'season_xg_per_game_off': _pick(_name, '_x_std', t.get(_roll_x_col), _lg_xg_off),
+            })
 
         # Map to players — one prediction per unique (team, opponent, is_home)
         match_cache = {}
@@ -3388,13 +3496,36 @@ with open(r"{temp_result_path}", 'w') as f:
             league_avg_goals = 1.3
 
         # Opponent's scoring identity for the team whose goals we want to predict
-        season_scoring = team_features[team_features['season'] == season].groupby('team').agg(
-            season_goals_per_game=('goals', 'mean'),
-            season_xg_per_game_off=('xg', 'mean'),
-        ).reset_index()
+        # Opponent scoring identity from the CROSS-SEASON rolling window, not a
+        # season-to-date mean. prior_lambda is multiplicative in this term, so at
+        # GW2 -- when a season average is a single match -- a club that happened to
+        # blank in GW1 would zero it and read as unable to score (six clubs blanked
+        # in GW1 2026/27, Man Utd on 1.82 xG among them). prepare_team_features
+        # masks newly promoted clubs, so for them this is the promoted-cohort prior.
+        _lg_xg_off = team_features['xg'].mean()
+        if not np.isfinite(_lg_xg_off) or _lg_xg_off <= 0:
+            _lg_xg_off = league_avg_goals
+        _roll_g_col = f'team_scored_roll{SEASON_STAT_WINDOW}'
+        _roll_x_col = f'team_xg_scored_roll{SEASON_STAT_WINDOW}'
+        # Same rule prepare_team_features uses: season-to-date once the club has
+        # enough games this season, the cross-season window before that.
+        _std = team_features[team_features['season'] == season].groupby('team').agg(
+            _g_std=('goals', 'mean'), _x_std=('xg', 'mean'), _n=('goals', 'size'))
+
+        def _pick(name, std_col, roll_val, fallback):
+            if name in _std.index and int(_std.at[name, '_n']) >= SEASON_STAT_MIN_GAMES:
+                v = _std.at[name, std_col]
+            else:
+                v = roll_val
+            return float(v) if v is not None and pd.notna(v) and np.isfinite(v) else fallback
+
         scoring_lookup = {}
-        for _, r in season_scoring.iterrows():
-            scoring_lookup[str(r['team']).lower()] = r
+        for _, t in latest_team.iterrows():
+            _name = str(t['team'])
+            scoring_lookup[_name.lower()] = pd.Series({
+                'season_goals_per_game': _pick(_name, '_g_std', t.get(_roll_g_col), league_avg_goals),
+                'season_xg_per_game_off': _pick(_name, '_x_std', t.get(_roll_x_col), _lg_xg_off),
+            })
 
         match_cache = {}
         pred_team_goals = []

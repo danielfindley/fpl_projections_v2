@@ -74,6 +74,74 @@ def _build_metrics_html(metrics):
 
 
 
+def _build_last_gw_html(last_gw):
+    """Build the 'last gameweek' table: top predicted players vs what they scored."""
+    if not last_gw or not last_gw.get('rows'):
+        return ''
+
+    body = ''
+    for r in last_gw['rows']:
+        actual = r.get('actual')
+        pred = r['predicted']
+        if actual is None:
+            actual_cell = '<span style="color:#666">&mdash;</span>'
+            diff_cell = ''
+        else:
+            # Green when the player beat the projection, red when he missed it.
+            delta = actual - pred
+            color = '#3fb950' if delta >= 0 else '#f85149'
+            actual_cell = f'<span style="color:{color};font-weight:600">{actual:.0f}</span>'
+            diff_cell = f'<span style="color:{color}">{delta:+.1f}</span>'
+        mins = r.get('minutes')
+        mins_cell = '&mdash;' if mins is None else f'{mins:.0f}'
+        pos = r.get('position') or ''
+        dot = _POS_COLOR.get(pos, '#888')
+        body += (
+            f'<tr>'
+            f'<td style="padding:6px 12px">'
+            f'<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:{dot};margin-right:7px"></span>'
+            f'{r["player_name"]}</td>'
+            f'<td style="padding:6px 12px;color:#888;font-size:12px">{r.get("team","")}</td>'
+            f'<td style="padding:6px 12px;text-align:right;font-variant-numeric:tabular-nums">{mins_cell}</td>'
+            f'<td style="padding:6px 12px;text-align:right;font-variant-numeric:tabular-nums;color:#999">{pred:.1f}</td>'
+            f'<td style="padding:6px 12px;text-align:right;font-variant-numeric:tabular-nums">{actual_cell}</td>'
+            f'<td style="padding:6px 12px;text-align:right;font-variant-numeric:tabular-nums;font-size:12px">{diff_cell}</td>'
+            f'</tr>' + chr(10)
+        )
+
+    foot = ''
+    if last_gw.get('mean_actual') is not None:
+        foot = (
+            f'<tfoot><tr style="background:#16213e;color:#7fdbca;font-weight:600">'
+            f'<td style="padding:7px 12px" colspan="3">Mean</td>'
+            f'<td style="padding:7px 12px;text-align:right;font-variant-numeric:tabular-nums">{last_gw["mean_predicted"]:.1f}</td>'
+            f'<td style="padding:7px 12px;text-align:right;font-variant-numeric:tabular-nums">{last_gw["mean_actual"]:.1f}</td>'
+            f'<td style="padding:7px 12px;text-align:right;font-variant-numeric:tabular-nums;font-size:12px">'
+            f'{last_gw["mean_actual"] - last_gw["mean_predicted"]:+.1f}</td>'
+            f'</tr></tfoot>'
+        )
+
+    return f'''
+<div style="max-width:620px;margin:32px auto 16px;padding:0 16px">
+  <h3 style="color:#e0e0e0;text-align:center;margin-bottom:4px;font-size:14px;font-weight:600">
+    GW{last_gw["gameweek"]} Top 10 &mdash; Predicted vs Actual</h3>
+  <p style="color:#777;text-align:center;margin:0 0 10px;font-size:11px">
+    Last week&rsquo;s highest projected players and what they returned</p>
+  <table style="width:100%;border-collapse:collapse;font-size:13px;color:#ccc;background:#1a1a2e;border-radius:8px;overflow:hidden">
+    <thead><tr style="background:#16213e;color:#7fdbca">
+      <th style="padding:8px 12px;text-align:left">Player</th>
+      <th style="padding:8px 12px;text-align:left">Team</th>
+      <th style="padding:8px 12px;text-align:right">Min</th>
+      <th style="padding:8px 12px;text-align:right">Pred</th>
+      <th style="padding:8px 12px;text-align:right">Actual</th>
+      <th style="padding:8px 12px;text-align:right">+/-</th>
+    </tr></thead>
+    <tbody>{body}</tbody>
+    {foot}
+  </table>
+</div>'''
+
+
 # Dot colours: DEF/MID/FWD match the ridge-plot legend so the two views agree.
 _POS_COLOR = {'GK': '#a371f7', 'DEF': '#3fb950', 'MID': '#58a6ff', 'FWD': '#d29922'}
 
@@ -524,6 +592,7 @@ def generate_distribution_html(
     metrics=None,
     predictions_per_fixture=None,
     squad=None,
+    last_gw_review=None,
 ):
     """Generate a self-contained responsive HTML file.
 
@@ -558,6 +627,7 @@ def generate_distribution_html(
     html = html.replace('__MOBILE_BODY__', m_body)
     html = html.replace('__MOBILE_SCRIPT__', m_script)
     html = html.replace('/*__DATA__*/null', json.dumps(data))
+    html = html.replace('<!--__LASTGW__-->', _build_last_gw_html(last_gw_review))
     html = html.replace('<!--__METRICS__-->', _build_metrics_html(metrics))
     # Both templates carry a __SQUAD__ slot; only the active one is rendered, so the
     # same markup serves the desktop right-hand column and the mobile lead block.
@@ -944,6 +1014,7 @@ window.addEventListener('resize', render);
 </script>
 <div class="side-col">
   <div class="side-squad"><!--__SQUAD__--></div>
+  <!--__LASTGW__-->
   <!--__METRICS__-->
 </div>
 </body>
@@ -1062,6 +1133,7 @@ body{
   <p>Monte Carlo Simulation &middot; Tap card for details</p>
 </div>
 <div class="mob-squad"><!--__SQUAD__--></div>
+<!--__LASTGW__-->
 <!--__METRICS__-->
 <div class="controls">
   <div class="pill active" data-pos="ALL">All</div>
