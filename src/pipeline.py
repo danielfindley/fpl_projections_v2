@@ -9,9 +9,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from .data_loader import load_player_stats, load_fixtures, merge_fixtures, get_fpl_positions, map_fpl_position, get_fpl_availability, merge_fpl_card_data, get_fpl_current_squads, normalize_player_name
-from .features import (compute_rolling_features, build_appearance_grid,
-                       TEAM_ROLL_MIN_PERIODS, SEASON_STAT_WINDOW,
-                       SEASON_STAT_MIN_GAMES, promoted_team_seasons)
+from .features import compute_rolling_features, build_appearance_grid
 from .models import GoalsModel, AssistsModel, MinutesModel, DefconModel, CleanSheetModel, BonusModel, CardsModel, SavesModel
 from .models.minutes import StarterClassifier, StarterMinutesModel, SubMinutesModel, ALL_FEATURES as MINUTES_ALL_FEATURES, STARTER_FEATURES, SUB_FEATURES
 from .experiment_log import log_experiment, get_history, get_best_run, log_predictions, get_predictions, clear_experiments
@@ -3358,6 +3356,58 @@ with open(r"{temp_result_path}", 'w') as f:
 
         return pd.DataFrame([pred])
 
+    @staticmethod
+    def _cs_match_key(team, opponent, is_home):
+        """Canonical key shared by team-level predictions and player rows."""
+        return (
+            CleanSheetModel._normalize_name(team),
+            CleanSheetModel._normalize_name(opponent),
+            int(is_home),
+        )
+
+    def _build_clean_sheet_match_predictions(self, test_df: pd.DataFrame,
+                                             gameweek: int, season: str,
+                                             verbose: bool = True) -> dict:
+        """Build one shift-safe CleanSheetModel prediction per target fixture."""
+        fixture_cols = ['team', 'opponent', 'season', 'gameweek', 'is_home']
+        fixture_cols += [
+            f'manager_emb_{i}' for i in range(8)
+            if f'manager_emb_{i}' in test_df.columns
+        ]
+        fixtures = test_df[fixture_cols].drop_duplicates(
+            subset=['team', 'opponent', 'season', 'gameweek', 'is_home'],
+            keep='first'
+        )
+        team_features = self.models['clean_sheet'].prepare_team_features(
+            self.df, prediction_fixtures=fixtures
+        )
+        prediction_mask = (
+            team_features['_is_prediction'].astype(bool)
+            if '_is_prediction' in team_features.columns
+            else pd.Series(False, index=team_features.index)
+        )
+        target = team_features[
+            prediction_mask
+            & team_features['season'].eq(season)
+            & pd.to_numeric(team_features['gameweek'], errors='coerce').eq(gameweek)
+        ].copy()
+
+        if target.empty:
+            if verbose:
+                print("  WARNING: No target clean-sheet feature rows were built")
+            return {}
+
+        goals_against = self.models['clean_sheet'].predict_goals_against(target)
+        cs_probs = np.exp(-goals_against)
+        two_plus_probs = 1.0 - np.exp(-goals_against) * (1.0 + goals_against)
+
+        match_predictions = {}
+        for (_, row), cs_prob, two_plus, ga in zip(
+                target.iterrows(), cs_probs, two_plus_probs, goals_against):
+            key = self._cs_match_key(row['team'], row['opponent'], row['is_home'])
+            match_predictions[key] = (float(cs_prob), float(two_plus), float(ga))
+        return match_predictions
+
     def _predict_clean_sheet(self, test_df: pd.DataFrame, gameweek: int,
                              season: str, verbose: bool) -> tuple:
         """Predict goals against, then derive CS prob and 2+ conceded prob for each player's team.
@@ -3367,103 +3417,33 @@ with open(r"{temp_result_path}", 'w') as f:
         Returns:
             Tuple of (cs_probs, two_plus_probs, pred_goals_against) as numpy arrays
         """
-        # Get team-level features
-        team_features = self.models['clean_sheet'].prepare_team_features(self.df)
-
-        # Get latest team features
-        latest_team = team_features.sort_values(['team', 'season', 'gameweek']).groupby('team').last().reset_index()
-
-        # Build lookup by lowercase team name
-        team_lookup = {}
-        for _, t in latest_team.iterrows():
-            team_lookup[str(t['team']).lower()] = t
-
-        # League average for fallbacks
-        league_avg_goals = team_features['goals_conceded'].mean()
-        if league_avg_goals < 0.5:
-            league_avg_goals = 1.3
-
-        # Also build a lookup for the opponent's season-level scoring identity
-        # We need each team's own scoring stats (goals/xG per game this season)
-        # These are computed in prepare_team_features as 'goals' per match
-        # Opponent scoring identity from the CROSS-SEASON rolling window, not a
-        # season-to-date mean. prior_lambda is multiplicative in this term, so at
-        # GW2 -- when a season average is a single match -- a club that happened to
-        # blank in GW1 would zero it and read as unable to score (six clubs blanked
-        # in GW1 2026/27, Man Utd on 1.82 xG among them). prepare_team_features
-        # masks newly promoted clubs, so for them this is the promoted-cohort prior.
-        _lg_xg_off = team_features['xg'].mean()
-        if not np.isfinite(_lg_xg_off) or _lg_xg_off <= 0:
-            _lg_xg_off = league_avg_goals
-        _roll_g_col = f'team_scored_roll{SEASON_STAT_WINDOW}'
-        _roll_x_col = f'team_xg_scored_roll{SEASON_STAT_WINDOW}'
-        # Same rule prepare_team_features uses: season-to-date once the club has
-        # enough games this season, the cross-season window before that.
-        _std = team_features[team_features['season'] == season].groupby('team').agg(
-            _g_std=('goals', 'mean'), _x_std=('xg', 'mean'), _n=('goals', 'size'))
-
-        def _pick(name, std_col, roll_val, fallback):
-            if name in _std.index and int(_std.at[name, '_n']) >= SEASON_STAT_MIN_GAMES:
-                v = _std.at[name, std_col]
-            else:
-                v = roll_val
-            return float(v) if v is not None and pd.notna(v) and np.isfinite(v) else fallback
-
-        scoring_lookup = {}
-        for _, t in latest_team.iterrows():
-            _name = str(t['team'])
-            scoring_lookup[_name.lower()] = pd.Series({
-                'season_goals_per_game': _pick(_name, '_g_std', t.get(_roll_g_col), league_avg_goals),
-                'season_xg_per_game_off': _pick(_name, '_x_std', t.get(_roll_x_col), _lg_xg_off),
-            })
+        match_predictions = self._build_clean_sheet_match_predictions(
+            test_df, gameweek, season, verbose
+        )
+        self._last_clean_sheet_match_predictions = match_predictions
 
         # Map to players — one prediction per unique (team, opponent, is_home)
-        match_cache = {}
         cs_probs = []
         two_plus_probs = []
         goals_against = []
+        missing = set()
 
         for _, row in test_df.iterrows():
-            team = str(row.get('team', '')).lower()
-            opponent = str(row.get('opponent', '')).lower()
-            is_home = row.get('is_home', 0)
-            cache_key = (team, opponent, is_home)
-
-            if cache_key in match_cache:
-                cs_prob, two_plus, ga = match_cache[cache_key]
+            key = self._cs_match_key(
+                row.get('team', ''), row.get('opponent', ''), row.get('is_home', 0)
+            )
+            if key in match_predictions:
+                cs_prob, two_plus, ga = match_predictions[key]
             else:
-                # Find matching team and opponent
-                team_row = self._fuzzy_team_lookup(team, team_lookup)
-                opp_row = self._fuzzy_team_lookup(opponent, team_lookup)
-
-                # Also get opponent's scoring identity
-                opp_scoring = self._fuzzy_team_lookup(opponent, scoring_lookup)
-
-                if team_row is not None:
-                    # Merge opponent scoring stats into opp_row for lookup
-                    opp_info = opp_row.copy() if opp_row is not None else pd.Series()
-                    if opp_scoring is not None:
-                        opp_info['season_goals_per_game'] = opp_scoring['season_goals_per_game']
-                        opp_info['season_xg_per_game'] = opp_scoring['season_xg_per_game_off']
-
-                    team_pred = self._build_cs_prediction_row(
-                        team_row, opp_info if len(opp_info) > 0 else None,
-                        is_home, league_avg_goals
-                    )
-                    cs_prob = self.models['clean_sheet'].predict_cs_prob(team_pred)[0]
-                    two_plus = self.models['clean_sheet'].predict_2plus_conceded_prob(team_pred)[0]
-                    ga = self.models['clean_sheet'].predict_goals_against(team_pred)[0]
-                else:
-                    cs_prob = 0.25
-                    two_plus = 0.40
-                    ga = 1.2
-
-                match_cache[cache_key] = (cs_prob, two_plus, ga)
+                missing.add(key)
+                cs_prob, two_plus, ga = 0.25, 0.40, 1.2
 
             cs_probs.append(cs_prob)
             two_plus_probs.append(two_plus)
             goals_against.append(ga)
 
+        if missing and verbose:
+            print(f"  WARNING: Used CS fallback for {len(missing)} unmatched team fixtures")
         return np.array(cs_probs), np.array(two_plus_probs), np.array(goals_against)
 
     @staticmethod
@@ -3483,87 +3463,32 @@ with open(r"{temp_result_path}", 'w') as f:
         This equals the predicted goals conceded by the OPPONENT.
         Uses the CleanSheetModel with correct matchup features.
         """
-        # Get team-level features
-        team_features = self.models['clean_sheet'].prepare_team_features(self.df)
-        latest_team = team_features.sort_values(['team', 'season', 'gameweek']).groupby('team').last().reset_index()
+        match_predictions = getattr(
+            self, '_last_clean_sheet_match_predictions', None
+        )
+        if match_predictions is None:
+            match_predictions = self._build_clean_sheet_match_predictions(
+                test_df, gameweek, season, verbose=False
+            )
 
-        team_lookup = {}
-        for _, t in latest_team.iterrows():
-            team_lookup[str(t['team']).lower()] = t
-
-        league_avg_goals = team_features['goals_conceded'].mean()
-        if league_avg_goals < 0.5:
-            league_avg_goals = 1.3
-
-        # Opponent's scoring identity for the team whose goals we want to predict
-        # Opponent scoring identity from the CROSS-SEASON rolling window, not a
-        # season-to-date mean. prior_lambda is multiplicative in this term, so at
-        # GW2 -- when a season average is a single match -- a club that happened to
-        # blank in GW1 would zero it and read as unable to score (six clubs blanked
-        # in GW1 2026/27, Man Utd on 1.82 xG among them). prepare_team_features
-        # masks newly promoted clubs, so for them this is the promoted-cohort prior.
-        _lg_xg_off = team_features['xg'].mean()
-        if not np.isfinite(_lg_xg_off) or _lg_xg_off <= 0:
-            _lg_xg_off = league_avg_goals
-        _roll_g_col = f'team_scored_roll{SEASON_STAT_WINDOW}'
-        _roll_x_col = f'team_xg_scored_roll{SEASON_STAT_WINDOW}'
-        # Same rule prepare_team_features uses: season-to-date once the club has
-        # enough games this season, the cross-season window before that.
-        _std = team_features[team_features['season'] == season].groupby('team').agg(
-            _g_std=('goals', 'mean'), _x_std=('xg', 'mean'), _n=('goals', 'size'))
-
-        def _pick(name, std_col, roll_val, fallback):
-            if name in _std.index and int(_std.at[name, '_n']) >= SEASON_STAT_MIN_GAMES:
-                v = _std.at[name, std_col]
-            else:
-                v = roll_val
-            return float(v) if v is not None and pd.notna(v) and np.isfinite(v) else fallback
-
-        scoring_lookup = {}
-        for _, t in latest_team.iterrows():
-            _name = str(t['team'])
-            scoring_lookup[_name.lower()] = pd.Series({
-                'season_goals_per_game': _pick(_name, '_g_std', t.get(_roll_g_col), league_avg_goals),
-                'season_xg_per_game_off': _pick(_name, '_x_std', t.get(_roll_x_col), _lg_xg_off),
-            })
-
-        match_cache = {}
         pred_team_goals = []
+        missing = set()
         for _, row in test_df.iterrows():
-            team = str(row.get('team', '')).lower()
-            opponent = str(row.get('opponent', '')).lower()
             is_home = row.get('is_home', 0)
-            opp_is_home = 1 - is_home
-            cache_key = (opponent, team, opp_is_home)  # predict opponent's goals conceded
-
-            if cache_key in match_cache:
-                ga = match_cache[cache_key]
+            reverse_key = self._cs_match_key(
+                row.get('opponent', ''), row.get('team', ''), 1 - is_home
+            )
+            if reverse_key in match_predictions:
+                # Goals scored by this player's team equal goals conceded by the
+                # opponent in the same target fixture.
+                ga = match_predictions[reverse_key][2]
             else:
-                # For pred_team_goals: predict how many the OPPONENT concedes
-                # = how many the player's TEAM scores
-                # So the "team" for CS model is the opponent, and the "opponent" is the player's team
-                opp_row = self._fuzzy_team_lookup(opponent, team_lookup)
-                team_scoring = self._fuzzy_team_lookup(team, scoring_lookup)
-
-                if opp_row is not None:
-                    # The player's team is the "attacker" (opponent of the defensive team)
-                    attacker_info = pd.Series()
-                    if team_scoring is not None:
-                        attacker_info['season_goals_per_game'] = team_scoring['season_goals_per_game']
-                        attacker_info['season_xg_per_game'] = team_scoring['season_xg_per_game_off']
-
-                    opp_pred = self._build_cs_prediction_row(
-                        opp_row, attacker_info if len(attacker_info) > 0 else None,
-                        opp_is_home, league_avg_goals
-                    )
-                    ga = self.models['clean_sheet'].predict_goals_against(opp_pred)[0]
-                else:
-                    ga = 1.3
-
-                match_cache[cache_key] = ga
-
+                missing.add(reverse_key)
+                ga = 1.3
             pred_team_goals.append(ga)
 
+        if missing:
+            print(f"  WARNING: Used team-goals fallback for {len(missing)} unmatched fixtures")
         return np.array(pred_team_goals)
     
     def _calculate_expected_points(self, df: pd.DataFrame) -> pd.DataFrame:
