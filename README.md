@@ -48,7 +48,7 @@ projecting_fpl_v2/
 │   ├── feature_selection.py            # Pre-computed feature rankings for Optuna
 │   ├── lineups.py                      # RotoWire predicted lineups: scrape, match, override, self-scoring
 │   ├── optimizer.py                    # Budget-constrained squad selection (MILP via scipy)
-│   ├── viz.py                          # Standalone HTML viz (ridge plot, metrics, squad pitch)
+│   ├── viz.py                          # Standalone HTML viz (ridge plot and metrics)
 │   ├── pipeline.py                     # Main pipeline: tune, train, predict, points
 │   └── models/
 │       ├── base.py                     # Abstract base model (XGBoost, minute-weighted)
@@ -70,7 +70,7 @@ projecting_fpl_v2/
 
 | Model | Predicts | Method | Key Features |
 |-------|----------|--------|--------------|
-| **Minutes** | Playing time (1-90), conditional on appearing | XGBoost, two-stage: P(start) x starter regressor + (1-P) x sub regressor | Rolling minutes, starter rate, current season minutes, goal involvement |
+| **Minutes** | Playing time (1-90), conditional on appearing | XGBoost mixture: P(60+ given appearance) × 60+ regressor + remaining probability × short-appearance regressor | Rolling minutes, starter rate, current season minutes, goal involvement |
 | **Appears** | P(minutes >= 1) | XGBoost binary classifier, isotonic-calibrated | Calendar-grid minutes features. The **only** model trained on non-appearances — see below |
 | **Goals** | Goals per match (raw counts) | XGBoost Poisson regression | xG rolling, shots, player share of team output, opponent weakness, xG overperformance, form trends |
 | **Assists** | Assists per match (raw counts) | XGBoost Poisson regression | xA rolling, key passes, player centrality, opponent weakness, xA overperformance, form trends |
@@ -82,7 +82,7 @@ projecting_fpl_v2/
 
 ## Feature Engineering
 
-All rolling features use `shift(1)` to prevent data leakage.
+Rolling statistics use only completed results before the forecast deadline; this extends `shift(1)` to real kickoff chronology and double gameweeks.
 
 ### Feature Groups
 
@@ -108,7 +108,7 @@ All rolling features use `shift(1)` to prevent data leakage.
 
 `player_stats.csv` contains one row per match a player *featured in*, so no model in the pipeline ever saw a player being left out — meaning nothing could estimate P(plays at all). `MinutesModel.predict()` is trained on `minutes >= 1` and clipped to `[1, 90]`, so it answers **E[minutes | appears]**, not "will he play".
 
-`features.build_appearance_grid()` restores the missing rows: a `(player_id, season, gameweek)` calendar spanning each player's first-to-last appearance in a season, with missed gameweeks filled at 0 minutes. That span keeps rotation calls and mid-season injury gaps while excluding weeks before a January signing arrived or after a departure. **90k player-gameweeks, 27.7k of them non-appearances.**
+`features.build_appearance_grid()` restores eligible player-fixture rows, including terminal non-appearances. Club blank gameweeks have no fixture and are not treated as a player being dropped. Explicit registration intervals can be supplied through `df.attrs['roster_spells']` (`player_id, team, season, start_date, end_date`). Otherwise membership is inferred from first observed appearances and club changes: unknown departures and pre-debut eligibility remain a limitation. The following appearance/calibration metrics describe the previous grid and require revalidation.
 
 `AppearClassifier` (`src/models/minutes.py`) trains on that grid with target `minutes > 0`, using only features defined on a week the player didn't play. Holdout (2025/26): **AUC 0.844, Brier 0.134 vs 0.198 base rate**.
 
@@ -127,45 +127,85 @@ Each team's manager for a given match is looked up from `data/match_managers.csv
 - **Minutes distribution** (rotation/management signal): `mins_mean`, `mins_median`, `mins_std`, `mins_max`, `num_players_used`, `num_full_90`, `num_subs_made`, `mins_concentration_top11`, `mins_entropy`
 - **Formation** (from `homeTeam.formation` / `awayTeam.formation`): `form_def`, `form_mid`, `form_fwd`
 
-For each row, these are rolled over the manager's prior 20 games using `shift(1)` (strictly prior). Standardize → fit PCA(8) on rows with ≥3 prior games (interim-manager protection — fewer prior games gives a zero vector). For the upcoming gameweek's synthetic rows, the previous manager is assumed to continue and their *current* rolled state (their last 20 played games, no shift) is projected via the trained PCA basis.
-
-Manager identity for the upcoming game is treated as a known input — no future-data leakage in the features themselves, since every numeric feature is derived from games played strictly before the row's own match.
+Raw prior-20-match summaries are read strictly before each forecast deadline.
+The team's latest observed manager is assumed to continue; unknown historical
+manager rows are not filled from future managers. Each model fits its own scaler
+and PCA(8) on training rows with at least three prior manager matches. The saved
+basis is reused at prediction time. There is no full-dataset or per-forecast PCA fit.
 
 ## Hyperparameter Tuning
 
-Dependency-ordered tuning with OOF feature propagation and joint hyperparameter + feature selection optimization:
+Minutes and clean sheet tune first; goals, assists and defcon consume causal,
+cross-fitted upstream predictions. Training, validation and holdout evaluation
+use the actual model wrappers, including minute weights, target caps, and the
+clean-sheet log-prior offset and geometric blend. Early OOF rows use prior
+rolling minutes / the matchup prior, never their own observed outcome.
 
-1. **Minutes model** tunes first → generates OOF `pred_minutes` on training set
-2. **Clean sheet model** tunes next → generates OOF `pred_team_goals` on training set
-3. **Remaining models** (goals, assists, defcon, saves) tune using OOF predictions as features, matching what they'll see at inference time
+Five expanding folds contain whole forecast deadlines. Rows whose results were
+not available at a validation origin are purged, and matches cannot straddle a
+fold. A gameweek's default information boundary is 90 minutes before its first
+kickoff; explicit `forecast_time` values override this. Features use real kickoff
+chronology rather than gameweek-number ordering, including postponed matches.
 
-For each model:
-1. **Pre-compute feature rankings** using 5 methods: XGBoost gain, XGBoost cover, LightGBM importance, permutation importance, mutual information
-2. **Optuna jointly tunes** XGBoost hyperparams + feature selection (`feat_method`, `n_features`) via TimeSeriesSplit 5-fold CV
-   - Search space: `n_estimators`, `max_depth`, `learning_rate`, `min_child_weight`, `colsample_bytree`, `subsample`, `reg_alpha`, `reg_lambda`, `feat_method`, `n_features`
-   - Loss functions: Poisson deviance (goals, assists, defcon, clean sheet), MAE (saves), Huber (minutes)
-   - Protected features (`pred_minutes`, `pred_team_goals`) are always included
+Feature ranking is now wrapper-based gain importance, fitted separately inside
+each training fold. Optuna chooses the feature count and tree parameters;
+`pred_minutes` / `pred_team_goals` stay protected where applicable. The previous
+five-ranking-method search is no longer the production tuning path. The final
+feature list is ranked again on the full training window only. Manager PCA is
+also fitted inside each wrapper's training window and reused at prediction time.
 
-Tuning runs in **subprocess isolation** (`use_subprocess=True`) to prevent OOM from parallel XGBoost + cross-validation.
+Minutes trials score the deployed probability-weighted mixture with Huber loss.
+The other primary losses remain Poisson deviance (goals, assists, defcon, clean
+sheet) and MAE (saves). Upstream parameters already selected in the training
+partition are held fixed during downstream CV; these CV scores are not a fully
+nested estimate of the entire selection process. The untouched chronological
+holdout is the final check.
 
-## Expected Points Formula
+`use_subprocess=True` runs the **same implementation** in a fresh spawned process
+per model. Existing parameter files remain accepted, but **retuning is strongly
+recommended** after this change. Old and new CV/points metrics are not directly
+comparable. The aggregate holdout report still uses reconstructed, played-only
+points; it has not been replaced with official all-roster FPL scoring.
 
-```
-exp_pts = appearance + goals + assists + clean_sheet + conceded_penalty
-        + saves + defcon + bonus + yellow + red
+## Shared Match Simulation and Expected Points
 
-where:
-  appearance       = 2 if mins >= 60, 1 if mins >= 1, else 0
-  goals            = pred_goals x {GK/DEF: 6, MID: 5, FWD: 4}
-  assists          = pred_assists x 3
-  clean_sheet      = pred_cs_prob x {GK/DEF: 4, MID: 1} (if mins >= 60)
-  conceded_penalty = -E[floor(k/2)] via Poisson (GK/DEF, if mins >= 60)
-  saves            = (pred_saves / 3) x 1 (GK only)
-  defcon           = pred_defcon_prob x 2 (DEF/MID, if mins >= 60)
-  bonus            = pred_bonus (0-3)
-  yellow           = pred_yellow_prob x -1
-  red              = pred_red_prob x -3
-```
+The weekly and experimental five-week forecasts use the same event/scoring
+engine. It samples a playing-time state, samples each team's score once, and
+allocates scorer and assister credits from minutes-adjusted player intensities.
+At most one different assister is credited per goal. Intensities above the team
+total are reconciled proportionally; a residual bucket represents unmodeled
+players and unassisted goals.
+
+Clean sheets and conceded penalties read that score. Saves, cards and
+negative-binomial defensive contributions scale with sampled minutes. Bonus
+ranks the BPS from those same events. Tied first place gives 3, 3, 1; tied second
+gives 3, 2, 2. Baseline-BPS reliability uses cumulative exposure, not a five-match
+mean mistaken for a minutes total. The baseline is trained as a per-90 rate;
+when actual BPS is available, shared simulated event contributions (including
+cards and conceded goals) are removed from its target to avoid counting them twice.
+
+The weekly minutes states are absent, 1–59, and 60–90. Thus a 50/50 mixture of
+20 and 90 minutes earns 1.5 expected appearance points, even though its mean is
+55 minutes. There is no eligibility cliff at **expected** minutes = 60.
+
+- `pred_minutes`: E[minutes | appears], retained as an upstream feature.
+- `pred_minutes_uncond`, `pred_appear_prob`, `pred_60_prob`: explicit mixture outputs.
+- `exp_total_pts` and `exp_total_pts_uncond`: unconditional mean of scored draws.
+- `exp_total_pts_cond`: conditional points view for consumers that need it.
+- Point-component `exp_*` columns: unconditional means from the same draws.
+- Raw `pred_exp_goals/assists/defcon`: conditional model outputs **before** team reconciliation.
+
+Charts consume saved `total_points` draws without independently resampling
+penalties or cards. Double-gameweek distributions sum fixture draws by player
+ID. Saved-run metadata records the new semantics; legacy archives retain their
+compatibility path. The optimizer uses unconditional points once, without an
+extra appearance discount.
+
+This remains an approximate simulator: player role draws are independent,
+unmodeled players do not compete for bonus, and exact substitution/event timing
+is not modeled. Team scores do not yet respond dynamically to lineup strength.
+Configured scoring constants/eligibility rules are retained; this is not a
+season-specific scoring-rule audit.
 
 ## Predicted Lineups
 
@@ -175,20 +215,18 @@ where:
 
 ### How it injects
 
-| Point | Effect |
-|-------|--------|
-| `p_start` override in `MinutesModel._blend` | Feed replaces the classifier's guess (0.95 in XI, 0.10 benched). The two minute regressors are untouched — only the weight between them changes |
-| Cold-start cap bypass | `_apply_caps` pins GW1 players to `minutes_roll5 x 1.2` and binds on **168 of 419** rows. A published XI is better evidence than the heuristic it stands in for |
-| `pred_appear_prob` scaling | `OUT`/`SUS` → 0, `QUES` → 0.75 (`DOUBT_MULTIPLIER`) |
+Lineup P(start) and P(60+ | appears) are different quantities. A lineup prior is
+converted using the training starter-completion rate when genuine start labels
+are available, otherwise an explicit 0.90 completion prior. The resulting joint role prior is
+blended with the model distribution (`lineup_weight=0.7`), raising appearance
+probability for a likely starter. Live availability then discounts it once.
+Starter/sub minutes come from their conditional regressors; the former
+temperature sharpening and cold-start caps are removed.
 
-**Hedging is applied to minutes, not to `p_start`** (`lineup_weight=0.7`). `_sharpen(temp=0.3)` is nearly a step function, so blending probabilities collapses straight back to the feed's answer:
-
-| | range | effect on blended minutes |
-|---|---|---|
-| `p_in` | 0.75 → 0.99 | **1.6 min** |
-| `lineup_weight` | 0.0 → 1.0 | **23.5 min** |
-
-Tune the weight, not the probabilities.
+OUT/SUS/QUES status still scales appearance probability. The resulting role
+distribution drives every downstream simulated points component. Historical
+lineup performance numbers above describe the previous implementation, not a
+validation of this new blend.
 
 ### Safety: benching is inferred from absence
 
@@ -219,7 +257,7 @@ Quiet until a gameweek completes. Snapshots land in `data/lineups/gw{N}_{timesta
 
 `pipeline.optimize_squad(predictions, gameweek, season)` picks the best 15 under a £100.0m budget, solved as an exact MILP via `scipy.optimize.milp` (no new dependency). Constraints: 2/5/5/3 by position, max 3 per club, valid XI shape, starters must be in the squad.
 
-**Unconditional expected points.** `exp_total_pts` is built from `pred_minutes`, which is E[minutes | appears] — so it is E[points | appears] and overstates a fringe player by `1/p_appear`. The optimizer multiplies by `pred_appear_prob` first.
+**Unconditional expected points.** New forecasts already include absence risk. The optimizer reads `exp_total_pts_uncond` directly. Only legacy forecasts without that field receive the old appearance-probability discount.
 
 **Bench slots weighted by how often they actually play.** An outfield bench slot only scores via autosub, which needs a starter to blank, so slot *k* is weighted by P(at least *k* starters blank) — the exact Poisson-binomial tail over the XI. Typical values: `[0.40, 0.085, 0.011]`. The backup GK is weighted separately by `1 - p_appear(GK1)` (~0.035), which is what drives it to the £4.0m floor.
 
@@ -294,7 +332,6 @@ Predictions saved to `data/predictions/gw{N}_{season}.csv` with columns:
 
 `src/viz.py` generates a standalone HTML file (`distributions.html`) with:
 
-- **Optimal-squad pitch** — the selected 15 laid out in the shape of the formation the optimizer chose, a coloured dot per player with name and price below, bench in autosub order, captain marked. Desktop `body` is `display:flex`, so the side column sits right of the ridge plot with the squad above the metrics; the mobile template stacks it first
 - **D3.js ridge plot** showing Monte Carlo points distributions for top outfield players
 - **Metrics dashboard** — sub-model holdout metrics, overall FPL points MAE/Poisson deviance/Spearman, and a calibration plot (predicted vs actual by bucket)
 - **Responsive layout** — desktop ridge plot and mobile card layout embedded in a single file, selected at load time based on viewport width
@@ -311,7 +348,6 @@ generate_distribution_html(
     top_n=100,
     gameweek=32,
     metrics=viz_metrics,
-    squad=squad,          # from pipeline.optimize_squad(); omit to skip the pitch
 )
 ```
 
@@ -357,3 +393,14 @@ python scripts/experiment.py --history             # all runs
 python scripts/experiment.py --best                # best per model
 python scripts/experiment.py --compare 3           # compare last 3 runs
 ```
+
+
+## Regression Checks
+
+Run `python -B -m pytest tests -q -p no:cacheprovider`. Tests use isolated
+synthetic histories and temporary output directories; they do not retune, replace,
+or deploy production runs. Coverage includes time boundaries, whole-match folds,
+fold-local manager PCA, appearance-grid blanks, mixture thresholds, shared event
+invariants, bonus ties, visualization totals and the weekly/five-week contract.
+
+A real temporal retune/backtest is still required before claiming better MAE.

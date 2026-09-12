@@ -146,142 +146,6 @@ def _build_last_gw_html(last_gw):
 _POS_COLOR = {'GK': '#a371f7', 'DEF': '#3fb950', 'MID': '#58a6ff', 'FWD': '#d29922'}
 
 
-def _squad_rows(squad_result):
-    """Flatten optimize_squad output into (xi_lines, bench) of plain dicts.
-
-    xi_lines is ordered GK -> DEF -> MID -> FWD so the pitch renders in the shape of
-    the formation that was actually selected.
-    """
-    def to_rows(frame):
-        out = []
-        for _, r in frame.iterrows():
-            name = r.get('web_name') or r.get('player_name', '')
-            if not isinstance(name, str) or not name:
-                name = str(r.get('player_name', ''))
-            out.append({
-                'name': name,
-                'full_name': str(r.get('player_name', '')),
-                'pos': r.get('fpl_position', 'MID'),
-                'team': str(r.get('team', '')),
-                'price': float(r.get('price', 0) or 0),
-                'pts': float(r.get('exp_pts_uncond', r.get('exp_total_pts', 0)) or 0),
-                # Ridge plot shows exp_total_pts, which is E[pts | he plays]. The pitch
-                # shows it discounted by P(appears) because that is what the optimiser
-                # maximises — carry both so the tooltip can show the arithmetic.
-                'pts_raw': float(r.get('exp_total_pts', 0) or 0),
-                'appear': float(r.get('pred_appear_prob', float('nan'))),
-            })
-        return out
-
-    xi = to_rows(squad_result['xi'])
-    bench = to_rows(squad_result['bench'])
-    lines = [[p for p in xi if p['pos'] == pos] for pos in ('GK', 'DEF', 'MID', 'FWD')]
-    return [ln for ln in lines if ln], bench
-
-
-def _player_dot(p, captain=None, bench_weight=None):
-    is_cap = captain is not None and p['full_name'] == captain
-    color = _POS_COLOR.get(p['pos'], '#8b949e')
-    # Show the straight projection so the pitch agrees with the ridge plot below.
-    # The optimiser still ranks on the appearance-adjusted value internally.
-    shown = p.get('pts_raw') or p['pts']
-    title = f"{p['full_name']} — {p['team']} — £{p['price']:.1f}m — {shown:.2f} xPts"
-    if p['appear'] == p['appear']:
-        title += f" — {p['appear'] * 100:.0f}% to play"
-    if bench_weight is not None:
-        title += f" — slot used {bench_weight * 100:.0f}% of the time"
-    cap = '<span class="sq-cap">C</span>' if is_cap else ''
-    return (
-        f'<div class="sq-plr" title="{title}">'
-        f'<span class="sq-dot" style="background:{color}">{cap}</span>'
-        f'<span class="sq-nm">{p["name"]}</span>'
-        f'<span class="sq-sub">£{p["price"]:.1f} &middot; {shown:.1f}</span>'
-        f'</div>'
-    )
-
-
-def _build_squad_html(squad_result, gameweek=None):
-    """Render the optimized 15 as a pitch in its own formation shape."""
-    if not squad_result:
-        return ''
-
-    lines, bench = _squad_rows(squad_result)
-    if not lines:
-        return ''
-
-    captain = squad_result.get('captain')
-    gw = f'GW{gameweek} &middot; ' if gameweek else ''
-    weights = list(squad_result.get('bench_weights') or [])
-    gk_w = squad_result.get('gk_bench_weight')
-
-    pitch = ''.join(
-        '<div class="sq-line">' + ''.join(_player_dot(p, captain) for p in line) + '</div>'
-        for line in lines
-    )
-
-    bench_cells = []
-    out_i = 0
-    for p in bench:
-        if p['pos'] == 'GK':
-            w = gk_w
-        else:
-            w = weights[out_i] if out_i < len(weights) else None
-            out_i += 1
-        bench_cells.append(_player_dot(p, captain, bench_weight=w))
-
-    cost = squad_result.get('total_cost', 0.0)
-    left = squad_result.get('budget_left', 0.0)
-    bench_cost = squad_result.get('bench_cost', 0.0)
-
-    return f'''
-<div class="sq-wrap">
-  <h3 class="sq-title">Optimal Squad</h3>
-  <div class="sq-meta">{gw}{squad_result.get('formation', '')} &middot; &pound;{cost:.1f}m
-    <span class="sq-dim">(&pound;{left:.1f}m free)</span></div>
-  <div class="sq-pitch">{pitch}</div>
-  <div class="sq-bench">
-    <div class="sq-bench-hd">Bench &middot; &pound;{bench_cost:.1f}m</div>
-    <div class="sq-line">{''.join(bench_cells)}</div>
-  </div>
-</div>'''
-
-
-_SQUAD_CSS = '''
-.sq-wrap{background:#161b22;border:1px solid #21262d;border-radius:10px;padding:14px 12px 12px}
-.sq-title{color:#e6edf3;font-size:14px;font-weight:600;text-align:center;margin-bottom:2px}
-.sq-meta{color:#8b949e;font-size:12px;text-align:center;margin-bottom:10px}
-.sq-dim{color:#6e7681}
-.sq-pitch{
-  background:linear-gradient(#122b1a,#0f2417);border:1px solid #1c3b26;border-radius:8px;
-  padding:14px 6px;display:flex;flex-direction:column;gap:12px;
-}
-.sq-line{display:flex;justify-content:center;gap:4px;flex-wrap:wrap}
-.sq-plr{
-  display:flex;flex-direction:column;align-items:center;gap:3px;
-  width:62px;cursor:default;
-}
-.sq-dot{
-  width:22px;height:22px;border-radius:50%;border:2px solid rgba(255,255,255,.22);
-  display:flex;align-items:center;justify-content:center;position:relative;
-}
-.sq-cap{
-  position:absolute;top:-5px;right:-6px;background:#f0883e;color:#0d1117;
-  font-size:8px;font-weight:700;width:12px;height:12px;border-radius:50%;
-  display:flex;align-items:center;justify-content:center;
-}
-.sq-nm{
-  font-size:10px;color:#e6edf3;font-weight:600;line-height:1.15;text-align:center;
-  max-width:62px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
-}
-.sq-sub{font-size:9px;color:#8b949e;font-variant-numeric:tabular-nums}
-.sq-bench{margin-top:10px;background:#0d1117;border:1px dashed #21262d;border-radius:8px;padding:8px 4px}
-.sq-bench-hd{
-  font-size:10px;color:#8b949e;text-align:center;margin-bottom:7px;
-  text-transform:uppercase;letter-spacing:.06em;
-}
-'''
-
-
 def _build_calibration_svg(calibration):
     """Render predicted-vs-actual calibration as overlaid line plots.
 
@@ -391,7 +255,7 @@ def _build_player_data(predictions, simulations, top_n, predictions_per_fixture=
     a '_sim_idx' column), per-sim totals are built fixture-by-fixture and
     summed per player, so DGW distributions match their aggregated exp_pts.
     """
-    np.random.seed(42)
+    rng = np.random.default_rng(42)
 
     top = predictions[predictions['fpl_position'] != 'GK'].nlargest(top_n, 'exp_total_pts')
 
@@ -413,9 +277,12 @@ def _build_player_data(predictions, simulations, top_n, predictions_per_fixture=
             pf_by_player.setdefault(pf_row[key_col], []).append(pf_row)
     else:
         sim_names = simulations['player_names']
-        name_to_idx = {}
+        name_to_indices = {}
         for idx, name in enumerate(sim_names):
-            name_to_idx.setdefault(name, idx)
+            name_to_indices.setdefault(name, []).append(idx)
+        id_to_indices = {}
+        for idx, player_id in enumerate(simulations.get('player_ids', [])):
+            id_to_indices.setdefault(player_id, []).append(idx)
 
     players_data = []
     all_totals_flat = []
@@ -431,14 +298,19 @@ def _build_player_data(predictions, simulations, top_n, predictions_per_fixture=
                 print(f"WARNING: {player_name} not found in per-fixture predictions, skipping")
                 continue
         else:
-            pidx = name_to_idx.get(player_name)
-            if pidx is None:
+            indices = id_to_indices.get(row.get('player_id'), name_to_indices.get(player_name))
+            if not indices:
                 print(f"WARNING: {player_name} not found in simulation arrays, skipping")
                 continue
-            fixture_rows = [row]
+            fixture_rows = []
+            for pidx in indices:
+                fx = row.copy()
+                fx['_sim_idx'] = pidx
+                fixture_rows.append(fx)
 
         total = np.zeros(N_SIMS)
         for fx in fixture_rows:
+            pidx = int(fx['_sim_idx'])
             if use_per_fixture:
                 pidx = int(fx['_sim_idx'])
                 mins = fx.get('pred_minutes', 0)
@@ -453,6 +325,11 @@ def _build_player_data(predictions, simulations, top_n, predictions_per_fixture=
                 yellow_p = row.get('pred_yellow_prob', 0)
                 red_p = row.get('pred_red_prob', 0)
 
+            if 'total_points' in simulations:
+                total += simulations['total_points'][:, pidx]
+                continue
+
+            # Legacy archives did not save scored draws.
             goals = sim_goals[:, pidx]
             assists = sim_assists[:, pidx]
             cs = sim_cs[:, pidx]
@@ -468,14 +345,14 @@ def _build_player_data(predictions, simulations, top_n, predictions_per_fixture=
 
             conceded_pen = np.zeros(N_SIMS)
             if mins >= 60 and pos == 'DEF':
-                conceded_pen = -(np.random.poisson(ga, N_SIMS) // 2)
+                conceded_pen = -(rng.poisson(ga, N_SIMS) // 2)
 
             defcon_pts = np.zeros(N_SIMS)
             if mins >= 60 and pos in ('DEF', 'MID'):
-                defcon_pts = np.random.binomial(1, np.clip(defcon_p, 0, 1), N_SIMS) * 2
+                defcon_pts = rng.binomial(1, np.clip(defcon_p, 0, 1), N_SIMS) * 2
 
-            yellow = -np.random.binomial(1, np.clip(yellow_p, 0, 1), N_SIMS)
-            red = -3 * np.random.binomial(1, np.clip(red_p, 0, 1), N_SIMS)
+            yellow = -rng.binomial(1, np.clip(yellow_p, 0, 1), N_SIMS)
+            red = -3 * rng.binomial(1, np.clip(red_p, 0, 1), N_SIMS)
 
             fixture_total = (
                 app + goal_pts + assist_pts + cs_pts
@@ -524,13 +401,24 @@ def _build_player_data(predictions, simulations, top_n, predictions_per_fixture=
             agg_defcon = float(row.get('pred_defcon_prob', 0) or 0) * 100
             agg_bonus = float(row.get('pred_bonus', 0) or 0)
 
+        if 'total_points' in simulations:
+            idx = [int(fx['_sim_idx']) for fx in fixture_rows]
+            agg_goals = float(simulations['goals'][:, idx].sum(axis=1).mean())
+            agg_assists = float(simulations['assists'][:, idx].sum(axis=1).mean())
+            agg_bonus = float(simulations['bonus'][:, idx].sum(axis=1).mean())
+            agg_cs = float((simulations['cs'][:, idx].sum(axis=1) > 0).mean() * 100)
+            if 'minutes' in simulations:
+                agg_minutes = float(simulations['minutes'][:, idx].sum(axis=1).mean())
+            if 'exp_defcon_pts' in simulations:
+                agg_defcon = float((simulations['exp_defcon_pts'][:, idx].sum(axis=1) > 0).mean() * 100)
+
         players_data.append({
             'name': player_name,
             'position': pos,
             'team': str(row.get('team', '')),
             'opponent': str(row.get('opponent', '?')),
             'is_home': bool(row.get('is_home', False)),
-            'exp_pts': round(float(row['exp_total_pts']), 2),
+            'exp_pts': round(float(total.mean() if 'total_points' in simulations else row['exp_total_pts']), 2),
             'pred_goals': round(agg_goals, 2),
             'pred_assists': round(agg_assists, 2),
             'pred_minutes': round(agg_minutes, 1),
@@ -599,7 +487,8 @@ def generate_distribution_html(
     Emits one file containing both the desktop D3 ridge plot and the
     mobile card layout as inert ``<template>`` elements. At load time an
     outer script picks the right one based on viewport width (<=768px
-    activates mobile).
+    activates mobile). ``squad`` is accepted for archived callers but is no
+    longer rendered on the distributions page.
     """
     players_data, all_totals_flat = _build_player_data(predictions, simulations, top_n, predictions_per_fixture)
 
@@ -627,13 +516,9 @@ def generate_distribution_html(
     html = html.replace('__MOBILE_BODY__', m_body)
     html = html.replace('__MOBILE_SCRIPT__', m_script)
     html = html.replace('/*__DATA__*/null', json.dumps(data))
+    html = html.replace('__N_SIMS__', f'{len(all_totals_flat[0]):,}')
     html = html.replace('<!--__LASTGW__-->', _build_last_gw_html(last_gw_review))
     html = html.replace('<!--__METRICS__-->', _build_metrics_html(metrics))
-    # Both templates carry a __SQUAD__ slot; only the active one is rendered, so the
-    # same markup serves the desktop right-hand column and the mobile lead block.
-    html = html.replace('<!--__SQUAD__-->', _build_squad_html(squad, gameweek))
-    if squad:
-        html = html.replace('</style>', _SQUAD_CSS + '</style>', 1)
 
     Path(output_path).write_text(html, encoding='utf-8')
     print(f"Distribution visualization saved to: {output_path}")
@@ -657,7 +542,7 @@ body{
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
   display:flex;justify-content:center;padding:20px 10px;
 }
-.container{width:100%;max-width:1100px}
+.container{width:100%;max-width:1100px;min-width:0}
 header{text-align:center;margin-bottom:18px}
 h1{font-size:22px;font-weight:700;color:#e6edf3;margin-bottom:4px}
 .subtitle{font-size:13px;color:#8b949e}
@@ -717,16 +602,12 @@ h1{font-size:22px;font-weight:700;color:#e6edf3;margin-bottom:4px}
 .method-body strong{color:#c9d1d9}
 .method-body ul{margin:4px 0 8px 18px}
 .method-body li{margin-bottom:3px}
-/* body is display:flex, so this column is a sibling of .container and lands to the
-   right of the ridge plot — which is already where the metrics tables render. The
-   squad sits at the top of that column, above them. The mobile template stacks
-   instead, putting the squad first on the page. */
+/* The review and metrics column sits beside the ridge plot on desktop. */
 .side-col{
   display:flex;flex-direction:column;align-items:stretch;
   flex:0 0 340px;min-width:0;margin-left:18px;
 }
-.side-squad{margin-top:4px}
-.side-col > div[style]{max-width:100% !important;margin-left:0 !important;margin-right:0 !important}
+.side-col > div[style]{max-width:100% !important;margin-left:0 !important;margin-right:0 !important;overflow-x:auto}
 </style>
 </head>
 <body>
@@ -738,8 +619,8 @@ h1{font-size:22px;font-weight:700;color:#e6edf3;margin-bottom:4px}
   <details class="methodology">
     <summary>Methodology &amp; How to Read This</summary>
     <div class="method-body">
-      <p>Each curve shows the <strong>probability distribution of FPL points</strong> a player could score in the upcoming gameweek, estimated from <strong>10,000 Monte Carlo simulations</strong>.</p>
-      <p><strong>How the simulations work:</strong> For each simulation we sample goals (Poisson), assists (Poisson), clean sheets (Bernoulli), bonus points (correlated with goals/assists/CS via a trained model), cards (Bernoulli), and goals-conceded penalties. These are converted to FPL points using official scoring rules and summed to produce a total for that trial. The resulting 10,000 totals are smoothed into the KDE curves you see below.</p>
+      <p>Each curve shows the <strong>probability distribution of FPL points</strong> a player could score in the upcoming gameweek, estimated from <strong>__N_SIMS__ Monte Carlo simulations</strong>.</p>
+      <p><strong>How the simulations work:</strong> Each trial samples a player's appearance and minutes, then shares one match score across goals, assists, clean sheets, and goals-conceded penalties. Goals and assists are allocated to players; saves, cards, defensive contributions, and BPS-based bonus are scored within the same trial. Expected points and threshold probabilities come from these same simulated totals, including non-appearances. The resulting __N_SIMS__ totals are smoothed into the KDE curves you see below.</p>
       <p><strong>How to read the plot:</strong></p>
       <ul>
         <li>The <strong>width/spread</strong> of a curve shows outcome variance &mdash; wider means less predictable.</li>
@@ -904,7 +785,7 @@ function render() {
     // Player label
     g.append('text')
       .attr('x', MARGIN.left + 12)
-      .attr('y', baseY - CURVE_HEIGHT * 0.78)
+      .attr('y', baseY - ROW_HEIGHT + 12)
       .attr('fill', '#e6edf3').attr('font-size', '11px').attr('font-weight', 600)
       .text(player.name);
 
@@ -912,16 +793,16 @@ function render() {
     const sub = player.position + ' vs ' + player.opponent + (player.is_home ? ' (H)' : ' (A)');
     g.append('text')
       .attr('x', MARGIN.left + 12)
-      .attr('y', baseY - CURVE_HEIGHT * 0.78 + 14)
+      .attr('y', baseY - ROW_HEIGHT + 26)
       .attr('fill', color).attr('font-size', '10px')
       .text(sub);
 
     // Stats
     const stats = `E[pts]=${player.exp_pts}  med=${player.median}  `
-      + `90%=[${player.p10}\u2013${player.p90}]  P(10+)=${player.p_10plus}%`;
+      + `P10-P90=[${player.p10}\u2013${player.p90}]  P(10+)=${player.p_10plus}%`;
     g.append('text')
       .attr('x', MARGIN.left + 12)
-      .attr('y', baseY - 3)
+      .attr('y', baseY - ROW_HEIGHT + 40)
       .attr('fill', '#484f58').attr('font-size', '10px')
       .text(stats);
 
@@ -958,7 +839,7 @@ function render() {
           <div class="tt-divider"></div>
           <div class="tt-row"><span class="label">E[pts]</span><span class="value">${player.exp_pts}</span></div>
           <div class="tt-row"><span class="label">Median</span><span class="value">${player.median}</span></div>
-          <div class="tt-row"><span class="label">90% CI</span><span class="value">${player.p10} &ndash; ${player.p90}</span></div>
+          <div class="tt-row"><span class="label">P10-P90 range</span><span class="value">${player.p10} &ndash; ${player.p90}</span></div>
           <div class="tt-row"><span class="label">P(10+)</span><span class="value">${player.p_10plus}%</span></div>
           <div class="tt-row"><span class="label">P(15+)</span><span class="value">${player.p_15plus}%</span></div>
           <div class="tt-divider"></div>
@@ -1013,7 +894,6 @@ if (document.readyState === 'loading') {
 window.addEventListener('resize', render);
 </script>
 <div class="side-col">
-  <div class="side-squad"><!--__SQUAD__--></div>
   <!--__LASTGW__-->
   <!--__METRICS__-->
 </div>
@@ -1040,7 +920,8 @@ body{
   padding:12px;-webkit-tap-highlight-color:transparent;
   display:flex;justify-content:center;
 }
-.page{width:100%;max-width:560px}
+.page{width:100%;max-width:560px;min-width:0}
+.page > div[style]{overflow-x:auto}
 .header{text-align:center;margin-bottom:14px}
 .header h1{font-size:18px;font-weight:700;color:#e6edf3}
 .header p{font-size:12px;color:#8b949e;margin-top:2px}
@@ -1115,7 +996,6 @@ body{
 .prob-cell{
   background:#1c2128;border-radius:8px;padding:8px 6px;text-align:center;
 }
-.mob-squad{padding:0 10px;margin-bottom:14px}
 .prob-cell .threshold{font-size:11px;color:#8b949e}
 .prob-cell .pct{font-size:16px;font-weight:700;color:#e6edf3}
 .prob-cell .bar{
@@ -1132,7 +1012,6 @@ body{
   <h1 id="title">FPL Points Distribution</h1>
   <p>Monte Carlo Simulation &middot; Tap card for details</p>
 </div>
-<div class="mob-squad"><!--__SQUAD__--></div>
 <!--__LASTGW__-->
 <!--__METRICS__-->
 <div class="controls">
@@ -1224,7 +1103,7 @@ function render() {
       </div>
       <div class="stats-row">
         <div class="stat"><div class="val">${player.median}</div><div class="lbl">Median</div></div>
-        <div class="stat"><div class="val">${player.p10}&ndash;${player.p90}</div><div class="lbl">90% CI</div></div>
+        <div class="stat"><div class="val">${player.p10}&ndash;${player.p90}</div><div class="lbl">P10-P90 range</div></div>
         <div class="stat"><div class="val">${player.p_10plus}%</div><div class="lbl">P(10+)</div></div>
         <div class="stat"><div class="val">${player.p_15plus}%</div><div class="lbl">P(15+)</div></div>
       </div>

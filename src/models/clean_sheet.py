@@ -1,6 +1,7 @@
 """Goals Against model (team-level) - predicts expected goals conceded per match.
 Uses Poisson distribution to derive clean sheet probability and 2+ conceded probability.
 """
+from ..features import ManagerFeatureMixin, chronological_frame, prior_stat
 import pandas as pd
 import numpy as np
 import xgboost as xgb
@@ -11,7 +12,7 @@ from ..features import (TEAM_NAME_MAP, TEAM_ROLL_MIN_PERIODS, SEASON_STAT_WINDOW
                         SEASON_STAT_MIN_GAMES, promoted_team_seasons)
 
 
-class CleanSheetModel:
+class CleanSheetModel(ManagerFeatureMixin):
     """Predicts expected goals against per match, then derives:
     - P(clean sheet) = P(goals_against = 0) via Poisson
     - P(2+ conceded) = 1 - P(goals_against <= 1) via Poisson
@@ -135,7 +136,10 @@ class CleanSheetModel:
         by one match, those rows provide the true pre-fixture feature state and
         include the most recently completed match without leaking future results.
         """
-        df = df.copy()
+        df = chronological_frame(df)
+        if 'match_id' not in df:
+            pair = df.apply(lambda r: '|'.join(sorted([str(r['team']), str(r['opponent'])])), axis=1)
+            df['match_id'] = df['season'].astype(str) + ':' + df['gameweek'].astype(str) + ':' + pair
         df['team_norm'] = df['team'].apply(self._normalize_name)
         df['opponent_norm'] = df['opponent'].apply(self._normalize_name)
 
@@ -153,7 +157,7 @@ class CleanSheetModel:
             df['own_goal'] = 0
 
         # Manager embedding columns: constant per team-match, take first
-        _mgr_emb_cols = [f'manager_emb_{i}' for i in range(8)]
+        _mgr_emb_cols = [f'manager_emb_{i}' for i in range(8)] + [c for c in df if c.startswith('manager_raw_') or c == 'manager_prior_games']
         for c in _mgr_emb_cols:
             if c not in df.columns:
                 df[c] = 0.0
@@ -176,9 +180,11 @@ class CleanSheetModel:
             key_passes=('key_passes', 'sum'),
             shots_on_target=('shots_on_target', 'sum'),
         )
+        for c in ['match_date', 'forecast_time', 'result_time']:
+            agg_kwargs[c] = (c, 'min')
         for c in _mgr_emb_cols:
             agg_kwargs[c] = (c, 'first')
-        team_match = df.groupby(['team_norm', 'opponent_norm', 'season', 'gameweek', 'is_home']).agg(
+        team_match = df.groupby(['team_norm', 'opponent_norm', 'season', 'gameweek', 'match_id', 'is_home']).agg(
             **agg_kwargs
         ).reset_index()
         team_match['_is_prediction'] = False
@@ -189,10 +195,13 @@ class CleanSheetModel:
             if missing:
                 raise ValueError(f"prediction_fixtures missing columns: {missing}")
 
-            future = prediction_fixtures.copy()
+            future = chronological_frame(prediction_fixtures)
+            if 'match_id' not in future:
+                pair = future.apply(lambda r: '|'.join(sorted([str(r['team']), str(r['opponent'])])), axis=1)
+                future['match_id'] = future['season'].astype(str) + ':' + future['gameweek'].astype(str) + ':' + pair
             future['team_norm'] = future['team'].apply(self._normalize_name)
             future['opponent_norm'] = future['opponent'].apply(self._normalize_name)
-            fixture_key = ['team_norm', 'opponent_norm', 'season', 'gameweek', 'is_home']
+            fixture_key = ['team_norm', 'opponent_norm', 'season', 'gameweek', 'match_id', 'is_home']
             future = future.drop_duplicates(subset=fixture_key, keep='first')
 
             # Do not duplicate a fixture if this method is deliberately used on a
@@ -202,7 +211,7 @@ class CleanSheetModel:
             future = future.loc[~future_keys.isin(existing_keys)].copy()
 
             if len(future) > 0:
-                future_team_match = future[fixture_key + ['team', 'opponent']].copy()
+                future_team_match = future[fixture_key + ['team', 'opponent', 'match_date', 'forecast_time', 'result_time']].copy()
                 for c in ['goals', 'xg', 'tackles', 'interceptions', 'clearances',
                           'blocks', 'saves', 'xgot_faced', 'accurate_passes',
                           'touches', 'key_passes', 'shots_on_target']:
@@ -220,7 +229,7 @@ class CleanSheetModel:
         # Goals conceded = opponent's player goals + this team's own goals
         # Match on both sides of the fixture so DGWs cannot create a cartesian join.
         opp_goals = team_match[[
-            'team_norm', 'opponent_norm', 'season', 'gameweek', 'goals', 'xg'
+            'team_norm', 'opponent_norm', 'season', 'gameweek', 'match_id', 'goals', 'xg'
         ]].copy()
         opp_goals = opp_goals.rename(columns={
             'team_norm': 'opponent_norm',
@@ -230,7 +239,7 @@ class CleanSheetModel:
         })
         team_match = team_match.merge(
             opp_goals,
-            on=['team_norm', 'opponent_norm', 'season', 'gameweek'],
+            on=['team_norm', 'opponent_norm', 'season', 'gameweek', 'match_id'],
             how='left'
         )
         team_match['goals_conceded'] = team_match['opp_goals'] + team_match['own_goals']
@@ -240,7 +249,7 @@ class CleanSheetModel:
         team_match['def_actions'] = (team_match['tackles'] + team_match['interceptions']
                                      + team_match['clearances'] + team_match['blocks'])
         team_match['gk_workload'] = team_match['saves'] + team_match['goals_conceded'].fillna(0)
-        team_match = team_match.sort_values(['team_norm', 'season', 'gameweek'])
+        team_match = team_match.sort_values(['team_norm', 'match_date'], kind='stable').reset_index(drop=True)
 
         # --- Rolling features ---
         _TEAM_WINDOWS = [1, 2, 3, 5, 7, 10, 30]
@@ -248,9 +257,7 @@ class CleanSheetModel:
 
         def _roll(source_col, prefix, windows):
             for w in windows:
-                team_match[f'{prefix}_roll{w}'] = team_match.groupby('team_norm')[source_col].transform(
-                    lambda x: x.shift(1).rolling(w, min_periods=min(TEAM_ROLL_MIN_PERIODS, w)).mean()
-                )
+                team_match[f'{prefix}_roll{w}'] = prior_stat(team_match, 'team_norm', source_col, w, min_periods=min(TEAM_ROLL_MIN_PERIODS, w))
 
         # Team defensive
         _roll('goals_conceded', 'team_conceded', _TEAM_WINDOWS)
@@ -262,9 +269,7 @@ class CleanSheetModel:
         _roll('xg', 'team_xg_scored', _PLAYER_WINDOWS)
 
         # EWMA for xGA (reacts faster to form changes than rolling mean)
-        team_match['team_xga_ewm'] = team_match.groupby('team_norm')['xga'].transform(
-            lambda x: x.shift(1).ewm(span=5, min_periods=1).mean()
-        )
+        team_match['team_xga_ewm'] = prior_stat(team_match, 'team_norm', 'xga', span=5)
 
         # Defensive quality aggregates
         _roll('def_actions', 'team_def_actions', _PLAYER_WINDOWS)
@@ -279,44 +284,36 @@ class CleanSheetModel:
         # Carrying last season's form is the point: in August a season-to-date mean
         # is a single match. Promoted clubs are masked below and never reach here
         # with real values.
-        _n_season = team_match.groupby(['team_norm', 'season']).cumcount()
+        _n_season = prior_stat(team_match.assign(_one=1), ['team_norm', 'season'], '_one', aggregation='sum').fillna(0)
         _use_std = (_n_season >= SEASON_STAT_MIN_GAMES).values
 
         def _identity(frame, col, n_season):
             """Season-to-date once the club has enough games this season, else a
             cross-season rolling window so last season's form carries in August."""
-            std = frame.groupby(['team_norm', 'season'])[col].transform(
-                lambda x: x.shift(1).expanding(min_periods=1).mean())
-            roll = frame.groupby('team_norm')[col].transform(
-                lambda x: x.shift(1).rolling(SEASON_STAT_WINDOW, min_periods=min(TEAM_ROLL_MIN_PERIODS, SEASON_STAT_WINDOW)).mean())
+            std = prior_stat(frame, ['team_norm', 'season'], col)
+            roll = prior_stat(frame, 'team_norm', col, SEASON_STAT_WINDOW, min_periods=TEAM_ROLL_MIN_PERIODS)
             return np.where((n_season >= SEASON_STAT_MIN_GAMES).values, std, roll)
 
         team_match['season_cs_rate'] = _identity(team_match, 'clean_sheet', _n_season)
         team_match['season_xga_per_game'] = _identity(team_match, 'xga', _n_season)
 
         # --- Opponent attacking stats (looked up via team_norm -> opponent_norm) ---
-        opp_offense = team_match[['team_norm', 'opponent_norm', 'season', 'gameweek',
-                                   'goals', 'xg', 'key_passes', 'shots_on_target']].copy()
+        opp_offense = team_match[['team_norm', 'opponent_norm', 'season', 'gameweek', 'match_id',
+                                   'goals', 'xg', 'key_passes', 'shots_on_target', 'match_date', 'forecast_time', 'result_time']].copy()
         for col, pfx in [('goals', 'opp_scored'), ('xg', 'opp_xg'),
                           ('key_passes', 'opp_key_passes'), ('shots_on_target', 'opp_shots_ot')]:
             for w in _PLAYER_WINDOWS:
-                opp_offense[f'{pfx}_roll{w}'] = opp_offense.groupby('team_norm')[col].transform(
-                    lambda x: x.shift(1).rolling(w, min_periods=min(TEAM_ROLL_MIN_PERIODS, w)).mean()
-                )
+                opp_offense[f'{pfx}_roll{w}'] = prior_stat(opp_offense, 'team_norm', col, w, min_periods=min(TEAM_ROLL_MIN_PERIODS, w))
 
         # Opponent scoring identity, rolling across seasons. This is the term that
         # zeroes prior_lambda when a club blanks, so it must not be a one-match mean.
-        _opp_n_season = opp_offense.groupby(['team_norm', 'season']).cumcount()
+        _opp_n_season = prior_stat(opp_offense.assign(_one=1), ['team_norm', 'season'], '_one', aggregation='sum').fillna(0)
         opp_offense['opp_season_goals_per_game'] = _identity(opp_offense, 'goals', _opp_n_season)
         opp_offense['opp_season_xg_per_game'] = _identity(opp_offense, 'xg', _opp_n_season)
         # Promoted-team blending needs genuine current-season evidence from the
         # first match; the general identity feature deliberately waits longer.
         for _source in ('goals', 'xg'):
-            opp_offense[f'_opp_current_season_{_source}'] = opp_offense.groupby(
-                ['team_norm', 'season']
-            )[_source].transform(
-                lambda x: x.shift(1).expanding(min_periods=1).mean()
-            )
+            opp_offense[f'_opp_current_season_{_source}'] = prior_stat(opp_offense, ['team_norm', 'season'], _source)
 
         opp_roll_cols = [c for c in opp_offense.columns
                          if any(c.startswith(p) for p in ['opp_scored_roll', 'opp_xg_roll',
@@ -326,14 +323,14 @@ class CleanSheetModel:
             '_opp_current_season_goals', '_opp_current_season_xg'
         ]
         opp_lookup = opp_offense[[
-            'team_norm', 'opponent_norm', 'season', 'gameweek'
+            'team_norm', 'opponent_norm', 'season', 'gameweek', 'match_id'
         ] + opp_roll_cols + opp_current_cols].copy()
         opp_lookup = opp_lookup.rename(columns={
             'team_norm': 'opponent_norm', 'opponent_norm': 'team_norm'
         })
         team_match = team_match.merge(
             opp_lookup,
-            on=['team_norm', 'opponent_norm', 'season', 'gameweek'],
+            on=['team_norm', 'opponent_norm', 'season', 'gameweek', 'match_id'],
             how='left'
         )
 
@@ -343,15 +340,8 @@ class CleanSheetModel:
         # blanket fillna(0), which would read as "concedes 0.0 per game" -- better
         # than any real defence. Anchor the unknowns to league average instead.
         _observed = ~team_match['_is_prediction'].fillna(False).astype(bool)
-        _lg_conceded = team_match.loc[_observed, 'goals_conceded'].mean()
-        if not np.isfinite(_lg_conceded) or _lg_conceded < 0.5:
-            _lg_conceded = 1.3
-        _lg_cs = team_match.loc[_observed, 'clean_sheet'].mean()
-        if not np.isfinite(_lg_cs):
-            _lg_cs = 0.25
-        _lg_xg = team_match.loc[_observed, 'xg'].mean()
-        if not np.isfinite(_lg_xg) or _lg_xg <= 0:
-            _lg_xg = _lg_conceded
+        # Fixed cold-start defaults contain no future league outcomes.
+        _lg_conceded, _lg_cs, _lg_xg = 1.3, 0.25, 1.3
 
         # Newly promoted clubs need a real prior while their current-season sample
         # is still small. Blend continuously over five completed matches instead
@@ -359,7 +349,7 @@ class CleanSheetModel:
         # Priors use early-season promoted clubs from PRIOR seasons, so every
         # training row remains leakage-safe.
         _promoted = promoted_team_seasons(team_match)
-        team_match['_prior_games'] = team_match.groupby(['team_norm', 'season']).cumcount()
+        team_match['_prior_games'] = prior_stat(team_match.assign(_one=1), ['team_norm', 'season'], '_one', aggregation='sum').fillna(0)
         team_match['_promoted_prior_weight'] = pd.Series([
             max(0.0, 1.0 - float(g) / self.PROMOTED_PRIOR_GAMES)
             if (t, sn) in _promoted else 0.0
@@ -367,7 +357,7 @@ class CleanSheetModel:
                                 team_match['_prior_games'])
         ], index=team_match.index)
         _opp_prior_lookup = team_match[[
-            'team_norm', 'opponent_norm', 'season', 'gameweek',
+            'team_norm', 'opponent_norm', 'season', 'gameweek', 'match_id',
             '_promoted_prior_weight'
         ]].rename(columns={
             'team_norm': 'opponent_norm', 'opponent_norm': 'team_norm',
@@ -375,7 +365,7 @@ class CleanSheetModel:
         })
         team_match = team_match.merge(
             _opp_prior_lookup,
-            on=['team_norm', 'opponent_norm', 'season', 'gameweek'],
+            on=['team_norm', 'opponent_norm', 'season', 'gameweek', 'match_id'],
             how='left'
         )
         _prior_weight = team_match['_promoted_prior_weight'].fillna(0.0).clip(0.0, 1.0)
@@ -383,25 +373,12 @@ class CleanSheetModel:
         _cold = _prior_weight.gt(0.0)
         _opp_cold = _opp_prior_weight.gt(0.0)
 
-        def _safe_mean(source_col, fallback):
-            value = pd.to_numeric(
-                team_match.loc[_observed, source_col], errors='coerce'
-            ).mean()
-            return float(value) if np.isfinite(value) else fallback
-
         _source_defaults = {
-            'goals_conceded': _lg_conceded,
-            'xga': _lg_xg,
-            'clean_sheet': _lg_cs,
-            'goals': _lg_conceded,
-            'xg': _lg_xg,
-            'def_actions': _safe_mean('def_actions', 50.0),
-            'clearances': _safe_mean('clearances', 20.0),
-            'gk_workload': _safe_mean('gk_workload', 5.0),
-            'accurate_passes': _safe_mean('accurate_passes', 350.0),
-            'touches': _safe_mean('touches', 600.0),
-            'key_passes': _safe_mean('key_passes', 9.0),
-            'shots_on_target': _safe_mean('shots_on_target', 4.0),
+            'goals_conceded': 1.3, 'xga': 1.3, 'clean_sheet': 0.25,
+            'goals': 1.3, 'xg': 1.3, 'def_actions': 50.0,
+            'clearances': 20.0, 'gk_workload': 5.0,
+            'accurate_passes': 350.0, 'touches': 600.0,
+            'key_passes': 9.0, 'shots_on_target': 4.0,
         }
         _gw_num = pd.to_numeric(team_match['gameweek'], errors='coerce')
         _is_promoted = pd.Series(
@@ -478,14 +455,8 @@ class CleanSheetModel:
 
         _blend_promoted('team_xga_ewm', 'xga', _prior_weight)
         team_match['team_xga_ewm'] = team_match['team_xga_ewm'].fillna(_lg_xg)
-        _current_team_xga = team_match.groupby(
-            ['team_norm', 'season']
-        )['xga'].transform(lambda x: x.shift(1).expanding(min_periods=1).mean())
-        _current_team_cs = team_match.groupby(
-            ['team_norm', 'season']
-        )['clean_sheet'].transform(
-            lambda x: x.shift(1).expanding(min_periods=1).mean()
-        )
+        _current_team_xga = prior_stat(team_match, ['team_norm', 'season'], 'xga')
+        _current_team_cs = prior_stat(team_match, ['team_norm', 'season'], 'clean_sheet')
         _blend_promoted(
             'season_xga_per_game', 'xga', _prior_weight, _current_team_xga
         )
@@ -520,6 +491,7 @@ class CleanSheetModel:
         team_match['opp_season_goals_per_game'] = team_match['opp_season_goals_per_game'].fillna(_lg_conceded)
         team_match['opp_season_xg_per_game'] = team_match['opp_season_xg_per_game'].fillna(_lg_xg)
 
+        team_match = team_match.copy()  # consolidate before adding interaction columns
         # --- Interaction and ratio features (computed for all standard windows) ---
         for w in _PLAYER_WINDOWS:
             team_match[f'xga_x_opp_xg_roll{w}'] = (team_match[f'team_xga_roll{w}'].fillna(0)
@@ -538,11 +510,10 @@ class CleanSheetModel:
             team_match[f'{venue}_season_cs_rate'] = np.nan
             for tn, grp in team_match[venue_mask].groupby('team_norm'):
                 idx = grp.index
-                _vn = grp.groupby('season').cumcount()
+                _vn = prior_stat(grp.assign(_one=1), 'season', '_one', aggregation='sum').fillna(0)
                 for _sfx, _src in (('xga', 'xga'), ('cs_rate', 'clean_sheet')):
-                    _r = grp[_src].shift(1).rolling(SEASON_STAT_WINDOW, min_periods=min(TEAM_ROLL_MIN_PERIODS, SEASON_STAT_WINDOW)).mean()
-                    _sd = grp.groupby('season')[_src].transform(
-                        lambda x: x.shift(1).expanding(min_periods=1).mean())
+                    _r = prior_stat(grp, 'team_norm', _src, SEASON_STAT_WINDOW, min_periods=TEAM_ROLL_MIN_PERIODS)
+                    _sd = prior_stat(grp, 'season', _src)
                     team_match.loc[idx, f'{venue}_season_{_sfx}'] = np.where(
                         (_vn >= SEASON_STAT_MIN_GAMES).values, _sd, _r)
 
@@ -580,16 +551,15 @@ class CleanSheetModel:
             team_match[f'{venue}_season_xg'] = np.nan
             for tn, grp in team_match[venue_mask].groupby('team_norm'):
                 idx = grp.index
-                _vn = grp.groupby('season').cumcount()
+                _vn = prior_stat(grp.assign(_one=1), 'season', '_one', aggregation='sum').fillna(0)
                 for _sfx, _src in (('goals', 'goals'), ('xg', 'xg')):
-                    _r = grp[_src].shift(1).rolling(SEASON_STAT_WINDOW, min_periods=min(TEAM_ROLL_MIN_PERIODS, SEASON_STAT_WINDOW)).mean()
-                    _sd = grp.groupby('season')[_src].transform(
-                        lambda x: x.shift(1).expanding(min_periods=1).mean())
+                    _r = prior_stat(grp, 'team_norm', _src, SEASON_STAT_WINDOW, min_periods=TEAM_ROLL_MIN_PERIODS)
+                    _sd = prior_stat(grp, 'season', _src)
                     team_match.loc[idx, f'{venue}_season_{_sfx}'] = np.where(
                         (_vn >= SEASON_STAT_MIN_GAMES).values, _sd, _r)
 
         # When we're home, use the opponent's away scoring rate and vice versa.
-        opp_ha_lookup2 = team_match[['team_norm', 'opponent_norm', 'season', 'gameweek',
+        opp_ha_lookup2 = team_match[['team_norm', 'opponent_norm', 'season', 'gameweek', 'match_id',
                                       'away_season_goals', 'away_season_xg',
                                       'home_season_goals', 'home_season_xg']].copy()
         opp_ha_lookup2 = opp_ha_lookup2.rename(columns={
@@ -598,10 +568,10 @@ class CleanSheetModel:
         # When our is_home=1, opponent is away, so use opponent's away_season_goals
         # When our is_home=0, opponent is home, so use opponent's home_season_goals
         team_match = team_match.merge(
-            opp_ha_lookup2[['team_norm', 'opponent_norm', 'season', 'gameweek',
+            opp_ha_lookup2[['team_norm', 'opponent_norm', 'season', 'gameweek', 'match_id',
                             'away_season_goals', 'away_season_xg',
                             'home_season_goals', 'home_season_xg']],
-            on=['team_norm', 'opponent_norm', 'season', 'gameweek'], how='left',
+            on=['team_norm', 'opponent_norm', 'season', 'gameweek', 'match_id'], how='left',
             suffixes=('', '_opp')
         )
         team_match['opp_ha_season_goals'] = np.where(
@@ -634,7 +604,7 @@ class CleanSheetModel:
         # --- Prior lambda (strong direct anchor) ---
         # Estimate: team xGA times the opponent's blended goals/xG attack rate,
         # normalized by the league-average goals rate.
-        league_avg_goals = team_match.loc[_observed, 'goals_conceded'].mean()  # ~1.38
+        league_avg_goals = 1.3  # fixed normalization; learned priors use prior seasons only
         if league_avg_goals < 0.5:
             league_avg_goals = 1.3  # safety fallback
 
@@ -672,7 +642,7 @@ class CleanSheetModel:
         return team_match
 
     def _prepare_X(self, df: pd.DataFrame):
-        df = df.copy()
+        df = self.manager_features(df)
         features = self.features_to_use
         for feat in features:
             if feat not in df.columns:
@@ -700,11 +670,12 @@ class CleanSheetModel:
 
     def fit(self, df: pd.DataFrame, verbose: bool = True):
         """Train on team-match data to predict goals conceded."""
-        team_df = self.prepare_team_features(df)
-        team_df = team_df.dropna(subset=['team_conceded_roll5', 'goals_conceded'])
+        return self.fit_prepared(self.prepare_team_features(df), verbose)
 
-        team_df = team_df.sort_values(['season', 'gameweek']).reset_index(drop=True)
-
+    def fit_prepared(self, team_df: pd.DataFrame, verbose: bool = True):
+        """Shared fitting path for final training, temporal CV, and evaluation."""
+        team_df = team_df.dropna(subset=['goals_conceded']).copy()
+        self.fit_manager_features(team_df)
         X = self._prepare_X(team_df)
         y = team_df['goals_conceded'].fillna(0).values
         base_margin = self._get_base_margin(team_df)

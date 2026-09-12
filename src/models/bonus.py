@@ -9,6 +9,7 @@ Instead of predicting bonus directly, this model:
 This is more accurate because bonus points are a ranking-based competition.
 """
 
+from ..features import ManagerFeatureMixin
 import pandas as pd
 import numpy as np
 import xgboost as xgb
@@ -165,7 +166,7 @@ def get_fpl_availability():
         return {}
 
 
-class BaselineBPSModel:
+class BaselineBPSModel(ManagerFeatureMixin):
     """
     Predicts baseline BPS score from "boring" stats.
     
@@ -254,7 +255,9 @@ class BaselineBPSModel:
         df = df.copy()
         
         # Get position for position-dependent BPS
-        fpl_pos = df.get('fpl_position', pd.Series(['MID'] * len(df), index=df.index))
+        fallback_pos = df.get('position', pd.Series(2, index=df.index)).map(
+            {0: 'GK', 1: 'DEF', 2: 'MID', 3: 'FWD'}).fillna('MID')
+        fpl_pos = df.get('fpl_position', fallback_pos)
         
         # Calculate BPS from major events
         goal_bps = fpl_pos.map(lambda p: BPS_RULES['goal'].get(p, 18))
@@ -264,12 +267,18 @@ class BaselineBPSModel:
         assists = df['assists'].fillna(0) if 'assists' in df.columns else pd.Series(0, index=df.index)
         
         # Clean sheet: 1 if opponent_goals == 0 and player played 60+ mins
-        opponent_goals = df['opponent_goals'].fillna(1) if 'opponent_goals' in df.columns else pd.Series(1, index=df.index)
+        opponent_goals = df.get('_bps_goals_against', df.get('opponent_goals',
+            df.get('goals_conceded', pd.Series(1., index=df.index)))).fillna(1)
         minutes = df['minutes'].fillna(0) if 'minutes' in df.columns else pd.Series(60, index=df.index)
         clean_sheet = ((opponent_goals == 0) & (minutes >= 60)).astype(int)
         
         # Total BPS from major events
-        major_event_bps = (goals * goal_bps) + (assists * 9) + (clean_sheet * cs_bps)
+        conceded_bps = fpl_pos.map(lambda p: BPS_RULES['goal_conceded'].get(p, 0))
+        yellow = df.get('yellow_cards', pd.Series(0., index=df.index)).fillna(0)
+        red = df.get('red_cards', pd.Series(0., index=df.index)).fillna(0)
+        major_event_bps = (goals * goal_bps + assists * BPS_RULES['assist'] +
+                           clean_sheet * cs_bps + opponent_goals * conceded_bps * (minutes >= 60) +
+                           yellow * BPS_RULES['yellow_card'] + red * BPS_RULES['red_card'])
         
         # Baseline = total - major events
         total_bps = df['bps'].fillna(0) if 'bps' in df.columns else pd.Series(0, index=df.index)
@@ -332,6 +341,15 @@ class BaselineBPSModel:
         """Train the baseline BPS model."""
         df = df.copy()
         
+        # Build full-match conceded counts before filtering to the 60+ training subset.
+        if {'match_id', 'team', 'opponent', 'goals'} <= set(df):
+            stats = df.assign(_team=df['team'].map(normalize_team_name),
+                              _og=df.get('own_goal', pd.Series(0., index=df.index)).fillna(0))
+            totals = stats.groupby(['match_id', '_team'])[['goals', '_og']].sum()
+            opposing = pd.MultiIndex.from_arrays([df['match_id'], df['opponent'].map(normalize_team_name)])
+            own = pd.MultiIndex.from_arrays([df['match_id'], df['team'].map(normalize_team_name)])
+            df['_bps_goals_against'] = (totals['goals'].reindex(opposing).fillna(0).to_numpy() +
+                                        totals['_og'].reindex(own).fillna(0).to_numpy())
         # Only train on players who played 60+ mins
         played_mask = (df['minutes'] >= 60) if 'minutes' in df.columns else pd.Series(True, index=df.index)
         df = df[played_mask].copy()
@@ -357,8 +375,10 @@ class BaselineBPSModel:
         for feat in available_features:
             df[feat] = df[feat].fillna(0)
         
-        X = df[available_features].fillna(0).astype(float)
-        y = df['baseline_bps'].fillna(0)
+        self.fit_manager_features(df)
+        X = self.manager_features(df)[available_features].fillna(0).astype(float)
+        # Inference scales the baseline by sampled minutes / 90: learn a rate.
+        y = df['baseline_bps'].fillna(0) / (df['minutes'] / 90).clip(lower=1 / 90)
         
         # Scale features
         X_scaled = self.scaler.fit_transform(X)
@@ -393,7 +413,7 @@ class BaselineBPSModel:
             if feat not in df.columns:
                 df[feat] = 0
         
-        X = df[self._features_used].fillna(0).astype(float)
+        X = self.manager_features(df)[self._features_used].fillna(0).astype(float)
         X_scaled = self.scaler.transform(X)
         preds = self.model.predict(X_scaled)
         
@@ -436,11 +456,7 @@ class BonusModel:
         self.is_fitted = True
         self._features_used = self.baseline_model._features_used
         
-        # Fetch FPL availability
-        self.fpl_availability = get_fpl_availability()
-        if verbose and self.fpl_availability:
-            print(f"  Loaded FPL availability for {len(self.fpl_availability)} players")
-        
+        # Live availability is supplied by the forecast, never fetched during fitting.
         return self
     
     def _get_player_availability(self, player_name: str) -> float:
@@ -484,179 +500,152 @@ class BonusModel:
         
         return 1.0
     
-    def predict(self, df: pd.DataFrame, pred_goals=None, pred_assists=None,
-                pred_cs_prob=None, pred_minutes=None, fpl_positions=None,
-                pred_yellow_prob=None) -> np.ndarray:
-        """
-        Predict expected bonus using Monte Carlo simulation.
+    @staticmethod
+    def award_bonus(bps, playing):
+        """Competition ranks: two tied first receive 3,3; next receives 1."""
+        bps, playing = np.asarray(bps), np.asarray(playing, dtype=bool)
+        ranks = np.zeros(bps.shape, dtype=int)
+        for i in range(bps.shape[1]):
+            ranks[:, i] = ((bps > bps[:, i, None]) & playing).sum(axis=1)
+        return np.where(playing, np.maximum(3 - ranks, 0), 0)
 
-        Players with low predicted minutes or low FPL availability are excluded
-        from bonus competition.
+    def simulate(self, df, probability=None, state_minutes=None, *,
+                 n_simulations=None, seed=42, defcon_r=None):
+        """Shared match events for weekly points, bonus, charts and five-week runs.
 
-        Includes fixes for per90 stat inflation:
-        1. Caps per90 stats at realistic maximums
-        2. Applies reliability weighting based on historical minutes
+        Team goal totals are sampled once. Scorers/assisters are allocated from
+        minutes-adjusted player intensities, leaving a residual bucket for players
+        outside the forecast pool/no assist. If player intensities exceed the team
+        total, they are proportionally reconciled. One scorer and at most one
+        different assister are credited per goal. Player role draws are presently
+        independent; this is not an eleven-player lineup simulator.
         """
         if not self.is_fitted:
-            raise ValueError("Model not fitted.")
-        
-        df = df.copy()
-        n = len(df)
-        
-        # Fix #1: Cap per90 stats to prevent inflation from low-minutes appearances
-        df = cap_per90_stats(df)
-        
-        # Refresh FPL availability
-        if not self.fpl_availability:
-            self.fpl_availability = get_fpl_availability()
-        
-        # Get predictions from df if not provided
-        if pred_goals is None:
-            pred_goals = df.get('pred_exp_goals', np.zeros(n))
-        if pred_assists is None:
-            pred_assists = df.get('pred_exp_assists', np.zeros(n))
-        if pred_cs_prob is None:
-            pred_cs_prob = df.get('pred_cs_prob', np.full(n, 0.25))
-        if pred_minutes is None:
-            pred_minutes = df.get('pred_minutes', np.full(n, 60))
-        
-        pred_goals = np.array(pred_goals)
-        pred_assists = np.array(pred_assists)
-        pred_cs_prob = np.array(pred_cs_prob)
-        pred_minutes = np.array(pred_minutes)
+            raise ValueError("Model not fitted")
+        frame = cap_per90_stats(df).reset_index(drop=True)
+        n, ns = len(frame), int(n_simulations or self.n_simulations)
+        rng = np.random.default_rng(seed)
+        def vector(column, default=0):
+            return pd.to_numeric(frame.get(column, pd.Series(default, index=frame.index)),
+                                 errors='coerce').fillna(default).to_numpy(dtype=float)
+        base_minutes = np.clip(vector('pred_minutes', 60), 1, 90)
+        if probability is None:
+            appear = np.clip(vector('pred_appear_prob', 1), 0, 1)
+            p60 = np.clip(vector('pred_60_prob_cond', 1), 0, 1)
+            probability = np.column_stack([1 - appear, appear * (1 - p60), appear * p60])
+            state_minutes = np.column_stack([
+                np.zeros(n), np.minimum(base_minutes, 59), np.maximum(base_minutes, 60)])
+        probability = np.asarray(probability, dtype=float)
+        if probability.ndim != 2 or probability.shape[0] != n:
+            raise ValueError("Role probabilities must have one row per fixture-player")
+        if not np.isfinite(probability).all() or (probability < 0).any():
+            raise ValueError("Role probabilities must be finite and non-negative")
+        if not np.allclose(probability.sum(axis=1), 1):
+            raise ValueError("Role probabilities must sum to one")
+        state_minutes = np.asarray(state_minutes, dtype=float)
+        if state_minutes.ndim == 1:
+            state_minutes = np.broadcast_to(state_minutes, probability.shape)
+        if state_minutes.shape != probability.shape or not np.isfinite(state_minutes).all():
+            raise ValueError("State minutes must match the role probabilities")
+        cumulative = probability.cumsum(axis=1)
+        draws = rng.random((ns, n))
+        state = (draws[:, :, None] > cumulative[None, :, :]).sum(axis=2)
+        state = np.minimum(state, probability.shape[1] - 1)
+        minutes = np.take_along_axis(np.broadcast_to(state_minutes, (ns, *state_minutes.shape)),
+                                     state[:, :, None], axis=2)[:, :, 0].clip(0, 90)
+        playing, sixty = minutes > 0, minutes >= 60
+        scale = minutes / base_minutes[None, :]
+        goals, assists = np.zeros((ns, n), dtype=int), np.zeros((ns, n), dtype=int)
+        against, team_goals = np.zeros((ns, n), dtype=int), np.zeros((ns, n), dtype=int)
+        team = frame.get('team', pd.Series('team', index=frame.index)).map(normalize_team_name).to_numpy()
+        opponent = frame.get('opponent', pd.Series('opponent', index=frame.index)).map(normalize_team_name).to_numpy()
+        # Even legacy callers without match_id are separated by season/GW/pair.
+        keys = []
+        for i, row in frame.iterrows():
+            fixture = row.get('match_id')
+            if pd.isna(fixture):
+                fixture = '|'.join(sorted([team[i], opponent[i]]))
+            keys.append((str(row.get('season', '')), str(row.get('gameweek', '')), str(fixture)))
+        groups = {}
+        for i, key in enumerate(keys):
+            groups.setdefault(key, []).append(i)
+        goal_mean = np.maximum(vector('pred_exp_goals'), 0)
+        assist_mean = np.maximum(vector('pred_exp_assists'), 0)
+        team_mean = np.maximum(vector('pred_team_goals', 1.3), .001)
+        ga_mean = np.maximum(vector('pred_goals_against', 1.3), .001)
 
-        if pred_yellow_prob is None:
-            pred_yellow_prob = df.get('pred_yellow_prob', np.zeros(n))
-        pred_yellow_prob = np.array(pred_yellow_prob)
-
-        # Get positions
-        if fpl_positions is None:
-            fpl_positions = df.get('fpl_position', pd.Series(['MID'] * n)).values
-        
-        # Get FPL availability for each player
-        player_names = df.get('player_name', pd.Series([''] * n))
-        availability = np.array([self._get_player_availability(name) for name in player_names])
-        
-        # Baseline BPS prediction
-        baseline_bps = self.baseline_model.predict(df)
-        
-        # Fix #2: Apply reliability weighting based on historical minutes
-        # Players with fewer rolling minutes have less reliable per90 stats
-        # 300 minutes (5 full games) = full reliability, less = reduced confidence
-        minutes_roll5 = df.get('minutes_roll5', pd.Series(np.full(n, 300))).fillna(300).values
-        reliability = np.clip(minutes_roll5 / 300.0, 0.3, 1.0)
-        baseline_bps = baseline_bps * reliability
-        
-        # Scale by predicted minutes for this match
-        baseline_bps = baseline_bps * np.clip(pred_minutes / 90, 0, 1.0)
-        
-        # Zero out BPS for players unlikely to play
-        # Players with <10 predicted minutes or 0% availability don't compete
-        playing_mask = (pred_minutes >= 10) & (availability > 0)
-        baseline_bps = np.where(playing_mask, baseline_bps, 0)
-        
-        # BPS values by position
-        goal_bps = np.array([BPS_RULES['goal'].get(p, 18) for p in fpl_positions])
-        cs_bps = np.array([BPS_RULES['clean_sheet'].get(p, 0) for p in fpl_positions])
-        mins_60_mask = (pred_minutes >= 60).astype(float)
-        
-        # Match grouping using proper normalization
-        if 'team' in df.columns and 'opponent' in df.columns:
-            match_groups = df.apply(
-                lambda r: '_vs_'.join(sorted([
-                    normalize_team_name(r.get('team', '')), 
-                    normalize_team_name(r.get('opponent', ''))
-                ])),
-                axis=1
-            ).values
-        else:
-            match_groups = np.array(['match'] * n)
-        
-        # Monte Carlo simulation
-        n_sims = self.n_simulations
-        
-        # Sample goals, assists, clean sheets, yellow cards for all simulations
-        all_goals = np.random.poisson(np.maximum(pred_goals, 0), (n_sims, n))
-        all_assists = np.random.poisson(np.maximum(pred_assists, 0), (n_sims, n))
-        all_cs = ((np.random.random((n_sims, n)) < pred_cs_prob) * mins_60_mask).astype(int)
-        all_yellows = (np.random.random((n_sims, n)) < np.clip(pred_yellow_prob, 0, 1)).astype(int)
-
-        # Apply playing mask - non-playing players get 0 events
-        all_goals = all_goals * playing_mask
-        all_assists = all_assists * playing_mask
-        all_cs = all_cs * playing_mask
-        all_yellows = all_yellows * playing_mask
-
-        # Calculate total BPS for each simulation (yellow cards = -3 BPS each)
-        all_bps = (
-            baseline_bps +
-            all_goals * goal_bps +
-            all_assists * BPS_RULES['assist'] +
-            all_cs * cs_bps +
-            all_yellows * BPS_RULES['yellow_card']
-        ) * playing_mask
-        
-        # Compute bonus per match via BPS ranking
-        all_bonus = np.zeros((n_sims, n))
-        unique_matches = np.unique(match_groups)
-        match_to_indices = {m: np.where(match_groups == m)[0] for m in unique_matches}
-
-        for match_id, match_idx in match_to_indices.items():
-            if len(match_idx) == 0:
-                continue
-
-            # Get BPS for this match across all simulations: (n_sims, n_match)
-            match_bps = all_bps[:, match_idx]
-
-            # Initialize match bonus
-            match_bonus = np.zeros((n_sims, len(match_idx)))
-
-            # For each simulation, rank players and award bonus
-            for sim in range(n_sims):
-                bps_sim = match_bps[sim]
-
-                # Only consider players who are actually playing
-                playing_in_match = bps_sim > 0
-                if not np.any(playing_in_match):
+        for indices in groups.values():
+            indices = np.asarray(indices)
+            sides = sorted(set(team[indices]) | set(opponent[indices]))
+            scores = {}
+            for side in sides:
+                attackers = indices[team[indices] == side]
+                defenders = indices[opponent[indices] == side]
+                lam = float(np.mean(team_mean[attackers])) if len(attackers) else float(np.mean(ga_mean[defenders]))
+                score = rng.poisson(lam, ns)
+                scores[side] = score
+                if not len(attackers):
                     continue
+                team_goals[:, attackers] = score[:, None]
+                scorer_weights = goal_mean[attackers][None, :] * scale[:, attackers] / lam
+                scorer_weights /= np.maximum(scorer_weights.sum(axis=1, keepdims=True), 1)
+                assist_weights = assist_mean[attackers][None, :] * scale[:, attackers] / lam
+                for event in range(int(score.max(initial=0))):
+                    active = np.flatnonzero(score > event)
+                    cdf = scorer_weights[active].cumsum(axis=1)
+                    scorer = (rng.random(len(active))[:, None] > cdf).sum(axis=1)
+                    credited = scorer < len(attackers)
+                    goals[active[credited], attackers[scorer[credited]]] += 1
+                    weights = assist_weights[active].copy()
+                    # An unmodeled scorer can still have a modeled assister.
+                    weights[np.flatnonzero(credited), scorer[credited]] = 0
+                    weights /= np.maximum(weights.sum(axis=1, keepdims=True), 1)
+                    assister = (rng.random(len(active))[:, None] > weights.cumsum(axis=1)).sum(axis=1)
+                    credited_assist = assister < len(attackers)
+                    assists[active[credited_assist], attackers[assister[credited_assist]]] += 1
+            for i in indices:
+                against[:, i] = scores[opponent[i]]
 
-                sorted_idx = np.argsort(-bps_sim)
-                sorted_bps = bps_sim[sorted_idx]
-
-                # Award 3, 2, 1 handling ties
-                bonus_to_award = [3, 2, 1]
-                bonus_idx = 0
-                i = 0
-
-                while i < len(sorted_idx) and bonus_idx < 3:
-                    if sorted_bps[i] <= 0:  # Skip non-playing players
-                        i += 1
-                        continue
-
-                    # Find all tied at this BPS level
-                    tied_mask = bps_sim == sorted_bps[i]
-                    n_tied = np.sum(tied_mask)
-
-                    # Award current bonus to all tied players
-                    match_bonus[sim, tied_mask] = bonus_to_award[bonus_idx]
-
-                    # Move to next bonus level
-                    bonus_idx += 1
-                    i += n_tied
-
-            all_bonus[:, match_idx] = match_bonus
-
-        # Store per-simulation arrays for distribution visualization
+        cs = ((against == 0) & sixty).astype(int)
+        yellows = rng.binomial(1, np.clip(vector('pred_yellow_prob')[None, :] * scale, 0, 1))
+        reds = rng.binomial(1, np.clip(vector('pred_red_prob')[None, :] * scale, 0, 1))
+        saves = rng.poisson(np.maximum(vector('pred_exp_saves')[None, :] * scale, 0))
+        mu = np.maximum(vector('pred_exp_defcon')[None, :] * scale, 0)
+        defcon = (rng.negative_binomial(defcon_r, defcon_r / (defcon_r + mu))
+                  if defcon_r is not None and defcon_r > 0 else rng.poisson(mu))
+        positions = frame.get('fpl_position', pd.Series('MID', index=frame.index)).to_numpy()
+        # minutes_roll5 is a MEAN, not cumulative exposure.
+        games = np.minimum(vector('lifetime_appearances', 5), 5)
+        reliability = np.clip(vector('minutes_roll5', 60) * games / 300., .3, 1.)
+        baseline = self.baseline_model.predict(frame) * reliability
+        goal_bps = np.array([BPS_RULES['goal'].get(p, 18) for p in positions])
+        cs_bps = np.array([BPS_RULES['clean_sheet'].get(p, 0) for p in positions])
+        gc_bps = np.array([BPS_RULES['goal_conceded'].get(p, 0) for p in positions])
+        bps = np.rint(baseline[None, :] * minutes / 90 +
+                      goals * goal_bps + assists * BPS_RULES['assist'] +
+                      cs * cs_bps + against * gc_bps * sixty +
+                      yellows * BPS_RULES['yellow_card'] + reds * BPS_RULES['red_card'])
+        bonus = np.zeros((ns, n), dtype=int)
+        for indices in groups.values():
+            bonus[:, indices] = self.award_bonus(bps[:, indices], playing[:, indices])
         self._last_simulations = {
-            'goals': all_goals,       # (n_sims, n_players)
-            'assists': all_assists,    # (n_sims, n_players)
-            'cs': all_cs,             # (n_sims, n_players) binary
-            'yellows': all_yellows,   # (n_sims, n_players) binary
-            'bonus': all_bonus,       # (n_sims, n_players) 0-3
+            'minutes': minutes, 'goals': goals, 'assists': assists, 'cs': cs,
+            'goals_against': against, 'team_goals': team_goals, 'yellows': yellows,
+            'reds': reds, 'saves': saves, 'defcon': defcon, 'bonus': bonus, 'bps': bps,
         }
+        return self._last_simulations
 
-        return all_bonus.mean(axis=0)
-    
+    def predict(self, df, pred_goals=None, pred_assists=None, pred_cs_prob=None,
+                pred_minutes=None, fpl_positions=None, pred_yellow_prob=None):
+        """Compatibility interface; new callers pass role distributions to simulate."""
+        frame = df.copy()
+        for column, value in [('pred_exp_goals', pred_goals), ('pred_exp_assists', pred_assists),
+                              ('pred_cs_prob', pred_cs_prob), ('pred_minutes', pred_minutes),
+                              ('fpl_position', fpl_positions), ('pred_yellow_prob', pred_yellow_prob)]:
+            if value is not None:
+                frame[column] = value
+        return self.simulate(frame)['bonus'].mean(axis=0)
+
     def get_last_simulations(self) -> dict:
         """Return per-simulation arrays from the last predict() call.
 
@@ -674,3 +663,32 @@ class BonusModel:
     def feature_importance(self) -> pd.DataFrame:
         """Get feature importance from baseline model."""
         return self.baseline_model.feature_importance()
+
+
+def score_simulations(frame, simulations, rules):
+    """Score the existing event draws once, using the pipeline's configured rules."""
+    minutes = simulations['minutes']
+    positions = frame['fpl_position'].to_numpy()
+    sixty = minutes >= 60
+    goal_values = np.array([rules['goal'].get(p, 5) for p in positions])
+    cs_values = np.array([rules['clean_sheet'].get(p, 0) for p in positions])
+    gc_values = np.array([rules['goals_conceded_2'].get(p, 0) for p in positions])
+    thresholds = np.where(positions == 'DEF', 10, 12)
+    components = {
+        'exp_appearance_pts': np.where(sixty, rules['appearance_60'],
+                                      np.where(minutes > 0, rules['appearance_1'], 0)),
+        'exp_goals_pts': simulations['goals'] * goal_values,
+        'exp_assists_pts': simulations['assists'] * rules['assist'],
+        'exp_cs_pts': simulations['cs'] * cs_values,
+        'exp_conceded_penalty': (simulations['goals_against'] // 2) * gc_values * sixty,
+        'exp_saves_pts': (simulations['saves'] // 3) * (positions == 'GK') * rules['saves_per_3'],
+        'exp_defcon_pts': ((simulations['defcon'] >= thresholds) * sixty *
+                           np.isin(positions, ['DEF', 'MID']) * rules['defcon']),
+        'exp_bonus_pts': simulations['bonus'],
+        'exp_yellow_pts': simulations['yellows'] * rules['yellow_card'],
+        'exp_red_pts': simulations['reds'] * rules['red_card'],
+    }
+    simulations['total_points'] = sum(components.values())
+    # Keep the components in the archive too: charts never need to resample.
+    simulations.update(components)
+    return components

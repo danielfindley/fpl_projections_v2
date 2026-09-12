@@ -51,6 +51,7 @@ PLAYER_STATS_FILE = DATA_DIR / 'players' / 'player_stats.csv'
 SHOTMAP_FILE = DATA_DIR / 'matches' / 'shotmap.csv'
 MATCH_DETAILS_FILE = DATA_DIR / 'matches' / 'match_details.csv'
 FIXTURES_FILE = DATA_DIR / 'fixtures.csv'
+MANAGERS_FILE = DATA_DIR / 'match_managers.csv'
 RAW_DIR = DATA_DIR / 'matches' / 'raw'
 
 
@@ -62,6 +63,73 @@ def save_raw_match(match_id, payload):
     path = RAW_DIR / f"{match_id}.json.gz"
     with gzip.open(path, "wt", encoding="utf-8") as f:
         json.dump(payload, f, separators=(",", ":"))
+
+
+def extract_manager_data(match_id, payload):
+    """Extract manager and formation fields used by manager embeddings."""
+    lineup = payload.get('content', {}).get('lineup', {})
+    home = lineup.get('homeTeam', {})
+    away = lineup.get('awayTeam', {})
+    home_coach = home.get('coach') or {}
+    away_coach = away.get('coach') or {}
+
+    if not home.get('name') or not away.get('name'):
+        return None
+
+    return {
+        'match_id': match_id,
+        'home_team': home.get('name'),
+        'away_team': away.get('name'),
+        'home_manager_id': home_coach.get('id'),
+        'home_manager_name': home_coach.get('name'),
+        'away_manager_id': away_coach.get('id'),
+        'away_manager_name': away_coach.get('name'),
+        'home_formation': home.get('formation'),
+        'away_formation': away.get('formation'),
+    }
+
+
+def refresh_manager_cache(new_rows=None):
+    """Upsert new manager rows and recover uncached rows from saved raw payloads."""
+    if MANAGERS_FILE.exists():
+        existing = pd.read_csv(MANAGERS_FILE, on_bad_lines='skip')
+    else:
+        existing = pd.DataFrame()
+
+    rows = list(new_rows or [])
+    known_ids = set()
+    if 'match_id' in existing:
+        match_ids = pd.to_numeric(existing['match_id'], errors='coerce')
+        known_ids = set(match_ids.dropna().astype(int))
+    known_ids.update(int(row['match_id']) for row in rows)
+
+    if RAW_DIR.exists():
+        for path in RAW_DIR.glob('*.json.gz'):
+            try:
+                match_id = int(path.name.removesuffix('.json.gz'))
+            except ValueError:
+                continue
+            if match_id in known_ids:
+                continue
+            try:
+                with gzip.open(path, 'rt', encoding='utf-8') as f:
+                    row = extract_manager_data(match_id, json.load(f))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if row:
+                rows.append(row)
+                known_ids.add(match_id)
+
+    if rows:
+        managers = pd.concat([existing, pd.DataFrame(rows)], ignore_index=True)
+        managers = managers.drop_duplicates(subset=['match_id'], keep='last')
+    else:
+        managers = existing
+
+    if len(managers):
+        managers.to_csv(MANAGERS_FILE, index=False)
+    return managers
+
 
 # FPL short name -> FotMob full name mapping
 FPL_TO_FOTMOB_TEAMS = {
@@ -199,14 +267,15 @@ def extract_match_data(match_id, browser=None):
     if browser:
         match = browser.fetch_match_json(match_id)
         if not match:
-            return None, None, None
+            return None, None, None, None
     else:
         url = f"https://www.fotmob.com/api/data/matchDetails?matchId={match_id}"
         response = requests.get(url, headers=HEADERS)
         if response.status_code != 200:
-            return None, None, None
+            return None, None, None, None
         match = response.json()
     save_raw_match(match_id, match)
+    manager_data = extract_manager_data(match_id, match)
 
     content = match.get('content', {})
     general = match.get('general', {})
@@ -270,7 +339,7 @@ def extract_match_data(match_id, browser=None):
             'is_from_inside_box': shot.get('isFromInsideBox'),
         })
 
-    return match_info, players_data, shots_data
+    return match_info, players_data, shots_data, manager_data
 
 
 def get_season_fixtures(season, browser=None):
@@ -515,6 +584,7 @@ def update_data(gameweeks=None, season=None, auto=False, force=False, verbose=Tr
     all_players = []
     all_shots = []
     all_match_details = []
+    all_managers = []
     failed = []
 
     for i, match in enumerate(matches_to_scrape):
@@ -524,11 +594,15 @@ def update_data(gameweeks=None, season=None, auto=False, force=False, verbose=Tr
         gw = match.get('round', '?')
 
         try:
-            match_info, players_data, shots_data = extract_match_data(match_id, browser=browser)
+            match_info, players_data, shots_data, manager_data = extract_match_data(
+                match_id, browser=browser
+            )
 
             if match_info:
                 match_info['season'] = season
                 all_match_details.append(match_info)
+                if manager_data:
+                    all_managers.append(manager_data)
 
                 for p in players_data:
                     p['season'] = season
@@ -573,6 +647,9 @@ def update_data(gameweeks=None, season=None, auto=False, force=False, verbose=Tr
     # --- Player stats ---
     if PLAYER_STATS_FILE.exists():
         df_players_old = pd.read_csv(PLAYER_STATS_FILE, on_bad_lines='skip')
+        for frame in (df_players_old, df_players_new):
+            frame['match_id'] = pd.to_numeric(frame['match_id'], errors='coerce').astype('Int64')
+            frame['player_id'] = pd.to_numeric(frame['player_id'], errors='coerce').astype('Int64')
         df_players = pd.concat([df_players_old, df_players_new], ignore_index=True)
         df_players = df_players.drop_duplicates(subset=['match_id', 'player_id'], keep='last')
     else:
@@ -599,6 +676,11 @@ def update_data(gameweeks=None, season=None, auto=False, force=False, verbose=Tr
         df_matches = df_matches_new
     df_matches.to_csv(MATCH_DETAILS_FILE, index=False)
     print(f"Saved: {MATCH_DETAILS_FILE} ({len(df_matches)} total matches)")
+
+    # --- Managers and formations ---
+    df_managers = refresh_manager_cache(all_managers)
+    if len(df_managers):
+        print(f"Saved: {MANAGERS_FILE} ({len(df_managers)} total matches)")
 
     # --- Fixtures ---
     df_fix_new = pd.DataFrame(all_fixtures)

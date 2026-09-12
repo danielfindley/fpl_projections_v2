@@ -1,4 +1,5 @@
 """Base model class for FPL prediction models."""
+from ..features import ManagerFeatureMixin
 import pandas as pd
 import numpy as np
 import xgboost as xgb
@@ -6,7 +7,7 @@ from sklearn.metrics import mean_absolute_error, r2_score
 from abc import ABC, abstractmethod
 
 
-class BaseModel(ABC):
+class BaseModel(ManagerFeatureMixin, ABC):
     """Abstract base class for FPL prediction models."""
 
     FEATURES = []
@@ -34,7 +35,7 @@ class BaseModel(ABC):
     
     def _prepare_X(self, df: pd.DataFrame) -> np.ndarray:
         """Prepare feature matrix using selected features if available."""
-        df = df.copy()
+        df = self.manager_features(df)
         features = self.features_to_use
         for feat in features:
             if feat not in df.columns:
@@ -46,6 +47,7 @@ class BaseModel(ABC):
         """Train the model."""
         df = df[df['minutes'] >= 1].copy()
         
+        self.fit_manager_features(df)
         X = self._prepare_X(df)
         y = df[self.TARGET].fillna(0).values
         y = np.clip(y, 0, self._get_y_max())

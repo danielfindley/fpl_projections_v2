@@ -1,11 +1,12 @@
 """Minutes prediction model — two-stage architecture.
 
 AppearClassifier: predicts P(minutes >= 1) — the only model trained on non-appearances
-StarterClassifier: predicts P(starter) via XGBClassifier
+StarterClassifier: predicts P(60+ minutes | appears) via XGBClassifier
 StarterMinutesModel: regressor for 60+ minute players
 SubMinutesModel: regressor for 1-59 minute players
 MinutesModel: backward-compatible wrapper that blends all three
 """
+from ..features import ManagerFeatureMixin, chronological_frame, deadline_splits
 import pandas as pd
 import numpy as np
 import xgboost as xgb
@@ -101,7 +102,7 @@ SUB_FEATURES = [
 ]
 
 
-class AppearClassifier:
+class AppearClassifier(ManagerFeatureMixin):
     """XGBClassifier predicting P(minutes >= 1) — whether a player features at all.
 
     Unlike every other model in the pipeline, this one trains on the calendar grid
@@ -141,7 +142,7 @@ class AppearClassifier:
         return self.selected_features if self.selected_features else self.FEATURES
 
     def _prepare_X(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
+        df = self.manager_features(df)
         for feat in self.features_to_use:
             if feat not in df.columns:
                 df[feat] = 0
@@ -157,14 +158,22 @@ class AppearClassifier:
         refit on everything and the map applied on top.
         """
         y_all = grid[self.TARGET].astype(int).values
+        if not len(y_all):
+            raise ValueError("Appearance training grid is empty")
+        self.calibrator = None
+        self.constant_probability = float(y_all[0]) if len(np.unique(y_all)) == 1 else None
+        if self.constant_probability is not None:
+            self.is_fitted = True
+            return self
         if verbose:
             print(f"  AppearClassifier: {len(grid):,} player-gameweeks, {y_all.mean():.1%} appeared")
 
         seasons = sorted(grid['season'].dropna().unique()) if 'season' in grid.columns else []
-        if len(seasons) >= 2:
+        if len(seasons) >= 2 and grid[grid['season'] != seasons[-1]][self.TARGET].nunique() > 1:
             holdout = seasons[-1]
-            core = grid[grid['season'] != holdout]
-            calib = grid[grid['season'] == holdout]
+            calib = chronological_frame(grid[grid['season'] == holdout])
+            core = chronological_frame(grid[grid['season'] != holdout])
+            core = core[core['result_time'] < calib['forecast_time'].min()]
             scaler = StandardScaler()
             pre = xgb.XGBClassifier(**self.model.get_params())
             pre.fit(scaler.fit_transform(self._prepare_X(core)),
@@ -176,6 +185,7 @@ class AppearClassifier:
             if verbose:
                 print(f"    isotonic calibration fit on {holdout} ({len(calib):,} rows)")
 
+        self.fit_manager_features(grid)
         X_scaled = self.scaler.fit_transform(self._prepare_X(grid))
         self.model.fit(X_scaled, y_all)
         self.is_fitted = True
@@ -192,6 +202,8 @@ class AppearClassifier:
         """Return P(plays >= 1 minute) for each row."""
         if not self.is_fitted:
             raise ValueError("AppearClassifier not fitted")
+        if getattr(self, 'constant_probability', None) is not None:
+            return np.full(len(df), self.constant_probability)
         X = self._prepare_X(df)
         p = self.model.predict_proba(self.scaler.transform(X))[:, 1]
         if self.calibrator is not None:
@@ -199,7 +211,7 @@ class AppearClassifier:
         return np.clip(p, 0.0, 1.0)
 
 
-class StarterClassifier:
+class StarterClassifier(ManagerFeatureMixin):
     """XGBClassifier predicting P(minutes >= 60)."""
 
     FEATURES = ALL_FEATURES
@@ -214,7 +226,6 @@ class StarterClassifier:
             'random_state': 42,
             'min_child_weight': 5,
             'eval_metric': 'logloss',
-            'use_label_encoder': False,
         }
         default_params.update(xgb_params)
         self.model = xgb.XGBClassifier(**default_params)
@@ -226,7 +237,7 @@ class StarterClassifier:
         return self.selected_features if self.selected_features else self.FEATURES
 
     def _prepare_X(self, df: pd.DataFrame) -> np.ndarray:
-        df = df.copy()
+        df = self.manager_features(df)
         features = self.features_to_use
         for feat in features:
             if feat not in df.columns:
@@ -236,6 +247,7 @@ class StarterClassifier:
     def fit(self, df: pd.DataFrame, verbose: bool = True):
         """Train on all players with minutes >= 1. Target: minutes >= 60."""
         df = df[df['minutes'] >= 1].copy()
+        self.fit_manager_features(df)
         X = self._prepare_X(df)
         y = (df['minutes'] >= 60).astype(int).values
         X_scaled = self.scaler.fit_transform(X)
@@ -243,20 +255,24 @@ class StarterClassifier:
         if verbose:
             print(f"  StarterClassifier: {len(X):,} samples, {y.mean():.1%} starters")
 
-        self.model.fit(X_scaled, y)
+        self.constant_probability = float(y[0]) if len(np.unique(y)) == 1 else None
+        if self.constant_probability is None:
+            self.model.fit(X_scaled, y)
         self.is_fitted = True
         return self
 
     def predict_proba(self, df: pd.DataFrame) -> np.ndarray:
-        """Return P(starter) for each row."""
+        """Return P(minutes >= 60 | appears), not lineup-start probability."""
         if not self.is_fitted:
             raise ValueError("StarterClassifier not fitted")
         X = self._prepare_X(df)
         X_scaled = self.scaler.transform(X)
+        if getattr(self, 'constant_probability', None) is not None:
+            return np.full(len(df), self.constant_probability)
         return self.model.predict_proba(X_scaled)[:, 1]
 
 
-class StarterMinutesModel:
+class StarterMinutesModel(ManagerFeatureMixin):
     """Regressor for players who start (minutes >= 60). Output clipped to [60, 90]."""
 
     FEATURES = STARTER_FEATURES
@@ -281,7 +297,7 @@ class StarterMinutesModel:
         return self.selected_features if self.selected_features else self.FEATURES
 
     def _prepare_X(self, df: pd.DataFrame) -> np.ndarray:
-        df = df.copy()
+        df = self.manager_features(df)
         features = self.features_to_use
         for feat in features:
             if feat not in df.columns:
@@ -291,14 +307,18 @@ class StarterMinutesModel:
     def fit(self, df: pd.DataFrame, verbose: bool = True):
         """Train on starters only (minutes >= 60)."""
         df = df[df['minutes'] >= 60].copy()
+        self.constant_minutes = 80.0 if df.empty else None
+        if df.empty:
+            self.is_fitted = True
+            return self
+        self.fit_manager_features(df)
         X = self._prepare_X(df)
         y = df['minutes'].values
         X_scaled = self.scaler.fit_transform(X)
 
-        # Weight toward full-90 games
+        # Fit the state's conditional mean without a full-90 preference.
         weights = np.ones(len(y))
-        weights[y >= 89] = 3.0
-        weights[(y >= 75) & (y < 89)] = 1.5
+        # Uniform weights retain E[minutes | state] for mixture expectations.
 
         if verbose:
             print(f"  StarterMinutesModel: {len(X):,} samples, mean={y.mean():.1f}")
@@ -310,12 +330,14 @@ class StarterMinutesModel:
     def predict(self, df: pd.DataFrame) -> np.ndarray:
         if not self.is_fitted:
             raise ValueError("StarterMinutesModel not fitted")
+        if getattr(self, 'constant_minutes', None) is not None:
+            return np.full(len(df), self.constant_minutes)
         X = self._prepare_X(df)
         X_scaled = self.scaler.transform(X)
         return np.clip(self.model.predict(X_scaled), 60, 90)
 
 
-class SubMinutesModel:
+class SubMinutesModel(ManagerFeatureMixin):
     """Regressor for substitutes (1 <= minutes < 60). Output clipped to [1, 59]."""
 
     FEATURES = SUB_FEATURES
@@ -340,7 +362,7 @@ class SubMinutesModel:
         return self.selected_features if self.selected_features else self.FEATURES
 
     def _prepare_X(self, df: pd.DataFrame) -> np.ndarray:
-        df = df.copy()
+        df = self.manager_features(df)
         features = self.features_to_use
         for feat in features:
             if feat not in df.columns:
@@ -350,6 +372,11 @@ class SubMinutesModel:
     def fit(self, df: pd.DataFrame, verbose: bool = True):
         """Train on subs only (1 <= minutes < 60)."""
         df = df[(df['minutes'] >= 1) & (df['minutes'] < 60)].copy()
+        self.constant_minutes = 20.0 if df.empty else None
+        if df.empty:
+            self.is_fitted = True
+            return self
+        self.fit_manager_features(df)
         X = self._prepare_X(df)
         y = df['minutes'].values
         X_scaled = self.scaler.fit_transform(X)
@@ -364,6 +391,8 @@ class SubMinutesModel:
     def predict(self, df: pd.DataFrame) -> np.ndarray:
         if not self.is_fitted:
             raise ValueError("SubMinutesModel not fitted")
+        if getattr(self, 'constant_minutes', None) is not None:
+            return np.full(len(df), self.constant_minutes)
         X = self._prepare_X(df)
         X_scaled = self.scaler.transform(X)
         return np.clip(self.model.predict(X_scaled), 1, 59)
@@ -389,7 +418,7 @@ class MinutesModel:
             sub_params = params.get('sub_params', {})
         else:
             # Legacy flat params — use for all sub-models
-            cls_params = {k: v for k, v in params.items() if k != 'selected_features'}
+            cls_params = {k: v for k, v in params.items() if k not in ('appear_params',)}
             starter_params = dict(cls_params)
             sub_params = dict(cls_params)
 
@@ -417,6 +446,11 @@ class MinutesModel:
         if verbose:
             print(f"Training MinutesModel (two-stage) on {len(df[df['minutes'] >= 1]):,} samples...")
 
+        if 'started' in df:
+            started = df.loc[pd.to_numeric(df['started'], errors='coerce').eq(1)]
+            self.p60_given_start = float((started['minutes'] >= 60).mean()) if len(started) >= 100 else 0.90
+        else:
+            self.p60_given_start = 0.90
         self.classifier.fit(df, verbose)
         self.starter_model.fit(df, verbose)
         self.sub_model.fit(df, verbose)
@@ -435,48 +469,48 @@ class MinutesModel:
 
         return self
 
-    def predict(self, df: pd.DataFrame, lineup_p_start: np.ndarray = None,
-                lineup_weight: float = 0.7) -> np.ndarray:
-        """Blend predictions: P(start)*starter_pred + (1-P(start))*sub_pred, then cap.
+    def predict_distribution(self, df: pd.DataFrame, lineup_p_start=None,
+                             lineup_weight: float = 0.7, appear_prob=None,
+                             availability=None):
+        """Joint probabilities for absent, 1-59 minutes and 60-90 minutes.
 
-        ``lineup_p_start`` optionally supplies P(starts) from a predicted-lineup feed,
-        NaN where the feed says nothing. Two things change for those rows:
-
-        - P(start) comes from the feed instead of the classifier, which at a season
-          opener knows far more than three-month-old rolling form does.
-        - A confirmed starter skips the cold-start cap. That cap exists to stop the
-          model over-trusting a stale appearance, but a feed naming the player in the
-          XI is strictly better evidence than the heuristic it stands in for, and it
-          otherwise pins players to minutes_roll5 * 1.2 regardless.
-
-        Hedging happens on minutes rather than on P(start), because _sharpen is close
-        to a step function — blending probabilities barely moves the result, so a
-        wrong feed would be committed to in full.
+        The classifier estimates P(60+ | appears); a lineup feed estimates
+        P(start). Convert the latter to a joint 60+ prior with a completion rate,
+        then blend whole distributions. A probable starter must also be probable
+        to appear. Injury/suspension availability discounts the mixture once.
         """
         if not self.is_fitted:
-            raise ValueError("Model not fitted")
+            raise ValueError("MinutesModel not fitted")
+        if not 0 <= lineup_weight <= 1:
+            raise ValueError("lineup_weight must lie in [0, 1]")
+        if appear_prob is None:
+            appear_prob = self.predict_appear_proba(df) if self.appear_is_fitted else np.ones(len(df))
+        appear = np.clip(np.asarray(appear_prob, dtype=float), 0, 1)
+        p60_joint = appear * np.clip(self.classifier.predict_proba(df), 0, 1)
+        if lineup_p_start is not None:
+            lineup = np.asarray(lineup_p_start, dtype=float)
+            have = np.isfinite(lineup)
+            starts = np.clip(lineup, 0, 1)
+            feed_appear = np.maximum(appear, starts)
+            feed_sixty = starts * getattr(self, 'p60_given_start', 0.90)
+            p60_joint = np.where(have,
+                (1 - lineup_weight) * p60_joint + lineup_weight * feed_sixty, p60_joint)
+            appear = np.where(have,
+                (1 - lineup_weight) * appear + lineup_weight * feed_appear, appear)
+        if availability is not None:
+            available = np.clip(np.asarray(availability, dtype=float), 0, 1)
+            appear, p60_joint = appear * available, p60_joint * available
+        probability = np.column_stack([1 - appear, appear - p60_joint, p60_joint])
+        state_minutes = np.column_stack([np.zeros(len(df)), self.sub_model.predict(df),
+                                        self.starter_model.predict(df)])
+        return probability, state_minutes
 
-        preds = np.clip(self._apply_caps(df, self._blend(df)), 1, 90)
-        if lineup_p_start is None:
-            return preds
-
-        lineup_p_start = np.asarray(lineup_p_start, dtype=float)
-        have = ~np.isnan(lineup_p_start)
-        if not have.any():
-            return preds
-
-        p_start = np.where(have, lineup_p_start, self.classifier.predict_proba(df))
-        p_sharp = self._sharpen(p_start, temp=0.3)
-        raw = np.clip(p_sharp * self.starter_model.predict(df)
-                      + (1 - p_sharp) * self.sub_model.predict(df), 1, 90)
-        capped = np.clip(self._apply_caps(df, raw.copy()), 1, 90)
-        starts = have & (lineup_p_start >= 0.5)
-        lineup_preds = np.where(starts, raw, capped)
-
-        out = preds.copy()
-        out[have] = (lineup_weight * lineup_preds[have]
-                     + (1 - lineup_weight) * preds[have])
-        return np.clip(out, 1, 90)
+    def predict(self, df: pd.DataFrame, lineup_p_start=None, lineup_weight: float = 0.7):
+        """E[minutes | appears], using the same mixture as points and simulation."""
+        probability, minutes = self.predict_distribution(df, lineup_p_start, lineup_weight)
+        appear = 1 - probability[:, 0]
+        return np.divide(np.sum(probability * minutes, axis=1), appear,
+                         out=np.zeros(len(df)), where=appear > 0)
 
     def predict_appear_proba(self, df: pd.DataFrame) -> np.ndarray:
         """P(plays >= 1 minute). Complements predict(), which is E[minutes | appears]."""
@@ -487,53 +521,7 @@ class MinutesModel:
         return self.appear_model.predict_proba(df)
 
     def _blend(self, df: pd.DataFrame) -> np.ndarray:
-        """Sigmoid-sharpened blend: push P(start) toward 0/1 before weighting."""
-        p_start = self.classifier.predict_proba(df)
-        p_sharp = self._sharpen(p_start, temp=0.3)
-        starter_preds = self.starter_model.predict(df)
-        sub_preds = self.sub_model.predict(df)
-        return p_sharp * starter_preds + (1 - p_sharp) * sub_preds
-
-    @staticmethod
-    def _sharpen(p: np.ndarray, temp: float = 0.3) -> np.ndarray:
-        """Sharpen probabilities via sigmoid with temperature scaling."""
-        p_clipped = np.clip(p, 1e-6, 1 - 1e-6)
-        logit = np.log(p_clipped / (1 - p_clipped))
-        return 1 / (1 + np.exp(-logit / temp))
-
-    def _apply_caps(self, df: pd.DataFrame, preds: np.ndarray) -> np.ndarray:
-        """Apply season-based capping logic (preserved from original)."""
-        preds = preds.copy()
-
-        current_season_mins = df['current_season_minutes'].fillna(0).values
-        current_season_apps = df['current_season_apps'].fillna(0).values
-        current_season_mins_per_app = df['current_season_mins_per_app'].fillna(0).values
-        roll5 = df['minutes_roll5'].fillna(60).values
-        # gw gap is 0-filled upstream, so 0 = no prior appearance; real gaps are >= 1
-        gw_gap = df['gw_gap_since_last_appearance'].fillna(0).values if 'gw_gap_since_last_appearance' in df.columns else np.zeros(len(preds))
-
-        for i in range(len(preds)):
-            if current_season_apps[i] == 0:
-                # Season opener for a recently active player (e.g. played the end
-                # of last season): trust rolling form instead of the cold-start cap
-                if 1 <= gw_gap[i] <= 3 and roll5[i] > 0:
-                    preds[i] = min(preds[i], max(roll5[i] * 1.2, 30))
-                else:
-                    preds[i] = min(preds[i], 30)
-            elif current_season_apps[i] >= 1 and current_season_mins[i] < 90:
-                max_reasonable = max(current_season_mins_per_app[i] * 1.2, 15)
-                preds[i] = min(preds[i], max_reasonable)
-            elif current_season_apps[i] >= 3:
-                max_reasonable = min(90, current_season_mins_per_app[i] * 1.2)
-                preds[i] = min(preds[i], max(max_reasonable, 30))
-
-            if current_season_apps[i] >= 5 and current_season_mins_per_app[i] >= 80:
-                if roll5[i] >= 80:
-                    preds[i] = max(preds[i], 88)
-                elif roll5[i] >= 70:
-                    preds[i] = max(preds[i], 80)
-
-        return preds
+        return self.predict(df)
 
     def feature_importance(self) -> pd.DataFrame:
         """Return classifier feature importances."""

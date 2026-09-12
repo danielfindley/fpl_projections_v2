@@ -6,6 +6,7 @@ training data (merged via merge_fpl_card_data() in load_data()).
 
 Red cards are predicted via fouls regression (too rare for direct classification).
 """
+from ..features import ManagerFeatureMixin
 import pandas as pd
 import numpy as np
 import xgboost as xgb
@@ -16,7 +17,7 @@ from sklearn.metrics import log_loss
 RED_PER_FOUL = 0.004
 
 
-class CardsModel:
+class CardsModel(ManagerFeatureMixin):
     """Predicts yellow card probability via binary classifier, red via fouls."""
 
     FEATURES = [
@@ -91,7 +92,7 @@ class CardsModel:
         return self.selected_features if self.selected_features else self.FEATURES
 
     def _prepare_X(self, df: pd.DataFrame, features: list = None) -> np.ndarray:
-        df = df.copy()
+        df = self.manager_features(df)
         features = features or self.features_to_use
         for feat in features:
             if feat not in df.columns:
@@ -127,6 +128,7 @@ class CardsModel:
         df_yc = df[df['yellow_cards'].notna()].copy()
 
         features = self.features_to_use
+        self.fit_manager_features(df_yc)
         X = self._prepare_X(df_yc, features)
         # Binary 0/1 per match (DGW rows already excluded as NaN upstream)
         y = np.clip(df_yc['yellow_cards'].astype(int).values, 0, 1)
@@ -168,6 +170,7 @@ class CardsModel:
     def _fit_fouls_model(self, df: pd.DataFrame, verbose: bool):
         """Train fouls regression model (used for red card prediction only)."""
         features = self._FOULS_FEATURES
+        # Reuse the yellow model's training-only PCA basis for both estimators.
         X = self._prepare_X(df, features)
         y = np.clip(df['fouls_committed_per90'].fillna(0).values, 0, 6.0)
         weights = df['minutes'].values / df['minutes'].mean()

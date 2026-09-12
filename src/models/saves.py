@@ -3,6 +3,7 @@
 Predicts saves_per90 for goalkeepers, then converts to expected saves
 and FPL save points (1 point per 3 saves).
 """
+from ..features import ManagerFeatureMixin
 import pandas as pd
 import numpy as np
 import xgboost as xgb
@@ -10,7 +11,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error
 
 
-class SavesModel:
+class SavesModel(ManagerFeatureMixin):
     """Predicts saves per 90 for goalkeepers."""
 
     FEATURES = [
@@ -65,7 +66,7 @@ class SavesModel:
         return self.selected_features if self.selected_features else self.FEATURES
 
     def _prepare_X(self, df: pd.DataFrame) -> np.ndarray:
-        df = df.copy()
+        df = self.manager_features(df)
         features = self.features_to_use
         for feat in features:
             if feat not in df.columns:
@@ -76,6 +77,7 @@ class SavesModel:
         """Train on goalkeepers who played 1+ minutes."""
         df = df[(df['minutes'] >= 1) & (df['is_gk'] == 1)].copy()
 
+        self.fit_manager_features(df)
         X = self._prepare_X(df)
         y = np.clip(df[self.TARGET].fillna(0).values, 0, 12.0)
 

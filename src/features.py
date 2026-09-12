@@ -1,6 +1,7 @@
 """
 Feature engineering for FPL prediction.
-All rolling features use shift(1) to prevent data leakage.
+Rolling statistics read only results completed before each forecast deadline.
+This is the timestamp-aware equivalent of shift(1), including double gameweeks.
 """
 import pandas as pd
 import numpy as np
@@ -43,6 +44,159 @@ SEASON_STAT_WINDOW = 10
 SEASON_STAT_MIN_GAMES = 5
 
 
+def chronological_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Attach match times and the information deadline for each gameweek.
+
+    Historical rows use actual kickoff times. The boundary defaults to 90 minutes
+    before a gameweek's earliest kickoff (an explicit forecast_time wins); postponed results cannot enter earlier
+    training windows. Small synthetic/unit-test frames may use season/GW order.
+    """
+    out = df.copy()
+    if 'match_date' not in out:
+        out['match_date'] = pd.NaT
+    dates = pd.to_datetime(out['match_date'], errors='coerce', utc=True)
+    years = out['season'].astype(str).str[:4].astype(int)
+    fallback = pd.to_datetime(years.astype(str) + '-07-01', utc=True)
+    fallback += pd.to_timedelta(pd.to_numeric(out['gameweek']).fillna(0) * 7, unit='D')
+    out['match_date'] = dates.fillna(fallback)
+    if 'forecast_time' not in out:
+        out['forecast_time'] = (out.groupby(['season', 'gameweek'])['match_date'].transform('min') - pd.Timedelta(minutes=90))
+    out['forecast_time'] = pd.to_datetime(out['forecast_time'], utc=True).fillna(
+        out.groupby(['season', 'gameweek'])['match_date'].transform('min'))
+    if 'result_time' not in out:
+        out['result_time'] = out['match_date'] + pd.Timedelta(hours=3)
+    out['result_time'] = pd.to_datetime(out['result_time'], utc=True).fillna(
+        out['match_date'] + pd.Timedelta(hours=3))
+    return out
+
+
+def deadline_splits(df: pd.DataFrame, n_splits: int = 5):
+    """Expanding folds of whole forecast deadlines, purged of unplayed results."""
+    from sklearn.model_selection import TimeSeriesSplit
+    frame = chronological_frame(df)
+    deadlines = np.sort(frame['forecast_time'].unique())
+    if len(deadlines) < 3:
+        return
+    splitter = TimeSeriesSplit(n_splits=min(n_splits, len(deadlines) - 1))
+    for train_blocks, valid_blocks in splitter.split(deadlines):
+        cutoff = deadlines[valid_blocks[0]]
+        train = frame['forecast_time'].isin(deadlines[train_blocks])
+        train &= frame['result_time'] < cutoff
+        valid = frame['forecast_time'].isin(deadlines[valid_blocks])
+        ti, vi = np.flatnonzero(train), np.flatnonzero(valid)
+        if len(ti) and len(vi):
+            yield ti, vi
+
+
+def freeze_prior_features(frame: pd.DataFrame, group: str, columns: list) -> pd.DataFrame:
+    """Read shifted historical state at the deadline, not at a later kickoff.
+
+    Each selected column already excludes its own match. The first match at or
+    after the deadline therefore carries exactly the available historical state.
+    This also prevents one DGW fixture from becoming history for the other.
+    """
+    if not columns or 'match_date' not in frame:
+        return frame
+    out = frame.copy()
+    for _, part in out.groupby(group, sort=False):
+        ordered = part.sort_values('match_date', kind='stable')
+        times = ordered['match_date'].astype('int64').to_numpy()
+        cutoffs = pd.to_datetime(part['forecast_time'], utc=True).astype('int64').to_numpy()
+        source = np.searchsorted(times, cutoffs, side='left').clip(0, len(times) - 1)
+        out.loc[part.index, columns] = ordered.iloc[source][columns].to_numpy()
+    return out
+
+
+def prior_stat(frame, group, source, window=None, aggregation='mean', min_periods=1, span=None):
+    """Aggregate completed observations strictly before each row's deadline."""
+    if not {'match_date', 'forecast_time', 'result_time'} <= set(frame.columns):
+        frame = chronological_frame(frame)
+    groups = [group] if isinstance(group, str) else list(group)
+    frame = frame[list(dict.fromkeys(groups + [source, 'result_time', 'forecast_time']))]
+    result = pd.Series(np.nan, index=frame.index, dtype=float)
+    for _, part in frame.groupby(group, sort=False):
+        ordered = part.sort_values('result_time', kind='stable')
+        values = pd.to_numeric(ordered[source], errors='coerce')
+        if aggregation == 'last':
+            state = values
+        else:
+            rolling = (values.ewm(span=span, min_periods=min_periods) if span else
+                       values.rolling(window, min_periods=min_periods) if window else
+                       values.expanding(min_periods=min_periods))
+            state = getattr(rolling, aggregation)()
+        times = ordered['result_time'].astype('int64').to_numpy()
+        cutoffs = part['forecast_time'].astype('int64').to_numpy()
+        previous = np.searchsorted(times, cutoffs, side='left') - 1
+        available = previous >= 0
+        result.loc[part.index[available]] = state.iloc[previous[available]].to_numpy()
+    return result
+
+
+def prior_exposure_rate(frame, group, source, window, cap=None, min_periods=1):
+    """Per-90 rate from pooled prior exposure: 90 * sum(stat) / sum(minutes).
+
+    Averaging match-level per-90 values lets a short cameo carry the same weight as
+    a full match. This keeps the same deadline-aware observation window as
+    ``prior_stat`` while weighting every action by the minutes that produced it.
+    """
+    if not {'match_date', 'forecast_time', 'result_time'} <= set(frame.columns):
+        frame = chronological_frame(frame)
+    groups = [group] if isinstance(group, str) else list(group)
+    columns = list(dict.fromkeys(groups + [source, 'minutes', 'result_time', 'forecast_time']))
+    working = frame[columns]
+    result = pd.Series(np.nan, index=working.index, dtype=float)
+    for _, part in working.groupby(group, sort=False):
+        ordered = part.sort_values('result_time', kind='stable')
+        raw_values = pd.to_numeric(ordered[source], errors='coerce')
+        valid = raw_values.notna()
+        values = raw_values.where(valid)
+        minutes = pd.to_numeric(ordered['minutes'], errors='coerce').clip(lower=0).where(valid)
+        numerator = values.rolling(window, min_periods=min_periods).sum()
+        denominator = minutes.rolling(window, min_periods=min_periods).sum()
+        rate = 90 * numerator / denominator.replace(0, np.nan)
+        times = ordered['result_time'].astype('int64').to_numpy()
+        cutoffs = part['forecast_time'].astype('int64').to_numpy()
+        previous = np.searchsorted(times, cutoffs, side='left') - 1
+        available = previous >= 0
+        result.loc[part.index[available]] = rate.iloc[previous[available]].to_numpy()
+    if cap is not None:
+        result = result.clip(upper=cap)
+    return result
+
+
+class ManagerFeatureMixin:
+    """Fit the manager PCA only on a model's training rows; reuse at inference."""
+
+    def fit_manager_features(self, df):
+        from sklearn.decomposition import PCA
+        from sklearn.preprocessing import StandardScaler
+        columns = sorted(c for c in df if c.startswith('manager_raw_'))
+        self.manager_basis = None
+        if columns:
+            valid = df.get('manager_prior_games', pd.Series(0, index=df.index)) >= MANAGER_EMB_MIN_GAMES
+            # Managers shared by many player rows must not gain extra PCA weight.
+            x = df.loc[valid, columns].fillna(0).drop_duplicates()
+            if len(x) >= MANAGER_EMB_DIM and len(columns) >= MANAGER_EMB_DIM:
+                scaler = StandardScaler().fit(x)
+                pca = PCA(n_components=MANAGER_EMB_DIM, svd_solver='full').fit(scaler.transform(x))
+                self.manager_basis = (columns, scaler, pca)
+        return self
+
+    def manager_features(self, df):
+        out = df.copy()
+        if not any(c.startswith('manager_raw_') for c in out):
+            return out
+        values = np.zeros((len(out), MANAGER_EMB_DIM))
+        basis = getattr(self, 'manager_basis', None)
+        if basis is not None:
+            columns, scaler, pca = basis
+            x = out.reindex(columns=columns).fillna(0)
+            values = pca.transform(scaler.transform(x))
+            valid = out.get('manager_prior_games', pd.Series(0, index=out.index)) >= MANAGER_EMB_MIN_GAMES
+            values[~valid.to_numpy()] = 0
+        out[MANAGER_EMB_COLS] = values
+        return out
+
 def promoted_team_seasons(df, team_col='team_norm', season_col='season'):
     """(team, season) pairs where the club was absent from the PL the season before.
 
@@ -76,107 +230,98 @@ MIN_MINUTES_FOR_PER90 = 20
 
 
 def _compute_calendar_minutes_features(df: pd.DataFrame,
-                                       include_appeared: bool = False) -> pd.DataFrame:
-    """Build a complete (player_id, season, gameweek) timeline filling missed gameweeks
-    with 0 minutes, then compute calendar-aware minutes / starter / full-90 rolling features
-    plus weeks-since-last-appearance.
+                                       include_appeared: bool = False,
+                                       per_fixture: bool = False,
+                                       roster_spells: pd.DataFrame = None) -> pd.DataFrame:
+    """Playing-time history on scheduled fixtures, including non-appearances.
 
-    Returns a DataFrame keyed by (player_id, season, gameweek) with the new feature columns.
-    Use to replace the appearances-only versions, which over-credit players with sparse
-    appearances (e.g., a player who started one match 7 GWs ago looks identical to a
-    regular starter in the appearance-only rolling).
-
-    With ``include_appeared``, the 0-minute rows are kept along with the ``appeared``
-    flag so the grid can be used as a training set for P(appears). The default drops
-    it: on played rows ``appeared`` is always 1, so merging it back would add a
-    constant column and leak the target into the per-match feature frame.
+    Explicit registration intervals can be supplied through roster_spells (or
+    df.attrs['roster_spells']): player_id, team, season, start_date, end_date.
+    Without them, membership starts with the first observed squad appearance and
+    continues until a known transfer or the club's last observed fixture. This
+    keeps terminal injury/rotation absences; unobserved transfers remain unknown.
+    Blank gameweeks have no fixture and are not labeled as selection failures.
     """
-    base = df[['player_id', 'season', 'gameweek', 'minutes']].copy()
-    base['minutes'] = pd.to_numeric(base['minutes'], errors='coerce').fillna(0)
-    base['was_starter'] = (base['minutes'] >= 60).astype(int)
-    base['was_full_90'] = (base['minutes'] >= 89).astype(int)
-    base['appeared'] = (base['minutes'] > 0).astype(int)
-
-    # Aggregate DGW (multiple matches in one gameweek) to a single calendar entry.
-    agg = base.groupby(['player_id', 'season', 'gameweek'], as_index=False).agg(
-        minutes=('minutes', 'sum'),
-        was_starter=('was_starter', 'max'),
-        was_full_90=('was_full_90', 'max'),
-        appeared=('appeared', 'max'),
-    )
-
-    bounds = agg.groupby(['player_id', 'season'], as_index=False).agg(
-        gw_min=('gameweek', 'min'),
-        gw_max=('gameweek', 'max'),
-    )
-
-    grids = []
-    for _, b in bounds.iterrows():
-        gws = np.arange(int(b['gw_min']), int(b['gw_max']) + 1)
-        grids.append(pd.DataFrame({
-            'player_id': b['player_id'],
-            'season': b['season'],
-            'gameweek': gws,
-        }))
-    if not grids:
-        return pd.DataFrame(columns=['player_id', 'season', 'gameweek'])
-    grid = pd.concat(grids, ignore_index=True)
-
-    grid = grid.merge(agg, on=['player_id', 'season', 'gameweek'], how='left')
-    grid['minutes'] = grid['minutes'].fillna(0)
-    grid['was_starter'] = grid['was_starter'].fillna(0).astype(int)
-    grid['was_full_90'] = grid['was_full_90'].fillna(0).astype(int)
-    grid['appeared'] = grid['appeared'].fillna(0).astype(int)
-
-    grid = grid.sort_values(['player_id', 'season', 'gameweek']).reset_index(drop=True)
-    # Rolling state carries across seasons: at GW1 a player's features come from
-    # the end of their previous season instead of resetting to zero.
-    g = grid.groupby('player_id')
-
-    grid['last_minutes'] = g['minutes'].shift(1)
-    grid['last_was_starter'] = g['was_starter'].shift(1).fillna(0)
-    grid['last_was_full_90'] = g['was_full_90'].shift(1).fillna(0)
-
+    frame = chronological_frame(df)
+    spells = roster_spells if roster_spells is not None else df.attrs.get('roster_spells')
+    frame.attrs = {k: v for k, v in frame.attrs.items() if k != 'roster_spells'}
+    keys = ['player_id', 'season', 'gameweek']
+    if {'team', 'match_id'} <= set(frame.columns):
+        timing = ['match_id', 'season', 'gameweek', 'match_date', 'forecast_time', 'result_time']
+        schedule = frame[['team'] + timing].drop_duplicates(['team', 'match_id'])
+        schedule = schedule.sort_values('match_date')
+        if spells is None:
+            records = []
+            for (player, season), history in frame.groupby(['player_id', 'season'], sort=False):
+                history = history.sort_values('match_date').drop_duplicates('match_id')
+                changes = history['team'].ne(history['team'].shift())
+                starts = history.loc[changes, ['team', 'match_date']]
+                for i, (_, row) in enumerate(starts.iterrows()):
+                    end_date = (starts.iloc[i + 1]['match_date'] if i + 1 < len(starts)
+                                else schedule.loc[schedule['season'].eq(season), 'result_time'].max()
+                                + pd.Timedelta(days=1))
+                    records.append(dict(player_id=player, season=season, team=row['team'],
+                                        start_date=row['match_date'], end_date=end_date))
+            spells = pd.DataFrame(records)
+        spells = pd.DataFrame(spells)
+        grids = []
+        for _, spell in spells.iterrows():
+            start_date = pd.to_datetime(spell['start_date'], utc=True)
+            end_date = pd.to_datetime(spell.get('end_date'), utc=True)
+            eligible = schedule['team'].eq(spell['team']) & schedule['season'].eq(spell['season'])
+            eligible &= schedule['match_date'].ge(start_date)
+            if pd.notna(end_date):
+                eligible &= schedule['match_date'].lt(end_date)
+            part = schedule.loc[eligible].copy()
+            part['player_id'] = spell['player_id']
+            grids.append(part)
+        if not grids:
+            return pd.DataFrame(columns=keys + ['match_id', 'appeared'])
+        grid = pd.concat(grids, ignore_index=True).drop_duplicates(['player_id', 'match_id'])
+        actual = frame.groupby(['player_id', 'match_id'], as_index=False)['minutes'].max()
+        grid = grid.merge(actual, on=['player_id', 'match_id'], how='left', validate='one_to_one')
+    else:
+        # Compatibility for weekly input without a fixture table.
+        actual = frame.groupby(keys, as_index=False)['minutes'].max()
+        grids = []
+        for (player, season), part in actual.groupby(['player_id', 'season']):
+            grids.append(pd.DataFrame({'player_id': player, 'season': season,
+                                       'gameweek': range(int(part.gameweek.min()), int(part.gameweek.max()) + 1)}))
+        grid = chronological_frame(pd.concat(grids, ignore_index=True).merge(actual, on=keys, how='left'))
+    grid['minutes'] = pd.to_numeric(grid['minutes'], errors='coerce').fillna(0).clip(0, 90)
+    grid = grid.sort_values(['player_id', 'match_date'], kind='stable').reset_index(drop=True)
+    grid['was_starter'] = (grid['minutes'] >= 60).astype(int)
+    grid['was_full_90'] = (grid['minutes'] >= 89).astype(int)
+    grid['appeared'] = (grid['minutes'] > 0).astype(int)
+    for source, dest in [('minutes', 'last_minutes'), ('was_starter', 'last_was_starter'),
+                         ('was_full_90', 'last_was_full_90')]:
+        grid[dest] = prior_stat(grid, 'player_id', source, aggregation='last').fillna(0)
     for window in ROLLING_WINDOWS:
-        grid[f'minutes_roll{window}'] = g['minutes'].transform(
-            lambda x: x.shift(1).rolling(window, min_periods=1).mean()
-        )
-        grid[f'starter_rate_roll{window}'] = g['was_starter'].transform(
-            lambda x: x.shift(1).rolling(window, min_periods=1).mean()
-        )
-        grid[f'full90_rate_roll{window}'] = g['was_full_90'].transform(
-            lambda x: x.shift(1).rolling(window, min_periods=1).mean()
-        )
-
-    # Weeks since last appearance, on a cross-season ordinal (seasons stacked at
-    # 38 GWs) so GW38 -> GW1 of the next season counts as a gap of 1.
-    season_rank = {s: i for i, s in enumerate(sorted(grid['season'].dropna().unique()))}
-    ordinal = grid['season'].map(season_rank) * 38 + pd.to_numeric(grid['gameweek'], errors='coerce')
-    last_app_ord = ordinal.where(grid['appeared'] == 1)
-    grid['_last_app_ord'] = last_app_ord.groupby(grid['player_id']).transform(
-        lambda x: x.shift(1).ffill()
-    )
-    grid['gw_gap_since_last_appearance'] = ordinal - grid['_last_app_ord']
-
-    # The ordinal stacks seasons end-to-end, so GW38 -> GW1 is a gap of 1 and the
-    # model cannot distinguish "started last week" from "started before a
-    # three-month summer break". This flag marks rows whose carried-over rolling
-    # form crossed a season boundary, so trees can learn to discount last_minutes /
-    # minutes_roll* there instead of treating May form as current.
-    grid['last_app_prev_season'] = (
-        ((grid['_last_app_ord'] - 1) // 38) < ((ordinal - 1) // 38)
-    ).fillna(False).astype(int)
-
+        for source, prefix in [('minutes', 'minutes'), ('was_starter', 'starter_rate'),
+                               ('was_full_90', 'full90_rate')]:
+            grid[f'{prefix}_roll{window}'] = prior_stat(grid, 'player_id', source, window).fillna(0)
+    year = grid['season'].str[:4].astype(int)
+    grid['_ordinal'] = (year * 38 + grid['gameweek']).where(grid['appeared'].eq(1))
+    grid['_app_year'] = year.where(grid['appeared'].eq(1))
+    # Forward fill is historical within a player, then read at the deadline.
+    grid['_ordinal'] = grid.groupby('player_id')['_ordinal'].ffill()
+    grid['_app_year'] = grid.groupby('player_id')['_app_year'].ffill()
+    last = prior_stat(grid, 'player_id', '_ordinal', aggregation='last')
+    last_year = prior_stat(grid, 'player_id', '_app_year', aggregation='last')
+    grid['gw_gap_since_last_appearance'] = (year * 38 + grid['gameweek'] - last).fillna(0)
+    grid['last_app_prev_season'] = (last_year < year).fillna(False).astype(int)
     feature_cols = (
         ['last_minutes', 'last_was_starter', 'last_was_full_90',
          'gw_gap_since_last_appearance', 'last_app_prev_season']
         + [f'minutes_roll{w}' for w in ROLLING_WINDOWS]
         + [f'starter_rate_roll{w}' for w in ROLLING_WINDOWS]
-        + [f'full90_rate_roll{w}' for w in ROLLING_WINDOWS]
-    )
+        + [f'full90_rate_roll{w}' for w in ROLLING_WINDOWS])
     if include_appeared:
-        feature_cols = feature_cols + ['appeared']
-    return grid[['player_id', 'season', 'gameweek'] + feature_cols]
+        feature_cols += ['appeared']
+    extra = [c for c in ['match_id', 'team', 'match_date', 'forecast_time', 'result_time'] if c in grid]
+    if per_fixture:
+        return grid[keys + extra + feature_cols]
+    return grid[keys + feature_cols].drop_duplicates(keys, keep='first')
 
 
 # Features the appearance model trains on. Restricted to the calendar grid, which is
@@ -192,20 +337,13 @@ APPEARANCE_FEATURES = (
 
 
 def build_appearance_grid(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
-    """Training set for P(appears): one row per (player, season, gameweek) the player
-    was at a Premier League club, including the weeks they did not play.
+    """One eligible player-fixture row, including terminal non-appearances.
 
-    The per-match frame only ever contains games a player featured in, so no model in
-    the pipeline currently sees a single non-appearance. This grid restores them.
-
-    Span is each player's first-to-last appearance within a season, which keeps
-    rotation calls and mid-season injury gaps (a player appearing in GW1 and GW30 has
-    every intervening blank) while excluding weeks before a mid-season signing arrived
-    or after a departure — weeks they could not have been picked by anyone.
-
-    Target column is ``appeared`` (minutes > 0).
+    Uses registered intervals if supplied, otherwise observed club spells. A
+    blank gameweek is not a fixture. Unknown departures/registration dates cannot
+    be recovered from appearances alone; see _compute_calendar_minutes_features.
     """
-    grid = _compute_calendar_minutes_features(df, include_appeared=True)
+    grid = _compute_calendar_minutes_features(df, include_appeared=True, per_fixture=True)
 
     # Drop each player-season's opening row. The span starts at their first appearance,
     # so that row always has appeared == 1 — and it carries the cross-season gap, the
@@ -214,13 +352,14 @@ def build_appearance_grid(df: pd.DataFrame, verbose: bool = True) -> pd.DataFram
     # keeps long gaps associated only with genuine mid-season absences.
     first = grid.groupby(['player_id', 'season'])['gameweek'].transform('min')
     n_before = len(grid)
-    grid = grid[grid['gameweek'] > first].copy()
+    if df.attrs.get('roster_spells') is None:
+        grid = grid[grid['gameweek'] > first].copy()
 
     # Position is a player attribute, not a per-match one; carry it over from any
     # match row so the grid's 0-minute weeks still get position dummies.
     pos_cols = [c for c in ('is_gk', 'is_def', 'is_mid', 'is_fwd') if c in df.columns]
     if pos_cols:
-        pos = df.groupby('player_id')[pos_cols].max().reset_index()
+        pos = df.sort_values(['season', 'gameweek']).groupby('player_id')[pos_cols].first().reset_index()
         grid = grid.merge(pos, on='player_id', how='left')
     for c in ('is_gk', 'is_def', 'is_mid', 'is_fwd'):
         if c not in grid.columns:
@@ -297,24 +436,13 @@ def add_manager_embeddings(
     min_games: int = MANAGER_EMB_MIN_GAMES,
     verbose: bool = True,
 ) -> pd.DataFrame:
-    """Append leak-free manager embedding features to df (one set per (match_id, team) row).
+    """Build manager raw priors using results strictly before each deadline.
 
-    Pipeline:
-      1. Load manager-per-match cache (data/match_managers.csv) and match_details.
-      2. Build per (manager, match) feature vector: minute-distribution stats, GF/GA,
-         formation breakdown.
-      3. Sort each manager's matches chronologically; rolling-mean over the prior
-         `window` games (shift(1) — strictly prior — so the current game's outcome
-         never leaks into its own embedding).
-      4. Standardize + fit PCA(n_components) on rows with >= min_games prior history.
-      5. Transform every row; managers below the threshold get a zero vector.
-      6. For synthetic future-match rows in df, assume the team's most recent
-         manager and compute their embedding from the latest `window` real games.
-      7. Merge `manager_emb_0..n-1` onto df by (match_id, team).
+    Manager identity comes from the team's latest completed match. Raw playing
+    style, formation and minute-distribution averages are retained; each model
+    fits and saves its own scaler/PCA using only its training window. The zero
+    embedding columns are placeholders, not a globally fitted projection.
     """
-    from sklearn.decomposition import PCA
-    from sklearn.preprocessing import StandardScaler
-
     data_path = Path(data_dir)
     mm_path = data_path / 'match_managers.csv'
     md_path = data_path / 'matches' / 'match_details.csv'
@@ -403,89 +531,31 @@ def add_manager_embeddings(
             & mt['mins_mean'].notna()].copy()
     mt['manager_id'] = mt['manager_id'].astype('int64')
 
-    # Sort each manager chronologically; ties broken by match_id
-    mt = mt.sort_values(['manager_id', 'match_date', 'match_id']).reset_index(drop=True)
-
-    # Rolling mean of prior `window` games (shift(1) for strict leak-freedom)
-    g = mt.groupby('manager_id', group_keys=False)
-    n_prior = g.cumcount()
-    mt['n_prior_games'] = n_prior.values
-    rolled = pd.DataFrame(index=mt.index)
-    for col in feat_cols:
-        rolled[col] = g[col].apply(
-            lambda s: s.shift(1).rolling(window, min_periods=1).mean()
-        ).values
-
-    valid_mask = (mt['n_prior_games'] >= min_games).values
-    X_valid = rolled.loc[valid_mask, feat_cols].fillna(0.0).values
-
-    if X_valid.shape[0] < n_components:
-        if verbose:
-            print(f"  [manager_emb] Only {X_valid.shape[0]} valid rows, skipping PCA")
-        for c in MANAGER_EMB_COLS[:n_components]:
-            df[c] = 0.0
-        return df
-
-    scaler = StandardScaler()
-    X_valid_scaled = scaler.fit_transform(X_valid)
-    pca = PCA(n_components=n_components)
-    pca.fit(X_valid_scaled)
-
-    X_all = rolled[feat_cols].fillna(0.0).values
-    X_all_scaled = scaler.transform(X_all)
-    emb_all = pca.transform(X_all_scaled)
-    emb_all[~valid_mask] = 0.0
-
-    for i in range(n_components):
-        mt[f'manager_emb_{i}'] = emb_all[:, i]
-
-    # Embeddings for synthetic future rows (match_ids absent from cache).
-    # For each team, look up the most recent manager and their up-to-date rolled
-    # feature vector (no shift since it's "current state").
-    df_matches = set(df['match_id'].dropna().unique())
-    cache_matches = set(mt['match_id'].unique())
-    synth_matches = df_matches - cache_matches
-    synth_rows = []
-    if synth_matches:
-        # Latest known manager per team (by match_date)
-        team_latest_mgr = (
-            mt.sort_values(['team', 'match_date'])
-              .groupby('team').tail(1)[['team', 'manager_id']]
-              .set_index('team')['manager_id']
-              .to_dict()
-        )
-        # Per-manager "current" rolled feature vector: mean of their latest `window`
-        # real games (no shift — represents now).
-        cur_per_mgr = (
-            mt.groupby('manager_id', group_keys=False)
-              .apply(lambda g: g.tail(window)[feat_cols].mean())
-        )
-        cur_n = mt.groupby('manager_id').size()
-
-        synth_team_match = df[df['match_id'].isin(synth_matches)][['match_id', 'team']].drop_duplicates()
-        for _, r in synth_team_match.iterrows():
-            mgr_id = team_latest_mgr.get(r['team'])
-            if mgr_id is None or mgr_id not in cur_per_mgr.index or cur_n.get(mgr_id, 0) < min_games:
-                emb = np.zeros(n_components)
-            else:
-                feats = cur_per_mgr.loc[mgr_id].fillna(0.0).values.reshape(1, -1)
-                emb = pca.transform(scaler.transform(feats))[0]
-            row = {'match_id': r['match_id'], 'team': r['team'], 'manager_id': mgr_id}
-            for i in range(n_components):
-                row[f'manager_emb_{i}'] = float(emb[i])
-            synth_rows.append(row)
-
-    emb_df = mt[['match_id', 'team'] + MANAGER_EMB_COLS[:n_components]].copy()
-    if synth_rows:
-        emb_df = pd.concat([emb_df, pd.DataFrame(synth_rows)[emb_df.columns]], ignore_index=True)
-
-    df = df.merge(emb_df, on=['match_id', 'team'], how='left')
-    for c in MANAGER_EMB_COLS[:n_components]:
-        df[c] = df[c].fillna(0.0)
-
-    if verbose:
-        n_zero = (df[MANAGER_EMB_COLS[:n_components]].abs().sum(axis=1) == 0).sum()
-        print(f"  [manager_emb] Done. {n_zero} of {len(df)} rows have zero embedding (interim/missing).")
+    mt['result_time'] = pd.to_datetime(mt['match_date'], utc=True) + pd.Timedelta(hours=3)
+    mt = mt.sort_values('result_time').reset_index(drop=True)
+    raw_cols = ['manager_raw_' + c for c in feat_cols]
+    # Resolve the manager from completed team history, including cache-missing
+    # historical rows. Never fill an old missing row from the latest future manager.
+    targets = chronological_frame(df)[['team', 'forecast_time']].drop_duplicates()
+    records = []
+    by_team = {team: part for team, part in mt.groupby('team')}
+    by_manager = {manager: part for manager, part in mt.groupby('manager_id')}
+    for _, target in targets.iterrows():
+        record = {'team': target['team'], 'forecast_time': target['forecast_time'],
+                  'manager_prior_games': 0, **dict.fromkeys(raw_cols, 0.)}
+        team_history = by_team.get(target['team'])
+        if team_history is not None:
+            prior = team_history[team_history['result_time'] < target['forecast_time']]
+            if not prior.empty:
+                history = by_manager[prior.iloc[-1]['manager_id']]
+                history = history[history['result_time'] < target['forecast_time']]
+                record['manager_prior_games'] = len(history)
+                record.update(zip(raw_cols, history.tail(window)[feat_cols].mean().fillna(0)))
+        records.append(record)
+    stale = [c for c in df if c.startswith('manager_raw_') or c == 'manager_prior_games']
+    df = chronological_frame(df).drop(columns=stale, errors='ignore').merge(
+        pd.DataFrame(records), on=['team', 'forecast_time'], how='left', validate='many_to_one')
+    df[MANAGER_EMB_COLS] = 0.0
     return df
 
 
@@ -494,8 +564,13 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     if verbose:
         print("Computing rolling features...")
 
+    data_dir = df.attrs.get('data_dir', 'data')
+    input_attrs = df.attrs.copy()
+    if isinstance(input_attrs.get('roster_spells'), pd.DataFrame):
+        input_attrs['roster_spells'] = input_attrs['roster_spells'].to_dict('records')
     df = df.copy()
-    df = df.sort_values(['player_id', 'season', 'gameweek']).reset_index(drop=True)
+    df.attrs = input_attrs
+    df = chronological_frame(df).sort_values(['player_id', 'match_date'], kind='stable').reset_index(drop=True)
 
     # Ensure minutes is numeric
     df['minutes'] = pd.to_numeric(df['minutes'], errors='coerce').fillna(0)
@@ -516,7 +591,7 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
             # Compute raw per90
             df[per90_col] = np.where(sufficient_minutes, df[col] / mins_90, np.nan)
             # Apply cap to prevent inflation
-            if col in PER90_CAPS:
+            if f'{col}_per90' in PER90_CAPS:
                 cap = PER90_CAPS[f'{col}_per90']
                 df[per90_col] = df[per90_col].clip(upper=cap)
 
@@ -528,15 +603,13 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
         if per90_col not in df.columns:
             # Compute with cap and min minutes filter
             df[per90_col] = np.where(sufficient_minutes, df[col] / mins_90, np.nan)
-            if col in PER90_CAPS:
+            if f'{col}_per90' in PER90_CAPS:
                 cap = PER90_CAPS[f'{col}_per90']
                 df[per90_col] = df[per90_col].clip(upper=cap)
 
         for window in ROLLING_WINDOWS:
-            # Rolling mean will skip NaN values (low-minute games)
-            df[f'{col}_per90_roll{window}'] = df.groupby('player_id')[per90_col].transform(
-                lambda x: x.shift(1).rolling(window, min_periods=1).mean()
-            )
+            df[f'{col}_per90_roll{window}'] = prior_exposure_rate(
+                df, 'player_id', col, window, PER90_CAPS.get(per90_col))
 
     # Calendar-aware minutes features (treats missed gameweeks as 0 minutes / not started).
     # Without this, a player who started one match 7 GWs ago has the same `last_minutes` and
@@ -557,17 +630,15 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
 
     # Current season features (to detect players with limited this-season playing time)
     # These are cumulative stats WITHIN the current season only
-    df['current_season_minutes'] = df.groupby(['player_id', 'season'])['minutes'].transform('cumsum') - df['minutes']
-    df['current_season_apps'] = df.groupby(['player_id', 'season']).cumcount()
+    df['current_season_minutes'] = prior_stat(df, ['player_id', 'season'], 'minutes', aggregation='sum').fillna(0)
+    df['current_season_apps'] = prior_stat(df.assign(_one=1), ['player_id', 'season'], '_one', aggregation='sum').fillna(0)
     df['current_season_mins_per_app'] = df['current_season_minutes'] / df['current_season_apps'].replace(0, 1)
 
     # Recent form (raw counts)
     for col in ['goals', 'assists']:
-        df[f'{col}_last1'] = df.groupby('player_id')[col].shift(1).fillna(0)
+        df[f'{col}_last1'] = prior_stat(df, 'player_id', col, aggregation='last').fillna(0)
         for window in ROLLING_WINDOWS:
-            df[f'{col}_roll{window}'] = df.groupby('player_id')[col].transform(
-                lambda x: x.shift(1).rolling(window, min_periods=1).sum()
-            ).fillna(0)
+            df[f'{col}_roll{window}'] = prior_stat(df, 'player_id', col, window, 'sum', 1).fillna(0)
 
     for window in ROLLING_WINDOWS:
         df[f'goal_involvements_roll{window}'] = df[f'goals_roll{window}'] + df[f'assists_roll{window}']
@@ -585,9 +656,8 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     df['fouls_committed_per90'] = df['fouls_committed_per90'].clip(upper=6.0)
 
     for window in ROLLING_WINDOWS:
-        df[f'fouls_committed_per90_roll{window}'] = df.groupby('player_id')['fouls_committed_per90'].transform(
-            lambda x: x.shift(1).rolling(window, min_periods=1).mean()
-        )
+        df[f'fouls_committed_per90_roll{window}'] = prior_exposure_rate(
+            df, 'player_id', 'fouls_committed', window, 6.0)
 
     # =========================================================================
     # YELLOW / RED CARDS (from FPL API merge, if available)
@@ -596,18 +666,14 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     if 'yellow_cards' in df.columns:
         df['yellow_cards'] = pd.to_numeric(df['yellow_cards'], errors='coerce').fillna(0)
         for window in ROLLING_WINDOWS:
-            df[f'yellow_cards_roll{window}'] = df.groupby('player_id')['yellow_cards'].transform(
-                lambda x: x.shift(1).rolling(window, min_periods=1).mean()
-            )
+            df[f'yellow_cards_roll{window}'] = prior_stat(df, 'player_id', 'yellow_cards', window, 'mean', 1)
         # Fouls per yellow (personalized booking rate) — only where fouls > 0
         df['_fouls_with_yellow'] = np.where(
             df['fouls_committed'] > 0,
             df['yellow_cards'] / df['fouls_committed'],
             np.nan
         )
-        df['yellow_per_foul_roll10'] = df.groupby('player_id')['_fouls_with_yellow'].transform(
-            lambda x: x.shift(1).rolling(10, min_periods=3).mean()
-        )
+        df['yellow_per_foul_roll10'] = prior_stat(df, 'player_id', '_fouls_with_yellow', 10, min_periods=3)
         df = df.drop(columns=['_fouls_with_yellow'], errors='ignore')
 
     if 'red_cards' in df.columns:
@@ -628,25 +694,21 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     df['saves_per90'] = df['saves_per90'].clip(upper=12.0)
 
     for window in ROLLING_WINDOWS:
-        df[f'saves_per90_roll{window}'] = df.groupby('player_id')['saves_per90'].transform(
-            lambda x: x.shift(1).rolling(window, min_periods=1).mean()
-        )
+        df[f'saves_per90_roll{window}'] = prior_exposure_rate(
+            df, 'player_id', 'saves', window, 12.0)
 
     # Raw saves rolling (recent form counts)
-    df['saves_last1'] = df.groupby('player_id')['saves'].shift(1).fillna(0)
+    df['saves_last1'] = prior_stat(df, 'player_id', 'saves', aggregation='last').fillna(0)
     for window in ROLLING_WINDOWS:
-        df[f'saves_roll{window}'] = df.groupby('player_id')['saves'].transform(
-            lambda x: x.shift(1).rolling(window, min_periods=1).mean()
-        )
+        df[f'saves_roll{window}'] = prior_stat(df, 'player_id', 'saves', window, 'mean', 1)
 
     # xGoT faced per 90 (shot quality faced by GK)
     df['xgot_faced_per90'] = np.where(sufficient_minutes, df['xgot_faced'] / mins_90, np.nan)
     df['xgot_faced_per90'] = df['xgot_faced_per90'].clip(upper=5.0)
 
     for window in ROLLING_WINDOWS:
-        df[f'xgot_faced_per90_roll{window}'] = df.groupby('player_id')['xgot_faced_per90'].transform(
-            lambda x: x.shift(1).rolling(window, min_periods=1).mean()
-        )
+        df[f'xgot_faced_per90_roll{window}'] = prior_exposure_rate(
+            df, 'player_id', 'xgot_faced', window, 5.0)
 
     # =========================================================================
     # DEFENSIVE STATS (DEFCON)
@@ -668,35 +730,41 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     df['is_mid'] = (pos == 2).astype(int)
     df['is_fwd'] = (pos == 3).astype(int)
 
-    # Defcon based on position
-    df['defcon'] = np.where(df['is_def'] == 1, df['CBIT'], df['CBIRT'])
-    df['defcon_threshold'] = np.where(df['is_def'] == 1, 10, 12)
-    df['hit_threshold'] = (df['defcon'] >= df['defcon_threshold']).astype(int)
+    # Defcon classification is an FPL rule, so only the FPL API position may
+    # choose its components and threshold. FotMob's on-pitch role is deliberately
+    # ignored here (for example, an FPL DEF may play as a winger).
+    fpl_pos = df.get('fpl_position', pd.Series(pd.NA, index=df.index)).astype('string').str.upper()
+    df['fpl_is_def'] = fpl_pos.eq('DEF').fillna(False).astype(int)
+    df['fpl_is_mid'] = fpl_pos.eq('MID').fillna(False).astype(int)
+    df['fpl_is_fwd'] = fpl_pos.eq('FWD').fillna(False).astype(int)
+    fpl_def = fpl_pos.eq('DEF').fillna(False)
+    fpl_mid = fpl_pos.eq('MID').fillna(False)
+    eligible_defcon = fpl_def | fpl_mid
+    df['defcon'] = np.where(fpl_def, df['CBIT'],
+                            np.where(fpl_mid, df['CBIRT'], np.nan))
+    df['defcon_threshold'] = np.where(fpl_def, 10,
+                                      np.where(fpl_mid, 12, np.nan))
+    df['hit_threshold'] = np.where(
+        eligible_defcon, (df['defcon'] >= df['defcon_threshold']).astype(int), np.nan)
 
     # Defcon per 90
     df['defcon_per90'] = df['defcon'] / mins_90
     for window in ROLLING_WINDOWS:
-        df[f'defcon_per90_roll{window}'] = df.groupby('player_id')['defcon_per90'].transform(
-            lambda x: x.shift(1).rolling(window, min_periods=1).mean()
-        )
-        df[f'hit_threshold_roll{window}'] = df.groupby('player_id')['hit_threshold'].transform(
-            lambda x: x.shift(1).rolling(window, min_periods=1).mean()
-        )
+        df[f'defcon_per90_roll{window}'] = prior_exposure_rate(
+            df, 'player_id', 'defcon', window)
+        df[f'hit_threshold_roll{window}'] = prior_stat(df, 'player_id', 'hit_threshold', window, 'mean', 1)
 
     # Raw defcon rolling counts (for Poisson count model)
     for window in ROLLING_WINDOWS:
-        df[f'defcon_roll{window}'] = df.groupby('player_id')['defcon'].transform(
-            lambda x: x.shift(1).rolling(window, min_periods=1).mean()
-        )
-    df['defcon_last1'] = df.groupby('player_id')['defcon'].transform(lambda x: x.shift(1))
+        df[f'defcon_roll{window}'] = prior_stat(df, 'player_id', 'defcon', window, 'mean', 1)
+    df['defcon_last1'] = prior_stat(df, 'player_id', 'defcon', aggregation='last')
 
     # Component stats per 90
     for col in ['tackles', 'interceptions', 'clearances', 'blocks', 'recoveries']:
         df[f'{col}_per90'] = df[col] / mins_90
         for window in ROLLING_WINDOWS:
-            df[f'{col}_per90_roll{window}'] = df.groupby('player_id')[f'{col}_per90'].transform(
-                lambda x: x.shift(1).rolling(window, min_periods=1).mean()
-            )
+            df[f'{col}_per90_roll{window}'] = prior_exposure_rate(
+                df, 'player_id', col, window)
 
     # =========================================================================
     # LIFETIME PLAYER PROFILE
@@ -709,30 +777,25 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     # which merges two careers into one. Every other rolling feature already keys
     # on player_id. The sort has to match the grouping — expanding() depends on
     # row order, and sorting by name would interleave a re-spelled player's blocks.
-    df = df.sort_values(['player_id', 'season', 'gameweek']).reset_index(drop=True)
+    df = df.sort_values(['player_id', 'match_date'], kind='stable').reset_index(drop=True)
 
     # Offensive stats
     for stat in ['goals', 'assists', 'xg', 'xa', 'minutes', 'shots']:
         if stat in df.columns:
-            df[f'lifetime_{stat}'] = df.groupby('player_id')[stat].transform(
-                lambda x: x.shift(1).expanding().sum()
-            )
+            df[f'lifetime_{stat}'] = prior_stat(df, 'player_id', stat, aggregation='sum')
 
     # Goalkeeper stats (lifetime)
     for stat in ['saves', 'xgot_faced']:
         if stat in df.columns:
-            df[f'lifetime_{stat}'] = df.groupby('player_id')[stat].transform(
-                lambda x: x.shift(1).expanding().sum()
-            )
+            df[f'lifetime_{stat}'] = prior_stat(df, 'player_id', stat, aggregation='sum')
 
     # Defensive stats (lifetime)
-    df['lifetime_defcon'] = df.groupby('player_id')['defcon'].transform(
-        lambda x: x.shift(1).expanding().sum()
-    )
+    df['lifetime_defcon'] = prior_stat(df, 'player_id', 'defcon', aggregation='sum')
+    df['_defcon_minutes'] = df['minutes'].where(df['defcon'].notna())
+    df['lifetime_defcon_minutes'] = prior_stat(
+        df, 'player_id', '_defcon_minutes', aggregation='sum').fillna(0)
     for col in ['tackles', 'interceptions', 'clearances', 'blocks', 'recoveries', 'fouls_committed']:
-        df[f'lifetime_{col}'] = df.groupby('player_id')[col].transform(
-            lambda x: x.shift(1).expanding().sum()
-        )
+        df[f'lifetime_{col}'] = prior_stat(df, 'player_id', col, aggregation='sum')
 
     df['lifetime_minutes'] = df['lifetime_minutes'].fillna(0)
     lifetime_mins_90 = np.maximum(df['lifetime_minutes'] / 90, 0.01)
@@ -752,11 +815,13 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
                 df[per90_col] = df[per90_col].clip(upper=PER90_CAPS[cap_key])
 
     # Lifetime defensive per 90
+    lifetime_defcon_mins_90 = np.maximum(df['lifetime_defcon_minutes'] / 90, 0.01)
     df['lifetime_defcon_per90'] = np.where(
-        df['lifetime_minutes'] >= 90,
-        df['lifetime_defcon'].fillna(0) / lifetime_mins_90,
+        df['lifetime_defcon_minutes'] >= 90,
+        df['lifetime_defcon'].fillna(0) / lifetime_defcon_mins_90,
         0
     )
+    df = df.drop(columns=['_defcon_minutes'], errors='ignore')
     for col in ['tackles', 'interceptions', 'clearances', 'fouls_committed']:
         df[f'lifetime_{col}_per90'] = np.where(
             df['lifetime_minutes'] >= 90,
@@ -766,9 +831,7 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
 
     # Lifetime yellow card per 90 (if yellow_cards column exists)
     if 'yellow_cards' in df.columns:
-        df['lifetime_yellow_cards'] = df.groupby('player_id')['yellow_cards'].transform(
-            lambda x: x.shift(1).expanding().sum()
-        ).fillna(0)
+        df['lifetime_yellow_cards'] = prior_stat(df, 'player_id', 'yellow_cards', aggregation='sum').fillna(0)
         df['lifetime_yellow_cards_per90'] = np.where(
             df['lifetime_minutes'] >= 90,
             df['lifetime_yellow_cards'] / lifetime_mins_90,
@@ -782,7 +845,7 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
         0
     )
 
-    df['lifetime_appearances'] = df.groupby('player_id').cumcount()
+    df['lifetime_appearances'] = prior_stat(df.assign(_one=1), 'player_id', '_one', aggregation='sum').fillna(0)
     df['lifetime_mins_per_app'] = np.where(
         df['lifetime_appearances'] > 0,
         df['lifetime_minutes'] / df['lifetime_appearances'],
@@ -797,15 +860,15 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     if 'own_goal' not in df.columns:
         df['own_goal'] = 0
 
-    team_stats = df.groupby(['team', 'season', 'gameweek']).agg({
+    team_stats = df.groupby(['team', 'season', 'gameweek', 'match_id']).agg({
         'goals': 'sum', 'xg': 'sum', 'shots': 'sum', 'own_goal': 'sum'
     }).reset_index()
 
     # Add opponent own goals to team goals (own goals by opponent count as goals for this team)
     if 'opponent' in df.columns:
-        opp_og = df.groupby(['opponent', 'season', 'gameweek'])['own_goal'].sum().reset_index()
+        opp_og = df.groupby(['opponent', 'season', 'gameweek', 'match_id'])['own_goal'].sum().reset_index()
         opp_og = opp_og.rename(columns={'opponent': 'team', 'own_goal': 'opp_own_goals'})
-        team_stats = team_stats.merge(opp_og, on=['team', 'season', 'gameweek'], how='left')
+        team_stats = team_stats.merge(opp_og, on=['team', 'season', 'gameweek', 'match_id'], how='left')
         team_stats['opp_own_goals'] = team_stats['opp_own_goals'].fillna(0)
         team_stats['team_goals'] = team_stats['goals'] + team_stats['opp_own_goals']
     else:
@@ -813,19 +876,19 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
 
     team_stats = team_stats.rename(columns={'xg': 'team_xg', 'shots': 'team_shots'})
     team_stats = team_stats.drop(columns=['goals', 'own_goal'], errors='ignore')
-    team_stats = team_stats.sort_values(['team', 'season', 'gameweek'])
+    timing = df[['match_id', 'match_date', 'forecast_time', 'result_time']].drop_duplicates('match_id')
+    team_stats = team_stats.merge(timing, on='match_id', validate='many_to_one')
+    team_stats = team_stats.sort_values(['team', 'match_date'])
 
     for col in ['team_goals', 'team_xg', 'team_shots']:
         for window in ROLLING_WINDOWS:
-            team_stats[f'{col}_roll{window}'] = team_stats.groupby('team')[col].transform(
-                lambda x: x.shift(1).rolling(window, min_periods=min(TEAM_ROLL_MIN_PERIODS, window)).mean()
-            )
+            team_stats[f'{col}_roll{window}'] = prior_stat(team_stats, 'team', col, window, 'mean', min(TEAM_ROLL_MIN_PERIODS, window))
 
     # Merge rolling team offensive stats (dynamic column selection)
     team_roll_cols = [c for c in team_stats.columns if '_roll' in c]
     df = df.merge(
-        team_stats[['team', 'season', 'gameweek'] + team_roll_cols],
-        on=['team', 'season', 'gameweek'], how='left'
+        team_stats[['team', 'season', 'gameweek', 'match_id'] + team_roll_cols],
+        on=['team', 'season', 'gameweek', 'match_id'], how='left'
     )
 
     # =========================================================================
@@ -834,8 +897,8 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
 
     # Merge raw per-match team totals for share computation
     df = df.merge(
-        team_stats[['team', 'season', 'gameweek', 'team_goals', 'team_xg', 'team_shots']],
-        on=['team', 'season', 'gameweek'], how='left'
+        team_stats[['team', 'season', 'gameweek', 'match_id', 'team_goals', 'team_xg', 'team_shots']],
+        on=['team', 'season', 'gameweek', 'match_id'], how='left'
     )
 
     # Per-match share ratios (only for games with sufficient minutes and non-zero team totals)
@@ -853,9 +916,7 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     # Rolling share features (shifted to prevent leakage)
     for share_col in ['xg_share', 'shot_share', 'goal_share']:
         for window in ROLLING_WINDOWS:
-            df[f'{share_col}_roll{window}'] = df.groupby('player_id')[share_col].transform(
-                lambda x: x.shift(1).rolling(window, min_periods=1).mean()
-            )
+            df[f'{share_col}_roll{window}'] = prior_stat(df, 'player_id', share_col, window, 'mean', 1)
 
     # Drop intermediate columns
     df = df.drop(columns=['team_goals', 'team_xg', 'team_shots',
@@ -881,7 +942,7 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
         df['opponent_norm'] = df['opponent'].apply(normalize_name)
 
         # Get goals conceded by each team (= opponent's goals + this team's own goals)
-        match_results = df.groupby(['team_norm', 'opponent_norm', 'season', 'gameweek']).agg({
+        match_results = df.groupby(['team_norm', 'opponent_norm', 'season', 'gameweek', 'match_id']).agg({
             'goals': 'sum', 'xg': 'sum', 'own_goal': 'sum', 'team': 'first', 'opponent': 'first'
         }).reset_index()
 
@@ -898,40 +959,35 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
         # Goals conceded = opponent's player goals + this team's own goals
         # own goals by this team are in the original (pre-swap) match_results
         # Include opponent_norm in key to prevent cartesian product for DGW teams
-        team_og = match_results[['team_norm', 'opponent_norm', 'season', 'gameweek', 'own_goal']].rename(
+        team_og = match_results[['team_norm', 'opponent_norm', 'season', 'gameweek', 'match_id', 'own_goal']].rename(
             columns={'own_goal': 'self_own_goals', 'opponent_norm': 'opponent_temp_norm'}
         )
-        team_conceded = team_conceded.merge(team_og, on=['team_norm', 'opponent_temp_norm', 'season', 'gameweek'], how='left')
+        team_conceded = team_conceded.merge(team_og, on=['team_norm', 'opponent_temp_norm', 'season', 'gameweek', 'match_id'], how='left')
         team_conceded['self_own_goals'] = team_conceded['self_own_goals'].fillna(0)
         team_conceded['goals_conceded'] = team_conceded['opp_goals'] + team_conceded['self_own_goals']
-        team_conceded = team_conceded.sort_values(['team_norm', 'season', 'gameweek'])
+        team_conceded = team_conceded.merge(timing, on='match_id', validate='many_to_one')
+        team_conceded = team_conceded.sort_values(['team_norm', 'match_date'])
 
         # Rolling goals conceded and xGA (multiple windows for different time horizons)
         for window in ROLLING_WINDOWS_LONG:
-            team_conceded[f'team_conceded_roll{window}'] = team_conceded.groupby('team_norm')['goals_conceded'].transform(
-                lambda x: x.shift(1).rolling(window, min_periods=min(TEAM_ROLL_MIN_PERIODS, window)).mean()
-            )
-            team_conceded[f'team_xga_roll{window}'] = team_conceded.groupby('team_norm')['xga'].transform(
-                lambda x: x.shift(1).rolling(window, min_periods=min(TEAM_ROLL_MIN_PERIODS, window)).mean()
-            )
+            team_conceded[f'team_conceded_roll{window}'] = prior_stat(team_conceded, 'team_norm', 'goals_conceded', window, 'mean', min(TEAM_ROLL_MIN_PERIODS, window))
+            team_conceded[f'team_xga_roll{window}'] = prior_stat(team_conceded, 'team_norm', 'xga', window, 'mean', min(TEAM_ROLL_MIN_PERIODS, window))
 
         # Clean sheet tracking
         team_conceded['clean_sheet'] = (team_conceded['goals_conceded'] == 0).astype(int)
         for window in ROLLING_WINDOWS_LONG:
-            team_conceded[f'team_cs_rate_roll{window}'] = team_conceded.groupby('team_norm')['clean_sheet'].transform(
-                lambda x: x.shift(1).rolling(window, min_periods=min(TEAM_ROLL_MIN_PERIODS, window)).mean()
-            )
+            team_conceded[f'team_cs_rate_roll{window}'] = prior_stat(team_conceded, 'team_norm', 'clean_sheet', window, 'mean', min(TEAM_ROLL_MIN_PERIODS, window))
 
         # Merge team defensive stats (dynamic column selection)
         # Deduplicate per (team, season, gameweek) to avoid cartesian for DGW teams
         team_def_cols = [c for c in team_conceded.columns
                         if any(c.startswith(p) for p in ['team_conceded_roll', 'team_xga_roll', 'team_cs_rate_roll'])]
-        team_conceded_dedup = team_conceded[['team_norm', 'season', 'gameweek'] + team_def_cols].drop_duplicates(
-            subset=['team_norm', 'season', 'gameweek'], keep='first'
+        team_conceded_dedup = team_conceded[['team_norm', 'season', 'gameweek', 'match_id'] + team_def_cols].drop_duplicates(
+            subset=['team_norm', 'season', 'gameweek', 'match_id'], keep='first'
         )
         df = df.merge(
             team_conceded_dedup,
-            on=['team_norm', 'season', 'gameweek'], how='left'
+            on=['team_norm', 'season', 'gameweek', 'match_id'], how='left'
         )
 
     # =========================================================================
@@ -943,32 +999,29 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
         team_stats['team_norm'] = team_stats['team'].apply(normalize_name)
 
         # Opponent's goals scored (their attacking strength)
-        opp_offense = team_stats[['team_norm', 'season', 'gameweek', 'team_goals', 'team_xg']].copy()
+        opp_offense = team_stats[['team_norm', 'season', 'gameweek', 'match_id', 'team_goals', 'team_xg']].copy()
         opp_offense = opp_offense.rename(columns={
             'team_norm': 'opponent_norm',
             'team_goals': 'opp_goals',
             'team_xg': 'opp_xg'
         })
-        opp_offense = opp_offense.sort_values(['opponent_norm', 'season', 'gameweek'])
+        opp_offense = opp_offense.merge(timing, on='match_id', validate='many_to_one')
+        opp_offense = opp_offense.sort_values(['opponent_norm', 'match_date'])
 
         for window in ROLLING_WINDOWS:
-            opp_offense[f'opp_goals_roll{window}'] = opp_offense.groupby('opponent_norm')['opp_goals'].transform(
-                lambda x: x.shift(1).rolling(window, min_periods=min(TEAM_ROLL_MIN_PERIODS, window)).mean()
-            )
-            opp_offense[f'opp_xg_roll{window}'] = opp_offense.groupby('opponent_norm')['opp_xg'].transform(
-                lambda x: x.shift(1).rolling(window, min_periods=min(TEAM_ROLL_MIN_PERIODS, window)).mean()
-            )
+            opp_offense[f'opp_goals_roll{window}'] = prior_stat(opp_offense, 'opponent_norm', 'opp_goals', window, 'mean', min(TEAM_ROLL_MIN_PERIODS, window))
+            opp_offense[f'opp_xg_roll{window}'] = prior_stat(opp_offense, 'opponent_norm', 'opp_xg', window, 'mean', min(TEAM_ROLL_MIN_PERIODS, window))
 
         opp_off_roll_cols = [c for c in opp_offense.columns if c.startswith('opp_') and '_roll' in c]
         df = df.merge(
-            opp_offense[['opponent_norm', 'season', 'gameweek'] + opp_off_roll_cols],
-            on=['opponent_norm', 'season', 'gameweek'], how='left'
+            opp_offense[['opponent_norm', 'season', 'gameweek', 'match_id'] + opp_off_roll_cols],
+            on=['opponent_norm', 'season', 'gameweek', 'match_id'], how='left'
         )
 
         # Opponent's defensive weakness (goals they concede = xGA) + CS rate
         opp_def_roll_cols = [c for c in team_conceded.columns
                            if any(c.startswith(p) for p in ['team_conceded_roll', 'team_xga_roll', 'team_cs_rate_roll'])]
-        opp_defense = team_conceded[['team_norm', 'season', 'gameweek'] + opp_def_roll_cols].copy()
+        opp_defense = team_conceded[['team_norm', 'season', 'gameweek', 'match_id'] + opp_def_roll_cols].copy()
         rename_map = {'team_norm': 'opponent_norm'}
         for col in opp_def_roll_cols:
             new_name = (col.replace('team_conceded_', 'opp_conceded_')
@@ -978,12 +1031,12 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
         opp_defense = opp_defense.rename(columns=rename_map)
 
         opp_def_merged_cols = [c for c in opp_defense.columns if c.startswith('opp_')]
-        opp_defense_dedup = opp_defense[['opponent_norm', 'season', 'gameweek'] + opp_def_merged_cols].drop_duplicates(
-            subset=['opponent_norm', 'season', 'gameweek'], keep='first'
+        opp_defense_dedup = opp_defense[['opponent_norm', 'season', 'gameweek', 'match_id'] + opp_def_merged_cols].drop_duplicates(
+            subset=['opponent_norm', 'season', 'gameweek', 'match_id'], keep='first'
         )
         df = df.merge(
             opp_defense_dedup,
-            on=['opponent_norm', 'season', 'gameweek'], how='left'
+            on=['opponent_norm', 'season', 'gameweek', 'match_id'], how='left'
         )
 
         # ================================================================
@@ -998,21 +1051,23 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
         # established clubs keep their cross-season history untouched.
         # ================================================================
         _promoted = promoted_team_seasons(df)
-        _tm = df[['team_norm', 'season', 'gameweek']].drop_duplicates().sort_values(
-            ['team_norm', 'season', 'gameweek'])
+        _tm = df[['team_norm', 'season', 'gameweek', 'match_id']].drop_duplicates().sort_values(
+            ['team_norm', 'season', 'gameweek', 'match_id'])
         # Games so far THIS season: a club returning after a relegation spell has
         # plenty of career games but no current-season form, and its old top-flight
         # numbers are the stale ones we are trying not to carry over.
-        _tm['_prior_games'] = _tm.groupby(['team_norm', 'season']).cumcount()
+        _tm = _tm.merge(timing, on='match_id', validate='many_to_one')
+        _tm['_one'] = 1
+        _tm['_prior_games'] = prior_stat(_tm, ['team_norm', 'season'], '_one', aggregation='sum').fillna(0)
         _tm['_cold'] = [
             (t, sn) in _promoted and g < TEAM_ROLL_MIN_PERIODS
             for t, sn, g in zip(_tm['team_norm'], _tm['season'], _tm['_prior_games'])
         ]
-        _tm = _tm.drop(columns=['_prior_games'])
-        df = df.merge(_tm, on=['team_norm', 'season', 'gameweek'], how='left')
+        _tm = _tm.drop(columns=['_prior_games', '_one', 'match_date', 'forecast_time', 'result_time'])
+        df = df.merge(_tm, on=['team_norm', 'season', 'gameweek', 'match_id'], how='left')
         df = df.merge(
             _tm.rename(columns={'team_norm': 'opponent_norm', '_cold': '_opp_cold'}),
-            on=['opponent_norm', 'season', 'gameweek'], how='left')
+            on=['opponent_norm', 'season', 'gameweek', 'match_id'], how='left')
 
         _cold = df['_cold'].fillna(False).astype(bool)
         _opp_cold = df['_opp_cold'].fillna(False).astype(bool)
@@ -1040,27 +1095,21 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
         team_roll_prior_cols = [c for c in df.columns if c.startswith('team_') and '_roll' in c]
         opp_roll_cols = [c for c in df.columns if c.startswith('opp_') and '_roll' in c]
 
-        if promoted_pairs:
-            gw_num = pd.to_numeric(df['gameweek'], errors='coerce')
-            is_promoted_row = pd.Series(
-                list(zip(df['team_norm'], df['season'])), index=df.index
-            ).isin(promoted_pairs)
-            cohort = df[is_promoted_row & (gw_num <= 10)]
-            prior = {c: cohort[c].mean() for c in team_roll_prior_cols}
-
-            for c in team_roll_prior_cols:
-                v = prior.get(c)
-                if v is not None and not np.isnan(v):
-                    df[c] = df[c].fillna(v)
-            for c in opp_roll_cols:
-                team_c = (c.replace('opp_conceded_', 'team_conceded_')
-                           .replace('opp_xga_', 'team_xga_')
-                           .replace('opp_cs_rate_', 'team_cs_rate_')
-                           .replace('opp_goals_', 'team_goals_')
-                           .replace('opp_xg_', 'team_xg_'))
-                v = prior.get(team_c)
-                if v is not None and not np.isnan(v):
-                    df[c] = df[c].fillna(v)
+        if team_roll_prior_cols:
+            is_promoted_row = pd.Series(list(zip(df['team_norm'], df['season'])), index=df.index).isin(promoted_pairs)
+            for season in seasons_sorted:
+                # A new season's prior is frozen from earlier seasons only.
+                cohort = df[is_promoted_row & (df['gameweek'] <= 10) & (df['season'] < season)]
+                season_mask = df['season'].eq(season)
+                prior = {c: cohort[c].mean() for c in team_roll_prior_cols}
+                for c in team_roll_prior_cols + opp_roll_cols:
+                    team_c = (c.replace('opp_conceded_', 'team_conceded_')
+                               .replace('opp_xga_', 'team_xga_').replace('opp_cs_rate_', 'team_cs_rate_')
+                               .replace('opp_goals_', 'team_goals_').replace('opp_xg_', 'team_xg_'))
+                    value = prior.get(team_c, np.nan)
+                    if not np.isfinite(value):
+                        value = 0.25 if 'cs_rate' in c else 12.0 if 'shots' in c else 1.3
+                    df.loc[season_mask, c] = df.loc[season_mask, c].fillna(value)
 
         # Clean up temporary normalized columns
         df = df.drop(columns=['team_norm', 'opponent_norm'], errors='ignore')
@@ -1097,7 +1146,7 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     # MANAGER EMBEDDINGS (leak-free PCA over rolling-prior manager stats)
     # =========================================================================
 
-    df = add_manager_embeddings(df, verbose=verbose)
+    df = add_manager_embeddings(df, data_dir=data_dir, verbose=verbose)
 
     # =========================================================================
     # CLEAN UP
@@ -1114,6 +1163,7 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     # Fill other defaults
     df['is_home'] = df['is_home'].fillna(0).astype(int)
     df['starter_score'] = df['starter_score'].fillna(0.5)
+    df.attrs.update(input_attrs)
 
     if verbose:
         print(f"  Computed {len(rolling_cols)} rolling/lifetime features")

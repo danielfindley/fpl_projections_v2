@@ -181,12 +181,15 @@ def optimize_squad(predictions: pd.DataFrame, budget: float = BUDGET,
             "MinutesModel fits its AppearClassifier"
         )
 
-    # exp_total_pts is built from pred_minutes, which is E[minutes | appears] — so it is
-    # E[points | appears] and overstates a fringe player by 1/p_appear. Scale it to an
-    # unconditional expectation before optimising. Applied to starters and bench alike;
-    # the bench is then discounted a second time by P(its slot is used), which is a
-    # different event and not double counting.
-    ep = df[points_col].values.astype(float) * p_appear
+    # New runs publish unconditional points explicitly. Legacy archives without
+    # that field still need their original appearance discount. Bench activation
+    # is a separate event and is weighted below in either case.
+    if points_col == 'exp_total_pts' and 'exp_total_pts_uncond' in df:
+        ep = df['exp_total_pts_uncond'].to_numpy(dtype=float)
+    elif points_col == 'exp_total_pts_uncond':
+        ep = df[points_col].to_numpy(dtype=float)
+    else:
+        ep = df[points_col].to_numpy(dtype=float) * p_appear
     df['exp_pts_uncond'] = ep
     price = df['price'].values.astype(float)
     pos = df['fpl_position'].values

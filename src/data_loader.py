@@ -176,36 +176,67 @@ def merge_fixtures(player_df: pd.DataFrame, fixtures_df: pd.DataFrame) -> pd.Dat
 
 
 def get_fpl_positions() -> dict:
-    """Fetch FPL positions from API."""
+    """Fetch ambiguity-safe FPL positions keyed by normalized player names.
+
+    FPL web names and surnames are not unique.  Keep a short variant only when
+    every player using it has the same position; otherwise callers must match a
+    full name.  This prevents shared surnames such as Munoz from assigning
+    Daniel Munoz Mejia's DEF position to Victor Munoz (MID).
+    """
     import requests
     try:
         bootstrap = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/", timeout=10).json()
         POS_MAP = {1: 'GK', 2: 'DEF', 3: 'MID', 4: 'FWD'}
-        
-        positions = {}
+
+        position_sets = {}
         for p in bootstrap['elements']:
             names = [p['web_name'], f"{p['first_name']} {p['second_name']}", p['second_name']]
             pos = POS_MAP.get(p['element_type'], 'MID')
             for name in names:
-                positions[name.lower()] = pos
-        return positions
+                key = normalize_player_name(name)
+                if key:
+                    position_sets.setdefault(key, set()).add(pos)
+        return {
+            key: next(iter(values))
+            for key, values in position_sets.items()
+            if len(values) == 1
+        }
     except:
         return {}
 
 
-def map_fpl_position(position_code, player_name: str = None, fpl_positions: dict = None) -> str:
-    """Map FotMob position code to FPL position."""
+def map_fpl_position(position_code, player_name: str = None,
+                     fpl_positions: dict = None,
+                     fallback_to_fotmob: bool = True):
+    """Resolve FPL position, optionally refusing a FotMob-role fallback."""
     # Try FPL API first
     if fpl_positions and player_name:
-        name_lower = player_name.lower()
-        if name_lower in fpl_positions:
-            return fpl_positions[name_lower]
-        # Try last name
-        parts = player_name.split()
-        if len(parts) > 1 and parts[-1].lower() in fpl_positions:
-            return fpl_positions[parts[-1].lower()]
+        key = normalize_player_name(player_name)
+        if key in fpl_positions:
+            return fpl_positions[key]
+
+        # FotMob sometimes omits an FPL middle/compound surname (for example,
+        # "Daniel Munoz" vs "Daniel Munoz Mejia"). Match only when all of the
+        # player's tokens identify one position across the candidate names.
+        tokens = set(key.split())
+        if len(tokens) >= 2:
+            subset_positions = {
+                pos for name, pos in fpl_positions.items()
+                if len(name.split()) >= 2 and tokens <= set(name.split())
+            }
+            if len(subset_positions) == 1:
+                return next(iter(subset_positions))
+
+        # A surname-only key is present only when it was position-unambiguous
+        # in get_fpl_positions().
+        parts = key.split()
+        if len(parts) > 1 and parts[-1] in fpl_positions:
+            return fpl_positions[parts[-1]]
     
-    # Fall back to FotMob position code
+    if not fallback_to_fotmob:
+        return pd.NA
+
+    # Fall back to FotMob position code for non-DefCon legacy consumers only.
     try:
         code = int(position_code)
         return {0: 'GK', 1: 'DEF', 2: 'MID', 3: 'FWD'}.get(code, 'MID')
@@ -329,11 +360,23 @@ def fetch_fpl_actual_points(gameweeks: list = None, cache_dir: str = None,
     import requests
 
     cache_path = Path(cache_dir) / 'fpl_actual_points.csv' if cache_dir else None
+    cached_df = None
+    if cache_path and cache_path.exists():
+        cached_df = pd.read_csv(cache_path)
+        if 'season' not in cached_df.columns:
+            cached_df['season'] = '2025/2026'
 
     # Fetch bootstrap for player/team metadata
-    bootstrap = requests.get(
-        "https://fantasy.premierleague.com/api/bootstrap-static/", timeout=15
-    ).json()
+    try:
+        bootstrap = requests.get(
+            "https://fantasy.premierleague.com/api/bootstrap-static/", timeout=15
+        ).json()
+    except Exception:
+        if cached_df is not None and len(cached_df):
+            if verbose:
+                print("FPL API unavailable; using cached actual points and positions")
+            return cached_df
+        raise
 
     teams_map = {t['id']: t['name'] for t in bootstrap['teams']}
 
@@ -368,13 +411,8 @@ def fetch_fpl_actual_points(gameweeks: list = None, cache_dir: str = None,
         print(f"No finished gameweeks in FPL API for {api_season} — using cache only")
 
     # Check cache for already-fetched GWs (cache is per-season; GW numbers repeat)
-    cached_df = None
     cached_gws = set()
-    if cache_path and cache_path.exists():
-        cached_df = pd.read_csv(cache_path)
-        if 'season' not in cached_df.columns:
-            # Cache predates the season column; all rows were fetched in 2025/26
-            cached_df['season'] = '2025/2026'
+    if cached_df is not None:
         cached_gws = set(cached_df.loc[cached_df['season'] == api_season, 'gameweek'].unique())
         if verbose:
             print(f"  Cache has {len(cached_gws)} GWs already for {api_season}")
@@ -536,20 +574,34 @@ def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
 
     # Build FPL lookup: (name_norm, team_norm, gameweek) -> dict of FPL stats
     fpl_lookup = {}
+    position_sets = {}
     for _, row in fpl_df.iterrows():
         entry = {
             'yellow_cards': row.get('yellow_cards', 0),
             'red_cards': row.get('red_cards', 0),
             'bonus': row.get('bonus', 0),
             'actual_total_points': row.get('actual_total_points', 0),
+            'fpl_position': row.get('fpl_position', pd.NA),
         }
         key = (row['_name_norm'], row['_team_norm'], row['season'], row['gameweek'])
         fpl_lookup[key] = entry
+        if row['_name_norm']:
+            position_sets.setdefault(
+                (row['_name_norm'], row['season']), set()
+            ).add(entry['fpl_position'])
         # Also add web_name as alternate key
         if '_web_norm' in row.index and row['_web_norm']:
             alt_key = (row['_web_norm'], row['_team_norm'], row['season'], row['gameweek'])
             if alt_key not in fpl_lookup:
                 fpl_lookup[alt_key] = entry
+            position_sets.setdefault(
+                (row['_web_norm'], row['season']), set()
+            ).add(entry['fpl_position'])
+    fpl_position_lookup = {
+        key: next(iter(positions))
+        for key, positions in position_sets.items()
+        if len(positions) == 1
+    }
 
     # Detect DGW: count FotMob rows per player per gameweek.
     # FPL reports cards per gameweek, not per match, so in a DGW we can't
@@ -563,6 +615,7 @@ def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
     reds = np.full(len(df), np.nan)
     bonus = np.full(len(df), np.nan)
     fpl_total_pts = np.full(len(df), np.nan)
+    fpl_positions = np.full(len(df), None, dtype=object)
     matched = 0
     dgw_skipped = 0
 
@@ -570,10 +623,6 @@ def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
         row = df.iloc[i]
         gw = row['_gw_num']
         if pd.isna(gw):
-            continue
-        # Skip DGW rows — FPL reports per-gameweek totals, can't attribute per match
-        if matches_per_gw.iloc[i] > 1:
-            dgw_skipped += 1
             continue
         # Try full name match
         key = (row['_name_norm'], row['_team_norm'], row['season'], gw)
@@ -585,6 +634,19 @@ def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
                 last_key = (parts[-1], row['_team_norm'], row['season'], gw)
                 result = fpl_lookup.get(last_key)
         if result is not None:
+            fpl_positions[i] = result['fpl_position']
+        else:
+            # FPL position is season-level identity metadata. Reuse an
+            # ambiguity-safe cached full/web-name match even when that exact GW
+            # was not fetched or the player did not appear.
+            fpl_positions[i] = fpl_position_lookup.get(
+                (row['_name_norm'], row['season']))
+        # Skip DGW stats — FPL reports per-gameweek totals, can't attribute per match.
+        # Position is identity metadata and remains safe to attach to both fixtures.
+        if matches_per_gw.iloc[i] > 1:
+            dgw_skipped += 1
+            continue
+        if result is not None:
             yellows[i] = result['yellow_cards']
             reds[i] = result['red_cards']
             bonus[i] = result['bonus']
@@ -595,6 +657,7 @@ def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
     df['red_cards'] = reds
     df['bonus'] = bonus
     df['fpl_total_points'] = fpl_total_pts
+    df['fpl_position'] = pd.Series(fpl_positions, index=df.index, dtype='string')
 
     # Clean up temp columns
     df = df.drop(columns=['_name_norm', '_team_norm', '_gw_num'], errors='ignore')

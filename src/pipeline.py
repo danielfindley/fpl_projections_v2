@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from .data_loader import load_player_stats, load_fixtures, merge_fixtures, get_fpl_positions, map_fpl_position, get_fpl_availability, merge_fpl_card_data, get_fpl_current_squads, normalize_player_name
-from .features import compute_rolling_features, build_appearance_grid
+from .features import compute_rolling_features, build_appearance_grid, chronological_frame, deadline_splits
 from .models import GoalsModel, AssistsModel, MinutesModel, DefconModel, CleanSheetModel, BonusModel, CardsModel, SavesModel
 from .models.minutes import StarterClassifier, StarterMinutesModel, SubMinutesModel, ALL_FEATURES as MINUTES_ALL_FEATURES, STARTER_FEATURES, SUB_FEATURES
 from .experiment_log import log_experiment, get_history, get_best_run, log_predictions, get_predictions, clear_experiments
@@ -59,6 +59,12 @@ def normalize_team_name(name: str) -> str:
         return TEAM_NAME_MAP[name_lower]
     # Return lowercased name
     return name_lower
+
+
+def _tune_worker(data_dir, name, n_iter, verbose, frame, params):
+    pipeline = FPLPipeline(data_dir)
+    pipeline.tuned_params = params
+    return pipeline._tune_in_process([name], n_iter, verbose, frame)
 
 
 class FPLPipeline:
@@ -121,6 +127,44 @@ class FPLPipeline:
         # Merge FPL yellow/red card data (required for CardsModel)
         self.df = merge_fpl_card_data(self.df, str(self.data_dir), verbose)
 
+        # DefCon is a fantasy scoring rule, so its position cannot come from the
+        # role FotMob observed on the pitch. Exact season/GW positions from the
+        # FPL cache take precedence; the current FPL API fills older rows for
+        # players who are still in the game. Unmatched rows remain unknown and
+        # are excluded from DefCon rather than falling back to FotMob.
+        self.fpl_positions = get_fpl_positions()
+        api_position = self.df.apply(
+            lambda row: map_fpl_position(
+                row.get('position'), row.get('player_name'), self.fpl_positions,
+                fallback_to_fotmob=False),
+            axis=1,
+        ).astype('string').str.upper()
+        cached_position = self.df.get(
+            'fpl_position', pd.Series(pd.NA, index=self.df.index, dtype='string')
+        ).astype('string').str.upper()
+        valid_cached = cached_position.isin(['GK', 'DEF', 'MID', 'FWD'])
+        self.df['fpl_position'] = cached_position.where(valid_cached, api_position)
+        if verbose:
+            known_position = self.df['fpl_position'].isin(['GK', 'DEF', 'MID', 'FWD'])
+            print(f"  FPL positions: {int(known_position.sum()):,}/{len(self.df):,} rows resolved; "
+                  "unresolved rows excluded from DefCon")
+
+        # Carry actual match timing into every feature and validation window.
+        date_path = self.data_dir / 'matches' / 'match_details.csv'
+        if date_path.exists():
+            dates = pd.read_csv(date_path, usecols=['match_id', 'match_date']).drop_duplicates('match_id')
+            self.df = self.df.drop(columns=['match_date'], errors='ignore').merge(
+                dates, on='match_id', how='left', validate='many_to_one')
+            missing_dates = pd.to_datetime(self.df['match_date'], errors='coerce', utc=True).isna()
+            if missing_dates.any():
+                if verbose:
+                    print(f"  Excluding {self.df.loc[missing_dates, 'match_id'].nunique()} matches without kickoff timestamps")
+                self.df = self.df.loc[~missing_dates].copy()
+        else:
+            raise ValueError("match_details.csv with real kickoff timestamps is required for temporal training")
+        self.df = chronological_frame(self.df)
+        self.df.attrs['data_dir'] = str(self.data_dir)
+
         # Snapshot raw data before feature engineering. Used at predict time to
         # build synthetic target-gameweek rows so rolling features include the
         # player's most recent actual match (shift(1) excludes the synthetic row).
@@ -177,8 +221,8 @@ class FPLPipeline:
         # Generate leak-free OOF predicted team goals for training data
         self._generate_oof_team_goals(verbose)
 
-        # Set pred_minutes for goals/assists training (actual minutes for historical data)
-        self.df['pred_minutes'] = self.df['minutes']
+        # Downstream training sees cross-fitted minutes, never the current match's outcome.
+        self.df['pred_minutes'] = self._generate_oof_minutes(self.df, mins_params, verbose)
 
         # Goals model (uses pred_team_goals and pred_minutes)
         goals_params = self.tuned_params.get('goals', {})
@@ -220,107 +264,106 @@ class FPLPipeline:
 
         return self
     
-    def _generate_oof_team_goals(self, verbose: bool = True):
-        """Generate out-of-fold predicted team goals using CleanSheetModel.
+    @staticmethod
+    def _model_class(name):
+        return {'minutes': MinutesModel, 'clean_sheet': CleanSheetModel,
+                'goals': GoalsModel, 'assists': AssistsModel,
+                'defcon': DefconModel, 'saves': SavesModel}[name]
 
-        For each match, predicts how many goals the opponent will concede
-        (= how many goals this team will score). Uses TimeSeriesSplit CV on the
-        CleanSheetModel to avoid data leakage.
+    @staticmethod
+    def _fit_model(name, frame, params=None):
+        """One fitting contract, used by CV, holdout, OOF and final training."""
+        model = FPLPipeline._model_class(name)(**(params or {}))
+        if name == 'clean_sheet':
+            model.fit_prepared(frame, verbose=False)
+        elif name == 'minutes':
+            model.fit(frame, verbose=False,
+                      appearance_grid=build_appearance_grid(frame, verbose=False))
+        else:
+            model.fit(frame, verbose=False)
+        return model
 
-        The prediction is mapped to every player row as 'pred_team_goals'.
-        """
-        from sklearn.model_selection import TimeSeriesSplit
-        import xgboost as xgb
+    @staticmethod
+    def _model_predict(name, model, frame):
+        if name == 'clean_sheet':
+            return model.predict_goals_against(frame)
+        if name == 'saves':
+            return model.predict_per90(frame)
+        return model.predict(frame)
 
-        if verbose:
-            print("\nGenerating leak-free predicted team goals (TimeSeriesSplit OOF)...")
+    @staticmethod
+    def _loss(name, actual, predicted):
+        from sklearn.metrics import mean_poisson_deviance, mean_absolute_error
+        if name == 'minutes':
+            residual = np.abs(np.asarray(actual) - predicted)
+            quadratic = np.minimum(residual, 10.0)
+            return float(np.mean(0.5 * quadratic**2 + 10 * (residual - quadratic)))
+        if name == 'saves':
+            return float(mean_absolute_error(actual, predicted))
+        return float(mean_poisson_deviance(np.maximum(actual, 0),
+                                          np.maximum(predicted, 1e-8)))
 
-        cs_model = CleanSheetModel()
-        team_df = cs_model.prepare_team_features(self.df)
-        team_df = team_df.dropna(subset=['team_conceded_roll5', 'goals_conceded'])
+    @staticmethod
+    def _map_team_prediction(players, teams, values, opponent=False):
+        """Fixture identity prevents collisions in double gameweeks."""
+        lookup = teams[['match_id', 'team']].copy()
+        lookup['_team'] = lookup['team'].map(normalize_team_name)
+        lookup['_prediction'] = np.asarray(values)
+        lookup = lookup.drop_duplicates(['match_id', '_team']).set_index(['match_id', '_team'])
+        keys = pd.MultiIndex.from_arrays([
+            players['match_id'],
+            players['opponent' if opponent else 'team'].map(normalize_team_name)])
+        return lookup['_prediction'].reindex(keys).fillna(1.3).to_numpy()
 
-        # Ensure temporal ordering for TimeSeriesSplit
-        team_df = team_df.sort_values(['season', 'gameweek']).reset_index(drop=True)
+    def _generate_oof_minutes(self, df_train, mins_params, verbose=False):
+        frame = chronological_frame(df_train).reset_index(drop=True)
+        # Cold-start rows have no fitted predecessor. Use only prior information,
+        # never their actual minutes. These rows are not scored as CV validation.
+        prediction = frame.get('minutes_roll5', pd.Series(60., index=frame.index))
+        prediction = prediction.fillna(60).clip(1, 90).to_numpy(copy=True, dtype=float)
+        for ti, vi in deadline_splits(frame):
+            model = self._fit_model('minutes', frame.iloc[ti], mins_params)
+            prediction[vi] = model.predict(frame.iloc[vi])
+        return prediction
 
-        features = [f for f in cs_model.features_to_use if f in team_df.columns]
-        X = team_df[features].fillna(0).values
-        y = team_df['goals_conceded'].fillna(0).values
+    def _generate_oof_team_goals_for_tuning(self, df_train, cs_params, verbose=False):
+        frame = chronological_frame(df_train).copy()
+        teams = CleanSheetModel().prepare_team_features(frame).reset_index(drop=True)
+        prediction = teams['prior_lambda'].fillna(1.3).to_numpy(copy=True)
+        for ti, vi in deadline_splits(teams):
+            model = self._fit_model('clean_sheet', teams.iloc[ti], cs_params)
+            prediction[vi] = model.predict_goals_against(teams.iloc[vi])
+        frame['pred_team_goals'] = self._map_team_prediction(frame, teams, prediction, opponent=True)
+        return frame
 
-        # Get XGB params from tuned clean_sheet params (strip non-XGB keys)
-        cs_params = {k: v for k, v in self.tuned_params.get('clean_sheet', {}).items()
-                     if k not in ('selected_features',)}
-        cs_params.setdefault('objective', 'count:poisson')
-        cs_params.setdefault('random_state', 42)
-        cs_params.setdefault('verbosity', 0)
+    def _generate_oof_team_goals(self, verbose=True):
+        self.df = self._generate_oof_team_goals_for_tuning(
+            self.df, self.tuned_params.get('clean_sheet', {}), verbose)
 
-        # TimeSeriesSplit OOF predictions at team-match level
-        oof_preds = np.full(len(y), np.nan)
-        tscv = TimeSeriesSplit(n_splits=5)
+    def _dependency_frames(self, train, valid=None, need_team=True):
+        """Cross-fit upstream features inside this training window, not outside CV."""
+        train = chronological_frame(train).copy()
+        train['pred_minutes'] = self._generate_oof_minutes(
+            train, self.tuned_params.get('minutes', {}))
+        if need_team:
+            train = self._generate_oof_team_goals_for_tuning(
+                train, self.tuned_params.get('clean_sheet', {}))
+        if valid is None:
+            return train
+        valid = chronological_frame(valid).copy()
+        minutes = self._fit_model('minutes', train, self.tuned_params.get('minutes', {}))
+        valid['pred_minutes'] = minutes.predict(valid)
+        if need_team:
+            # Preparing history together is safe: each feature's information
+            # cutoff is its own deadline. Fitting uses training outcomes only.
+            teams = CleanSheetModel().prepare_team_features(pd.concat([train, valid], ignore_index=True))
+            train_teams = teams[teams['match_id'].isin(train['match_id'])]
+            cs = self._fit_model('clean_sheet', train_teams,
+                                 self.tuned_params.get('clean_sheet', {}))
+            valid['pred_team_goals'] = self._map_team_prediction(
+                valid, teams, cs.predict_goals_against(teams), opponent=True)
+        return train, valid
 
-        for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(X)):
-            model = xgb.XGBRegressor(**cs_params)
-            model.fit(X[train_idx], y[train_idx])
-            oof_preds[val_idx] = np.clip(model.predict(X[val_idx]), 1e-6, 10.0)
-        
-        # Now we have predicted goals_conceded for each team-match (OOF)
-        # For a player on team A vs opponent B: 
-        #   pred_team_goals = predicted goals conceded by B (= goals scored by A)
-        # So we need to look up the OPPONENT's predicted goals_conceded
-        
-        team_df['oof_goals_conceded'] = oof_preds
-        
-        # Build lookup: for each (opponent, season, gameweek) -> their predicted goals_conceded
-        # This is: how many goals did the opponent concede in this match = how many team scored
-        opp_conceded_lookup = team_df[['team', 'season', 'gameweek', 'oof_goals_conceded']].copy()
-        opp_conceded_lookup = opp_conceded_lookup.rename(columns={
-            'team': 'opponent',
-            'oof_goals_conceded': 'pred_team_goals'
-        })
-        
-        # Normalize opponent names for matching
-        def normalize_name(name):
-            if pd.isna(name):
-                return ''
-            return str(name).lower().replace(' ', '_').replace("'", "").strip()
-        
-        opp_conceded_lookup['opponent_norm'] = opp_conceded_lookup['opponent'].apply(normalize_name)
-        self.df['opponent_norm'] = self.df['opponent'].apply(normalize_name)
-        
-        # Deduplicate lookup to avoid row multiplication during merge
-        opp_conceded_lookup = opp_conceded_lookup.drop_duplicates(
-            subset=['opponent_norm', 'season', 'gameweek'], keep='first'
-        )
-        
-        # Drop existing pred_team_goals if present (from previous run)
-        if 'pred_team_goals' in self.df.columns:
-            self.df = self.df.drop(columns=['pred_team_goals'])
-        
-        n_before = len(self.df)
-        
-        # Merge into player-level data
-        self.df = self.df.merge(
-            opp_conceded_lookup[['opponent_norm', 'season', 'gameweek', 'pred_team_goals']],
-            on=['opponent_norm', 'season', 'gameweek'],
-            how='left'
-        )
-        
-        # Safety check: merge should not create duplicate rows
-        if len(self.df) != n_before:
-            self.df = self.df.drop_duplicates(subset=['player_id', 'season', 'gameweek'], keep='first')
-            if verbose:
-                print(f"  WARNING: Merge created duplicates, deduplicated {len(self.df)} rows")
-        
-        # Fill NaN with league average (~1.3 goals/game)
-        self.df['pred_team_goals'] = self.df['pred_team_goals'].fillna(1.3)
-        
-        # Clean up
-        self.df = self.df.drop(columns=['opponent_norm'], errors='ignore')
-        
-        if verbose:
-            valid = self.df['pred_team_goals'].notna().sum()
-            print(f"  Mapped pred_team_goals to {valid:,}/{len(self.df):,} player rows")
-            print(f"  Mean pred_team_goals: {self.df['pred_team_goals'].mean():.3f}")
-    
     def tune(self, models: list = None, n_iter: int = 100, test_size: float = 0.2,
              test_season: str = '2025/2026', test_start_gw: int = None,
              verbose: bool = True, use_subprocess: bool = False,
@@ -338,6 +381,8 @@ class FPLPipeline:
             n_iter: Number of Optuna trials per model (default 100)
             test_size: Ignored when test_season is set (kept for backward compat).
             test_season: Season to use as holdout test set (default '2025/2026').
+                         Seasons after the holdout are always excluded from tuning
+                         to preserve chronological evaluation.
                          Set to None to fall back to percentage-based temporal split.
             test_start_gw: If set, only gameweeks >= this value in test_season are held out.
                            Earlier gameweeks from test_season are included in training data.
@@ -363,7 +408,7 @@ class FPLPipeline:
 
         # Create train/test split
         df_sorted = self.df[self.df['minutes'] >= 1].copy()
-        df_sorted = df_sorted.sort_values(['season', 'gameweek'])
+        df_sorted = chronological_frame(df_sorted).sort_values('match_date')
 
         if test_season is not None:
             # Split by season (optionally filtered by gameweek)
@@ -371,21 +416,31 @@ class FPLPipeline:
             if test_start_gw is not None:
                 # Only GWs >= test_start_gw in test_season are held out
                 df_test = df_sorted[season_mask & (df_sorted['gameweek'] >= test_start_gw)].copy()
-                df_train = df_sorted[~season_mask | (season_mask & (df_sorted['gameweek'] < test_start_gw))].copy()
+                df_train = df_sorted[
+                    (df_sorted['season'] < test_season)
+                    | (season_mask & (df_sorted['gameweek'] < test_start_gw))
+                ].copy()
             else:
                 df_test = df_sorted[season_mask].copy()
-                df_train = df_sorted[~season_mask].copy()
+                df_train = df_sorted[df_sorted['season'] < test_season].copy()
             if len(df_test) == 0:
                 raise ValueError(f"No data found for test season '{test_season}'" +
                                  (f" GW>={test_start_gw}" if test_start_gw else ""))
         else:
             # Fall back to percentage-based temporal split
-            n_total = len(df_sorted)
-            n_test = int(n_total * test_size)
-            n_train = n_total - n_test
-            df_train = df_sorted.iloc[:n_train].copy()
-            df_test = df_sorted.iloc[n_train:].copy()
-        
+            if not 0 < test_size < 1:
+                raise ValueError("test_size must be between 0 and 1")
+            deadlines = np.sort(df_sorted['forecast_time'].unique())
+            cutoff = deadlines[max(1, min(len(deadlines) - 1,
+                                        int(len(deadlines) * (1 - test_size))))]
+            df_train = df_sorted[df_sorted['forecast_time'] < cutoff].copy()
+            df_test = df_sorted[df_sorted['forecast_time'] >= cutoff].copy()
+
+        # A rescheduled older-GW result may not yet exist at the holdout origin.
+        df_train = df_train[df_train['result_time'] < df_test['forecast_time'].min()].copy()
+        if df_train.empty or df_test.empty:
+            raise ValueError("Temporal split must contain training and holdout rows")
+
         if verbose:
             split_label = f"season={test_season}" if test_season else f"temporal {test_size:.0%}"
             print(f"\nData split ({split_label}):")
@@ -401,9 +456,10 @@ class FPLPipeline:
             print("-" * 60)
         
         if use_subprocess:
-            self.tuned_params, cv_scores = self._tune_with_subprocess(models, n_iter, verbose, df_train)
+            new_params, cv_scores = self._tune_with_subprocess(models, n_iter, verbose, df_train)
         else:
-            self.tuned_params, cv_scores = self._tune_in_process(models, n_iter, verbose, df_train)
+            new_params, cv_scores = self._tune_in_process(models, n_iter, verbose, df_train)
+        self.tuned_params.update(new_params)
 
         # Evaluate on held-out test set
         if verbose:
@@ -448,1343 +504,182 @@ class FPLPipeline:
 
         return self
     
-    def _tune_in_process(self, models: list, n_iter: int, verbose: bool, df_train: pd.DataFrame) -> Dict:
-        """Run tuning in the current process using Optuna with TimeSeriesSplit CV.
+    def _tune_in_process(self, models, n_iter, verbose, df_train):
+        """Deadline-blocked CV, fold-local ranking/PCA, production model wrappers.
 
-        Feature selection is integrated into Optuna: ranking method and number of
-        features are hyperparameters. Rankings are pre-computed once per model before
-        trials begin, so each trial just slices the top-N from the chosen ranking.
-
-        Uses TimeSeriesSplit for time-aware cross-validation.
+        Minutes trials optimize the deployed mixture's Huber loss, not three
+        unrelated proxy objectives. Upstream OOF features are rebuilt within each
+        downstream fold; already-tuned upstream hyperparameters are held fixed.
         """
         import optuna
-        from sklearn.model_selection import cross_val_score, TimeSeriesSplit
-        from sklearn.metrics import make_scorer, mean_poisson_deviance
-        import xgboost as xgb
-        from .feature_selection import compute_feature_rankings, select_features
-
         optuna.logging.set_verbosity(optuna.logging.WARNING)
+        params_out, scores = {}, {}
+        frame = chronological_frame(df_train).sort_values('match_date').reset_index(drop=True)
+        order = [name for name in ('minutes', 'clean_sheet', 'goals', 'assists', 'defcon', 'saves')
+                 if name in models]
+        for name in order:
+            source = (CleanSheetModel().prepare_team_features(frame)
+                      if name == 'clean_sheet' else frame.copy())
+            if name == 'saves':
+                source = source[source['is_gk'] == 1].copy()
+            elif name == 'defcon':
+                # Unknown and ineligible fantasy positions are not zero-DefCon
+                # observations. They are outside this model's population.
+                source = source[
+                    source['fpl_position'].isin(['DEF', 'MID'])
+                    & source['defcon'].notna()
+                ].copy()
+            source = source.reset_index(drop=True)
+            folds = []
+            for ti, vi in deadline_splits(source):
+                tr, va = source.iloc[ti].copy(), source.iloc[vi].copy()
+                if name in ('goals', 'assists', 'defcon'):
+                    tr, va = self._dependency_frames(tr, va, need_team=name != 'defcon')
+                folds.append((tr, va))
+            if not folds:
+                raise ValueError(f"Not enough historical deadlines to tune {name}")
+            full = source
+            if name in ('goals', 'assists', 'defcon'):
+                full = self._dependency_frames(source, need_team=name != 'defcon')
+            available = [f for f in self._model_class(name).FEATURES if f in full.columns]
+            protected = [f for f in ('pred_minutes', 'pred_team_goals') if f in available]
 
-        tscv = TimeSeriesSplit(n_splits=5)
+            def rank(training):
+                # Fitting the actual wrapper also makes ranking respect weights,
+                # target caps, clean-sheet offsets and training-only manager PCA.
+                probe = self._fit_model(name, training,
+                                        {'n_estimators': 60, 'max_depth': 3})
+                if name == 'minutes':
+                    sub = probe.classifier
+                    if getattr(sub, 'constant_probability', None) is not None:
+                        return list(available)
+                    importance = dict(zip(sub.features_to_use, sub.model.feature_importances_))
+                    return sorted(available, key=lambda f: importance.get(f, 0), reverse=True)
+                importance = probe.feature_importance().set_index('feature')['importance']
+                return sorted(available, key=lambda f: importance.get(f, 0), reverse=True)
 
-        def huber_loss(y_true, y_pred, delta=10.0):
-            residual = np.abs(y_true - y_pred)
-            quadratic = np.minimum(residual, delta)
-            linear = residual - quadratic
-            return np.mean(0.5 * quadratic**2 + delta * linear)
+            rankings = [rank(tr) for tr, _ in folds]
+            selectable = max(1, len(available) - len(protected))
 
-        huber_scorer = make_scorer(huber_loss, greater_is_better=False)
+            def select(ranking, count):
+                return protected + [f for f in ranking if f not in protected][:count]
 
-        def safe_poisson_deviance(y_true, y_pred):
-            y_pred = np.clip(y_pred, 1e-8, None)
-            y_true = np.clip(y_true, 0, None)
-            return mean_poisson_deviance(y_true, y_pred)
-
-        poisson_scorer = make_scorer(safe_poisson_deviance, greater_is_better=False)
-
-        mae_scorer = 'neg_mean_absolute_error'
-        SCORING = {
-            'goals': ('Poisson Deviance', poisson_scorer),
-            'assists': ('Poisson Deviance', poisson_scorer),
-            'defcon': ('Poisson Deviance', poisson_scorer),
-            'minutes': ('Huber Loss', huber_scorer),
-            'saves': ('MAE', mae_scorer),
-        }
-
-        SEARCH_SPACES = {
-            'goals': {
-                'n_estimators': (100, 400),
-                'max_depth': (3, 7),
-                'learning_rate': (0.01, 0.3, 'log'),
-                'min_child_weight': (1, 10),
-                'colsample_bytree': (0.4, 1.0),
-                'subsample': (0.6, 1.0),
-                'reg_alpha': (1e-3, 10.0, 'log'),
-                'reg_lambda': (1e-3, 10.0, 'log'),
-            },
-            'assists': {
-                'n_estimators': (100, 400),
-                'max_depth': (3, 7),
-                'learning_rate': (0.01, 0.3, 'log'),
-                'min_child_weight': (1, 10),
-                'colsample_bytree': (0.4, 1.0),
-                'subsample': (0.6, 1.0),
-                'reg_alpha': (1e-3, 10.0, 'log'),
-                'reg_lambda': (1e-3, 10.0, 'log'),
-            },
-            'minutes': {
-                'n_estimators': (100, 400),
-                'max_depth': (3, 7),
-                'learning_rate': (0.01, 0.3, 'log'),
-                'min_child_weight': (1, 15),
-                'colsample_bytree': (0.4, 1.0),
-                'subsample': (0.6, 1.0),
-                'reg_alpha': (1e-3, 10.0, 'log'),
-                'reg_lambda': (1e-3, 10.0, 'log'),
-            },
-            'defcon': {
-                'n_estimators': (100, 400),
-                'max_depth': (3, 7),
-                'learning_rate': (0.01, 0.3, 'log'),
-                'min_child_weight': (1, 10),
-                'colsample_bytree': (0.4, 1.0),
-                'subsample': (0.6, 1.0),
-                'reg_alpha': (1e-3, 10.0, 'log'),
-                'reg_lambda': (1e-3, 10.0, 'log'),
-            },
-            'clean_sheet': {
-                'n_estimators': (50, 300),
-                'max_depth': (3, 8),
-                'learning_rate': (0.01, 0.3, 'log'),
-                'min_child_weight': (1, 10),
-                'colsample_bytree': (0.4, 1.0),
-                'subsample': (0.6, 1.0),
-                'reg_alpha': (1e-3, 10.0, 'log'),
-                'reg_lambda': (1e-3, 10.0, 'log'),
-            },
-            'saves': {
-                'n_estimators': (100, 400),
-                'max_depth': (3, 7),
-                'learning_rate': (0.01, 0.3, 'log'),
-                'min_child_weight': (1, 10),
-                'colsample_bytree': (0.4, 1.0),
-                'subsample': (0.6, 1.0),
-                'reg_alpha': (1e-3, 10.0, 'log'),
-                'reg_lambda': (1e-3, 10.0, 'log'),
-            },
-        }
-
-        # Min features per model (excluding protected features)
-        MIN_FEATURES = {
-            'goals': 15, 'assists': 5, 'defcon': 5, 'saves': 5,
-        }
-
-        # Protected features that must always be included
-        PROTECTED = {
-            'goals': ['pred_team_goals', 'pred_minutes'],
-            'assists': ['pred_team_goals', 'pred_minutes'],
-            'defcon': ['pred_minutes'],
-            'saves': [],
-        }
-
-        RANKING_METHODS = ['xgb_gain', 'xgb_cover', 'lgbm', 'permutation', 'mutual_info']
-
-        MODEL_CLASSES = {
-            'goals': GoalsModel,
-            'assists': AssistsModel,
-            'minutes': MinutesModel,
-            'defcon': DefconModel,
-            'clean_sheet': CleanSheetModel,
-            'saves': SavesModel,
-        }
-
-        tuned_params = {}
-        cv_scores = {}
-
-        # --- Dependency-ordered tuning with OOF feature generation ---
-        # 1. Minutes first → OOF pred_minutes for downstream models
-        # 2. Clean sheet → OOF pred_team_goals for goals/assists
-        # 3. Everything else uses the OOF predictions as features
-
-        # Stage 1: Tune minutes (no upstream dependencies)
-        if 'minutes' in models:
-            mins_result = self._tune_minutes_in_process(
-                n_iter, verbose, df_train, SEARCH_SPACES['minutes']
-            )
-            tuned_params['minutes'] = mins_result['params']
-            cv_scores['minutes'] = mins_result['cv_score']
-
-            # Generate OOF pred_minutes for downstream models
-            if verbose:
-                print(f"\n  Generating OOF pred_minutes for downstream models...")
-            df_train['pred_minutes'] = self._generate_oof_minutes(df_train, tuned_params['minutes'], verbose)
-        else:
-            # Fallback: use actual minutes
-            df_train['pred_minutes'] = df_train['minutes']
-
-        # Stage 2: Tune clean_sheet (no upstream dependencies)
-        if 'clean_sheet' in models:
-            cs_result = self._tune_clean_sheet_in_process(
-                n_iter, verbose, df_train, SEARCH_SPACES['clean_sheet']
-            )
-            tuned_params['clean_sheet'] = cs_result['params']
-            cv_scores['clean_sheet'] = cs_result['cv_score']
-
-            # Generate OOF pred_team_goals for downstream models
-            if verbose:
-                print(f"\n  Generating OOF pred_team_goals for downstream models...")
-            df_train = self._generate_oof_team_goals_for_tuning(df_train, tuned_params['clean_sheet'], verbose)
-
-        # Stage 3: Tune remaining models (goals, assists, defcon, saves)
-        # These now have OOF pred_minutes and pred_team_goals available as features
-        remaining = [m for m in models if m not in ('minutes', 'clean_sheet')]
-        for model_name in remaining:
-            if model_name not in MODEL_CLASSES:
-                continue
-
-            model_class = MODEL_CLASSES[model_name]
-            space = SEARCH_SPACES.get(model_name, {})
-            score_name, scorer = SCORING.get(model_name, ('RMSE', 'neg_root_mean_squared_error'))
-
-            model_instance = model_class()
-            all_features = [f for f in model_instance.FEATURES if f in df_train.columns]
-            target = model_instance.TARGET
-            n_total_features = len(all_features)
-            protected = [f for f in PROTECTED.get(model_name, []) if f in all_features]
-            min_feats = MIN_FEATURES.get(model_name, 5)
-
-            # Filter to GKs only for saves model
-            tune_df = df_train
-            if model_name == 'saves':
-                tune_df = df_train[df_train['is_gk'] == 1].copy()
-
-            X_full = tune_df[all_features].fillna(0).values
-            y = tune_df[target].fillna(0).values
-
-            if verbose:
-                print(f"\nTuning {model_name.upper()} ({n_iter} trials, TimeSeriesSplit CV, {score_name})...")
-                print(f"  Pre-computing feature rankings ({n_total_features} features, {len(RANKING_METHODS)} methods)...")
-
-            # Pre-compute rankings once
-            xgb_hint = {'objective': 'count:poisson'} if model_name in ('goals', 'assists', 'defcon') else {}
-            rankings = compute_feature_rankings(X_full, y, all_features, task='regression', xgb_params=xgb_hint)
-
-            if verbose:
-                print(f"  Rankings computed. Starting Optuna search...")
-
-            # Optuna tunes hyperparams + feature selection jointly
-            def objective(trial, _rankings=rankings, _all_features=all_features,
-                          _protected=protected, _min_feats=min_feats, _n_total=n_total_features):
-                params = {
-                    'n_estimators': trial.suggest_int('n_estimators', space['n_estimators'][0], space['n_estimators'][1]),
-                    'max_depth': trial.suggest_int('max_depth', space['max_depth'][0], space['max_depth'][1]),
-                    'learning_rate': trial.suggest_float('learning_rate', space['learning_rate'][0], space['learning_rate'][1], log=True),
-                    'min_child_weight': trial.suggest_int('min_child_weight', space['min_child_weight'][0], space['min_child_weight'][1]),
-                    'colsample_bytree': trial.suggest_float('colsample_bytree', space['colsample_bytree'][0], space['colsample_bytree'][1]),
-                    'subsample': trial.suggest_float('subsample', space['subsample'][0], space['subsample'][1]),
-                    'reg_alpha': trial.suggest_float('reg_alpha', space['reg_alpha'][0], space['reg_alpha'][1], log=True),
-                    'reg_lambda': trial.suggest_float('reg_lambda', space['reg_lambda'][0], space['reg_lambda'][1], log=True),
-                    'random_state': 42,
-                    'verbosity': 0,
-                    'n_jobs': -1,
+            def objective(trial):
+                candidate = {
+                    'n_estimators': trial.suggest_int('n_estimators', 50 if name == 'clean_sheet' else 100, 300),
+                    'max_depth': trial.suggest_int('max_depth', 3, 7),
+                    'learning_rate': trial.suggest_float('learning_rate', .01, .3, log=True),
+                    'min_child_weight': trial.suggest_int('min_child_weight', 1, 15),
+                    'colsample_bytree': trial.suggest_float('colsample_bytree', .4, 1.),
+                    'subsample': trial.suggest_float('subsample', .6, 1.),
+                    'reg_alpha': trial.suggest_float('reg_alpha', .001, 10., log=True),
+                    'reg_lambda': trial.suggest_float('reg_lambda', .001, 10., log=True),
                 }
+                count = trial.suggest_int('n_features', min(5, selectable), selectable)
+                losses, sizes = [], []
+                for (tr, va), ranking in zip(folds, rankings):
+                    model = self._fit_model(name, tr, {
+                        **candidate, 'selected_features': select(ranking, count)})
+                    target = 'goals_conceded' if name == 'clean_sheet' else model.TARGET
+                    losses.append(self._loss(name, va[target].fillna(0).to_numpy(),
+                                             self._model_predict(name, model, va)))
+                    sizes.append(len(va))
+                return float(np.average(losses, weights=sizes))
 
-                if model_name in ('goals', 'assists', 'defcon'):
-                    params['objective'] = 'count:poisson'
-
-                # Feature selection as hyperparameters
-                feat_method = trial.suggest_categorical('feat_method', RANKING_METHODS)
-                n_selectable = _n_total - len(_protected)
-                n_features = trial.suggest_int('n_features', _min_feats, n_selectable)
-
-                selected = select_features(_rankings, feat_method, n_features, _protected)
-                feat_idx = [_all_features.index(f) for f in selected]
-                X_sel = X_full[:, feat_idx]
-
-                model = xgb.XGBRegressor(**params)
-                scores = cross_val_score(model, X_sel, y, cv=tscv, scoring=scorer, n_jobs=1)
-                return -scores.mean()
-
-            study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=42))
+            study = optuna.create_study(direction='minimize',
+                                       sampler=optuna.samplers.TPESampler(seed=42))
             study.optimize(objective, n_trials=n_iter, show_progress_bar=verbose)
-
-            best_params = study.best_params.copy()
-
-            # Extract feature selection params
-            best_feat_method = best_params.pop('feat_method')
-            best_n_features = best_params.pop('n_features')
-            selected_features = select_features(rankings, best_feat_method, best_n_features, protected)
-
-            if model_name in ('goals', 'assists', 'defcon'):
-                best_params['objective'] = 'count:poisson'
-
-            tuned_params[model_name] = {
-                **best_params,
-                'selected_features': selected_features,
-            }
-            cv_scores[model_name] = study.best_value
-
+            best = study.best_params.copy()
+            count = best.pop('n_features')
+            best['selected_features'] = select(rank(full), count)
+            params_out[name] = best
+            scores[name] = study.best_value
+            self.tuned_params[name] = best
             if verbose:
-                print(f"  Best CV {score_name}: {study.best_value:.4f}")
-                print(f"  Feature method: {best_feat_method}, selected {len(selected_features)}/{n_total_features} features")
-
-        return tuned_params, cv_scores
-
-    def _tune_clean_sheet_in_process(self, n_iter: int, verbose: bool,
-                                      df_train: pd.DataFrame, space: dict) -> Dict:
-        """Tune CleanSheetModel (Poisson regression for goals against).
-
-        Feature selection is integrated into Optuna: ranking method and number of
-        features are hyperparameters alongside XGBoost params.
-        """
-        import optuna
-        from sklearn.model_selection import cross_val_score, TimeSeriesSplit
-        from sklearn.metrics import make_scorer, mean_poisson_deviance
-        import xgboost as xgb
-        from .feature_selection import compute_feature_rankings, select_features
-
-        RANKING_METHODS = ['xgb_gain', 'xgb_cover', 'lgbm', 'permutation', 'mutual_info']
-
-        def safe_poisson_deviance(y_true, y_pred):
-            y_pred = np.clip(y_pred, 1e-8, None)
-            y_true = np.clip(y_true, 0, None)
-            return mean_poisson_deviance(y_true, y_pred)
-        poisson_scorer = make_scorer(safe_poisson_deviance, greater_is_better=False)
-
-        tscv = TimeSeriesSplit(n_splits=5)
-
-        # Prepare team-level data (already sorted temporally by prepare_team_features)
-        cs_model = CleanSheetModel()
-        team_df = cs_model.prepare_team_features(df_train)
-        team_df = team_df.dropna(subset=['team_conceded_roll5', 'goals_conceded'])
-
-        all_features = [f for f in cs_model.FEATURES if f in team_df.columns]
-        n_total_features = len(all_features)
-        X_full = team_df[all_features].fillna(0).values
-        y = team_df['goals_conceded'].fillna(0).values
-
-        if verbose:
-            print(f"\nTuning GOALS_AGAINST ({n_iter} trials, TimeSeriesSplit CV, Poisson Deviance)...")
-            print(f"  Pre-computing feature rankings ({n_total_features} features, {len(RANKING_METHODS)} methods)...")
-            print(f"  Team-matches: {len(X_full)}, Avg conceded: {y.mean():.3f}")
-
-        # Pre-compute rankings
-        rankings = compute_feature_rankings(X_full, y, all_features, task='regression',
-                                            xgb_params={'objective': 'count:poisson'})
-
-        if verbose:
-            print(f"  Rankings computed. Starting Optuna search...")
-
-        def objective(trial):
-            params = {
-                'n_estimators': trial.suggest_int('n_estimators', space['n_estimators'][0], space['n_estimators'][1]),
-                'max_depth': trial.suggest_int('max_depth', space['max_depth'][0], space['max_depth'][1]),
-                'learning_rate': trial.suggest_float('learning_rate', space['learning_rate'][0], space['learning_rate'][1], log=True),
-                'min_child_weight': trial.suggest_int('min_child_weight', space['min_child_weight'][0], space['min_child_weight'][1]),
-                'colsample_bytree': trial.suggest_float('colsample_bytree', space['colsample_bytree'][0], space['colsample_bytree'][1]),
-                'subsample': trial.suggest_float('subsample', space['subsample'][0], space['subsample'][1]),
-                'reg_alpha': trial.suggest_float('reg_alpha', space['reg_alpha'][0], space['reg_alpha'][1], log=True),
-                'reg_lambda': trial.suggest_float('reg_lambda', space['reg_lambda'][0], space['reg_lambda'][1], log=True),
-                'random_state': 42,
-                'verbosity': 0,
-                'n_jobs': -1,
-                'objective': 'count:poisson',
-            }
-
-            # Feature selection as hyperparameters
-            feat_method = trial.suggest_categorical('feat_method', RANKING_METHODS)
-            n_features = trial.suggest_int('n_features', 5, n_total_features)
-
-            selected = select_features(rankings, feat_method, n_features)
-            feat_idx = [all_features.index(f) for f in selected]
-            X_sel = X_full[:, feat_idx]
-
-            model = xgb.XGBRegressor(**params)
-            scores = cross_val_score(model, X_sel, y, cv=tscv, scoring=poisson_scorer, n_jobs=1)
-            return -scores.mean()
-
-        study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=42))
-        study.optimize(objective, n_trials=n_iter, show_progress_bar=verbose)
-
-        best_params = study.best_params.copy()
-
-        # Extract feature selection params
-        best_feat_method = best_params.pop('feat_method')
-        best_n_features = best_params.pop('n_features')
-        selected_features = select_features(rankings, best_feat_method, best_n_features)
-
-        if verbose:
-            print(f"  Best CV Poisson Deviance: {study.best_value:.4f}")
-            print(f"  Feature method: {best_feat_method}, selected {len(selected_features)}/{n_total_features} features")
-
-        return {
-            'params': {**best_params, 'selected_features': selected_features},
-            'cv_score': study.best_value,
-        }
-
-    def _tune_minutes_in_process(self, n_iter: int, verbose: bool,
-                                  df_train: pd.DataFrame, space: dict) -> dict:
-        """Tune the two-stage MinutesModel: classifier + starter regressor + sub regressor.
-
-        Each sub-model gets its own Optuna pass with integrated feature selection.
-        Returns nested params dict.
-        """
-        import optuna
-        from sklearn.model_selection import cross_val_score, TimeSeriesSplit
-        from sklearn.metrics import make_scorer, log_loss
-        import xgboost as xgb
-        from .feature_selection import compute_feature_rankings, select_features
-
-        RANKING_METHODS = ['xgb_gain', 'xgb_cover', 'lgbm', 'permutation', 'mutual_info']
-
-        optuna.logging.set_verbosity(optuna.logging.WARNING)
-        tscv = TimeSeriesSplit(n_splits=5)
-
-        df_played = df_train[df_train['minutes'] >= 1].copy()
-        df_played = df_played.sort_values(['season', 'gameweek'])
-
-        if verbose:
-            print(f"\nTuning MINUTES (two-stage, {n_iter} trials each)...")
-            print(f"  Total played: {len(df_played):,}")
-
-        # ---- 1. StarterClassifier (log-loss) ----
-        cls_features = [f for f in MINUTES_ALL_FEATURES if f in df_played.columns]
-        X_cls = df_played[cls_features].fillna(0).values
-        y_cls = (df_played['minutes'] >= 60).astype(int).values
-        n_cls_features = len(cls_features)
-
-        if verbose:
-            print(f"\n  [1/3] StarterClassifier ({n_cls_features} features, {y_cls.mean():.1%} starters)")
-            print(f"    Pre-computing feature rankings...")
-
-        cls_rankings = compute_feature_rankings(X_cls, y_cls, cls_features, task='classification')
-
-        def cls_objective(trial):
-            params = {
-                'n_estimators': trial.suggest_int('n_estimators', space['n_estimators'][0], space['n_estimators'][1]),
-                'max_depth': trial.suggest_int('max_depth', space['max_depth'][0], space['max_depth'][1]),
-                'learning_rate': trial.suggest_float('learning_rate', space['learning_rate'][0], space['learning_rate'][1], log=True),
-                'min_child_weight': trial.suggest_int('min_child_weight', space['min_child_weight'][0], space['min_child_weight'][1]),
-                'colsample_bytree': trial.suggest_float('colsample_bytree', space['colsample_bytree'][0], space['colsample_bytree'][1]),
-                'subsample': trial.suggest_float('subsample', space['subsample'][0], space['subsample'][1]),
-                'reg_alpha': trial.suggest_float('reg_alpha', space['reg_alpha'][0], space['reg_alpha'][1], log=True),
-                'reg_lambda': trial.suggest_float('reg_lambda', space['reg_lambda'][0], space['reg_lambda'][1], log=True),
-                'random_state': 42, 'verbosity': 0, 'n_jobs': -1,
-                'eval_metric': 'logloss', 'use_label_encoder': False,
-            }
-            feat_method = trial.suggest_categorical('feat_method', RANKING_METHODS)
-            n_features = trial.suggest_int('n_features', 5, n_cls_features)
-            selected = select_features(cls_rankings, feat_method, n_features)
-            feat_idx = [cls_features.index(f) for f in selected]
-            X_sel = X_cls[:, feat_idx]
-
-            model = xgb.XGBClassifier(**params)
-            scores = cross_val_score(model, X_sel, y_cls, cv=tscv, scoring='neg_log_loss', n_jobs=1)
-            return -scores.mean()
-
-        study_cls = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=42))
-        study_cls.optimize(cls_objective, n_trials=n_iter, show_progress_bar=verbose)
-        cls_best = study_cls.best_params.copy()
-        cls_feat_method = cls_best.pop('feat_method')
-        cls_n_features = cls_best.pop('n_features')
-        cls_selected = select_features(cls_rankings, cls_feat_method, cls_n_features)
-
-        if verbose:
-            print(f"    Best CV LogLoss: {study_cls.best_value:.4f}")
-            print(f"    Feature method: {cls_feat_method}, selected {len(cls_selected)}/{n_cls_features} features")
-
-        # ---- 2. StarterMinutesModel (MAE, trained on 60+ only) ----
-        df_starters = df_played[df_played['minutes'] >= 60].copy()
-        starter_features = [f for f in STARTER_FEATURES if f in df_starters.columns]
-        X_start = df_starters[starter_features].fillna(0).values
-        y_start = df_starters['minutes'].values
-        n_starter_features = len(starter_features)
-
-        if verbose:
-            print(f"\n  [2/3] StarterMinutesModel ({n_starter_features} features, {len(df_starters):,} samples)")
-            print(f"    Pre-computing feature rankings...")
-
-        starter_rankings = compute_feature_rankings(X_start, y_start, starter_features, task='regression')
-
-        def starter_objective(trial):
-            params = {
-                'n_estimators': trial.suggest_int('n_estimators', space['n_estimators'][0], space['n_estimators'][1]),
-                'max_depth': trial.suggest_int('max_depth', space['max_depth'][0], space['max_depth'][1]),
-                'learning_rate': trial.suggest_float('learning_rate', space['learning_rate'][0], space['learning_rate'][1], log=True),
-                'min_child_weight': trial.suggest_int('min_child_weight', space['min_child_weight'][0], space['min_child_weight'][1]),
-                'colsample_bytree': trial.suggest_float('colsample_bytree', space['colsample_bytree'][0], space['colsample_bytree'][1]),
-                'subsample': trial.suggest_float('subsample', space['subsample'][0], space['subsample'][1]),
-                'reg_alpha': trial.suggest_float('reg_alpha', space['reg_alpha'][0], space['reg_alpha'][1], log=True),
-                'reg_lambda': trial.suggest_float('reg_lambda', space['reg_lambda'][0], space['reg_lambda'][1], log=True),
-                'random_state': 42, 'verbosity': 0, 'n_jobs': -1,
-            }
-            feat_method = trial.suggest_categorical('feat_method', RANKING_METHODS)
-            n_features = trial.suggest_int('n_features', 5, n_starter_features)
-            selected = select_features(starter_rankings, feat_method, n_features)
-            feat_idx = [starter_features.index(f) for f in selected]
-            X_sel = X_start[:, feat_idx]
-
-            model = xgb.XGBRegressor(**params)
-            scores = cross_val_score(model, X_sel, y_start, cv=tscv, scoring='neg_mean_absolute_error', n_jobs=1)
-            return -scores.mean()
-
-        study_start = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=43))
-        study_start.optimize(starter_objective, n_trials=n_iter, show_progress_bar=verbose)
-        starter_best = study_start.best_params.copy()
-        starter_feat_method = starter_best.pop('feat_method')
-        starter_n_features = starter_best.pop('n_features')
-        starter_selected = select_features(starter_rankings, starter_feat_method, starter_n_features)
-
-        if verbose:
-            print(f"    Best CV MAE: {study_start.best_value:.4f}")
-            print(f"    Feature method: {starter_feat_method}, selected {len(starter_selected)}/{n_starter_features} features")
-
-        # ---- 3. SubMinutesModel (MAE, trained on 1-59 only) ----
-        df_subs = df_played[(df_played['minutes'] >= 1) & (df_played['minutes'] < 60)].copy()
-        sub_features = [f for f in SUB_FEATURES if f in df_subs.columns]
-        X_sub = df_subs[sub_features].fillna(0).values
-        y_sub = df_subs['minutes'].values
-        n_sub_features = len(sub_features)
-
-        if verbose:
-            print(f"\n  [3/3] SubMinutesModel ({n_sub_features} features, {len(df_subs):,} samples)")
-            print(f"    Pre-computing feature rankings...")
-
-        sub_rankings = compute_feature_rankings(X_sub, y_sub, sub_features, task='regression')
-
-        def sub_objective(trial):
-            params = {
-                'n_estimators': trial.suggest_int('n_estimators', space['n_estimators'][0], space['n_estimators'][1]),
-                'max_depth': trial.suggest_int('max_depth', space['max_depth'][0], space['max_depth'][1]),
-                'learning_rate': trial.suggest_float('learning_rate', space['learning_rate'][0], space['learning_rate'][1], log=True),
-                'min_child_weight': trial.suggest_int('min_child_weight', space['min_child_weight'][0], space['min_child_weight'][1]),
-                'colsample_bytree': trial.suggest_float('colsample_bytree', space['colsample_bytree'][0], space['colsample_bytree'][1]),
-                'subsample': trial.suggest_float('subsample', space['subsample'][0], space['subsample'][1]),
-                'reg_alpha': trial.suggest_float('reg_alpha', space['reg_alpha'][0], space['reg_alpha'][1], log=True),
-                'reg_lambda': trial.suggest_float('reg_lambda', space['reg_lambda'][0], space['reg_lambda'][1], log=True),
-                'random_state': 42, 'verbosity': 0, 'n_jobs': -1,
-            }
-            feat_method = trial.suggest_categorical('feat_method', RANKING_METHODS)
-            n_features = trial.suggest_int('n_features', 3, n_sub_features)
-            selected = select_features(sub_rankings, feat_method, n_features)
-            feat_idx = [sub_features.index(f) for f in selected]
-            X_sel = X_sub[:, feat_idx]
-
-            model = xgb.XGBRegressor(**params)
-            scores = cross_val_score(model, X_sel, y_sub, cv=tscv, scoring='neg_mean_absolute_error', n_jobs=1)
-            return -scores.mean()
-
-        study_sub = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=44))
-        study_sub.optimize(sub_objective, n_trials=n_iter, show_progress_bar=verbose)
-        sub_best = study_sub.best_params.copy()
-        sub_feat_method = sub_best.pop('feat_method')
-        sub_n_features = sub_best.pop('n_features')
-        sub_selected = select_features(sub_rankings, sub_feat_method, sub_n_features)
-
-        if verbose:
-            print(f"    Best CV MAE: {study_sub.best_value:.4f}")
-            print(f"    Feature method: {sub_feat_method}, selected {len(sub_selected)}/{n_sub_features} features")
-
-        # Build nested params
-        nested_params = {
-            'classifier_params': {**cls_best, 'selected_features': cls_selected},
-            'starter_params': {**starter_best, 'selected_features': starter_selected},
-            'sub_params': {**sub_best, 'selected_features': sub_selected},
-        }
-
-        # Combined CV score: weighted average of classifier log-loss (as proxy)
-        combined_cv = study_cls.best_value
-
-        return {
-            'params': nested_params,
-            'cv_score': combined_cv,
-        }
-
-    def _generate_oof_minutes(self, df_train: pd.DataFrame, mins_params: dict,
-                               verbose: bool = True) -> np.ndarray:
-        """Generate out-of-fold predicted minutes on training data.
-
-        Uses TimeSeriesSplit to produce leak-free pred_minutes that downstream
-        models (goals, assists, defcon) see during tuning — matching what they'll
-        see at inference time when actual minutes are unknown.
-
-        Returns an array of OOF predictions aligned to df_train's index.
-        """
-        from sklearn.model_selection import TimeSeriesSplit
-
-        df_played = df_train[df_train['minutes'] >= 1].copy()
-        df_played = df_played.sort_values(['season', 'gameweek']).reset_index(drop=True)
-
-        tscv = TimeSeriesSplit(n_splits=5)
-        oof_preds = np.full(len(df_played), np.nan)
-
-        for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(df_played)):
-            fold_train = df_played.iloc[train_idx]
-            fold_val = df_played.iloc[val_idx]
-
-            fold_model = MinutesModel(**mins_params)
-            fold_model.fit(fold_train, verbose=False)
-            oof_preds[val_idx] = fold_model.predict(fold_val)
-
-        # For rows not covered by any val fold (early data), use actual minutes
-        missing = np.isnan(oof_preds)
-        oof_preds[missing] = df_played.loc[missing, 'minutes'].values
-
-        # Map back to original df_train index
-        result = pd.Series(df_train['minutes'].values, index=df_train.index)
-        # df_played was sorted and reset, so map via player_id + season + gameweek
-        oof_series = pd.Series(oof_preds, index=df_played.index)
-        # Since df_played is a filtered/sorted copy, merge back by matching original indices
-        played_original_idx = df_train[df_train['minutes'] >= 1].sort_values(['season', 'gameweek']).index
-        for i, orig_idx in enumerate(played_original_idx):
-            result.loc[orig_idx] = oof_preds[i]
-
-        if verbose:
-            valid = (~np.isnan(oof_preds)).sum()
-            mae = np.nanmean(np.abs(oof_preds - df_played['minutes'].values))
-            print(f"  OOF pred_minutes: {valid:,} predictions, MAE={mae:.2f}")
-
-        return result.values
-
-    def _generate_oof_team_goals_for_tuning(self, df_train: pd.DataFrame, cs_params: dict,
-                                              verbose: bool = True) -> pd.DataFrame:
-        """Generate out-of-fold predicted team goals on training data.
-
-        Uses TimeSeriesSplit on team-level data to produce leak-free pred_team_goals,
-        then maps back to player-level rows so goals/assists models see realistic
-        predictions during tuning.
-
-        Returns df_train with pred_team_goals column added/updated.
-        """
-        from sklearn.model_selection import TimeSeriesSplit
-        import xgboost as xgb
-
-        cs_model = CleanSheetModel()
-        team_df = cs_model.prepare_team_features(df_train)
-        team_df = team_df.dropna(subset=['team_conceded_roll5', 'goals_conceded'])
-        team_df = team_df.sort_values(['season', 'gameweek']).reset_index(drop=True)
-
-        selected_features = cs_params.get('selected_features', None)
-        features = selected_features if selected_features else [f for f in cs_model.FEATURES if f in team_df.columns]
-        X = team_df[features].fillna(0).values
-        y = team_df['goals_conceded'].fillna(0).values
-
-        xgb_params = {k: v for k, v in cs_params.items() if k not in ('selected_features',)}
-        xgb_params.setdefault('objective', 'count:poisson')
-        xgb_params.setdefault('random_state', 42)
-        xgb_params.setdefault('verbosity', 0)
-
-        tscv = TimeSeriesSplit(n_splits=5)
-        oof_preds = np.full(len(y), np.nan)
-
-        for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(X)):
-            model = xgb.XGBRegressor(**xgb_params)
-            model.fit(X[train_idx], y[train_idx])
-            oof_preds[val_idx] = np.clip(model.predict(X[val_idx]), 1e-6, 10.0)
-
-        # Fill early folds with actual values
-        missing = np.isnan(oof_preds)
-        oof_preds[missing] = y[missing]
-
-        team_df['oof_goals_conceded'] = oof_preds
-
-        # Map to player-level: pred_team_goals = opponent's predicted goals conceded
-        def normalize_name(name):
-            if pd.isna(name):
-                return ''
-            return str(name).lower().replace(' ', '_').replace("'", "").strip()
-
-        opp_lookup = team_df[['team', 'season', 'gameweek', 'oof_goals_conceded']].copy()
-        opp_lookup = opp_lookup.rename(columns={
-            'team': 'opponent',
-            'oof_goals_conceded': 'pred_team_goals'
-        })
-        opp_lookup['opponent_norm'] = opp_lookup['opponent'].apply(normalize_name)
-        opp_lookup = opp_lookup.drop_duplicates(subset=['opponent_norm', 'season', 'gameweek'], keep='first')
-
-        df_train['opponent_norm'] = df_train['opponent'].apply(normalize_name)
-
-        if 'pred_team_goals' in df_train.columns:
-            df_train = df_train.drop(columns=['pred_team_goals'])
-
-        n_before = len(df_train)
-        df_train = df_train.merge(
-            opp_lookup[['opponent_norm', 'season', 'gameweek', 'pred_team_goals']],
-            on=['opponent_norm', 'season', 'gameweek'],
-            how='left'
-        )
-        if len(df_train) != n_before:
-            df_train = df_train.drop_duplicates(subset=['player_id', 'season', 'gameweek'], keep='first')
-
-        df_train['pred_team_goals'] = df_train['pred_team_goals'].fillna(1.3)
-        df_train = df_train.drop(columns=['opponent_norm'], errors='ignore')
-
-        if verbose:
-            valid = df_train['pred_team_goals'].notna().sum()
-            print(f"  OOF pred_team_goals: mapped to {valid:,}/{len(df_train):,} player rows")
-            print(f"  Mean pred_team_goals: {df_train['pred_team_goals'].mean():.3f}")
-
-        return df_train
-
-    def _tune_with_subprocess(self, models: list, n_iter: int, verbose: bool, df_train: pd.DataFrame) -> Dict:
-        """Run each model's tuning in a separate subprocess to save RAM.
-
-        Dependency-ordered: minutes and clean_sheet tune first (in-process) to
-        generate OOF predictions. Remaining models run in subprocesses with
-        OOF pred_minutes and pred_team_goals available as features.
-        """
-        import subprocess
-        import sys
-        import json
-        import tempfile
-        import os
-
-        SCORING_NAMES = {
-            'goals': 'Poisson Deviance',
-            'assists': 'Poisson Deviance',
-            'defcon': 'Poisson Deviance',
-            'minutes': 'Huber Loss',
-            'clean_sheet': 'Poisson Deviance',
-            'saves': 'MAE',
-        }
-
-        SEARCH_SPACES_CS = {
-            'n_estimators': (50, 300),
-            'max_depth': (3, 8),
-            'learning_rate': (0.01, 0.3, 'log'),
-            'min_child_weight': (1, 10),
-            'colsample_bytree': (0.4, 1.0),
-            'subsample': (0.6, 1.0),
-            'reg_alpha': (1e-3, 10.0, 'log'),
-            'reg_lambda': (1e-3, 10.0, 'log'),
-        }
-
-        tuned_params = {}
-        cv_scores = {}
-
-        # --- Stage 1: Tune minutes (in-process) + generate OOF pred_minutes ---
-        if 'minutes' in models:
-            mins_result = self._tune_minutes_in_process(
-                n_iter, verbose, df_train, {
-                    'n_estimators': (100, 400),
-                    'max_depth': (3, 7),
-                    'learning_rate': (0.01, 0.3, 'log'),
-                    'min_child_weight': (1, 15),
-                    'colsample_bytree': (0.4, 1.0),
-                    'subsample': (0.6, 1.0),
-                    'reg_alpha': (1e-3, 10.0, 'log'),
-                    'reg_lambda': (1e-3, 10.0, 'log'),
-                }
-            )
-            tuned_params['minutes'] = mins_result['params']
-            cv_scores['minutes'] = mins_result['cv_score']
-
-            if verbose:
-                print(f"\n  Generating OOF pred_minutes for downstream models...")
-            df_train['pred_minutes'] = self._generate_oof_minutes(df_train, tuned_params['minutes'], verbose)
-        else:
-            df_train['pred_minutes'] = df_train['minutes']
-
-        # --- Stage 2: Tune clean_sheet (in-process) + generate OOF pred_team_goals ---
-        if 'clean_sheet' in models:
-            cs_result = self._tune_clean_sheet_in_process(
-                n_iter, verbose, df_train, SEARCH_SPACES_CS
-            )
-            tuned_params['clean_sheet'] = cs_result['params']
-            cv_scores['clean_sheet'] = cs_result['cv_score']
-
-            if verbose:
-                print(f"\n  Generating OOF pred_team_goals for downstream models...")
-            df_train = self._generate_oof_team_goals_for_tuning(df_train, tuned_params['clean_sheet'], verbose)
-
-        # --- Stage 3: Remaining models in subprocess (with OOF features in CSV) ---
-        remaining = [m for m in models if m not in ('minutes', 'clean_sheet')]
-
-        # Save training data (now including OOF pred_minutes and pred_team_goals)
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, encoding='utf-8') as f:
-            temp_data_path = f.name
-            df_train.to_csv(f, index=False)
-
-        try:
-            for model_name in remaining:
-                score_name = SCORING_NAMES.get(model_name, 'RMSE')
-                if verbose:
-                    print(f"\nTuning {model_name.upper()} ({n_iter} trials, TimeSeriesSplit CV, {score_name}) in subprocess...")
-
-                # Create temp file for results
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-                    temp_result_path = f.name
-
-                # Python script to run in subprocess
-                tune_script = f'''
-import pandas as pd
-import numpy as np
-import json
-import sys
-import optuna
-from sklearn.model_selection import cross_val_score, TimeSeriesSplit
-from sklearn.metrics import make_scorer, mean_poisson_deviance
-import xgboost as xgb
-
-optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-sys.path.insert(0, r"{self.data_dir.parent}")
-from src.models import GoalsModel, AssistsModel, MinutesModel, DefconModel, SavesModel
-from src.feature_selection import compute_feature_rankings, select_features
-
-def huber_loss(y_true, y_pred, delta=10.0):
-    residual = np.abs(y_true - y_pred)
-    quadratic = np.minimum(residual, delta)
-    linear = residual - quadratic
-    return np.mean(0.5 * quadratic**2 + delta * linear)
-
-huber_scorer = make_scorer(huber_loss, greater_is_better=False)
-
-def safe_poisson_deviance(y_true, y_pred):
-    y_pred = np.clip(y_pred, 1e-8, None)
-    y_true = np.clip(y_true, 0, None)
-    return mean_poisson_deviance(y_true, y_pred)
-
-poisson_scorer = make_scorer(safe_poisson_deviance, greater_is_better=False)
-
-SCORING = {{
-    'goals': poisson_scorer,
-    'assists': poisson_scorer,
-    'defcon': poisson_scorer,
-    'minutes': huber_scorer,
-    'saves': 'neg_mean_absolute_error',
-}}
-
-MODEL_CLASSES = {{
-    'goals': GoalsModel,
-    'assists': AssistsModel,
-    'minutes': MinutesModel,
-    'defcon': DefconModel,
-    'saves': SavesModel,
-}}
-
-SEARCH_SPACES = {{
-    'goals': {{
-        'n_estimators': (100, 400),
-        'max_depth': (3, 7),
-        'learning_rate': (0.01, 0.3),
-        'min_child_weight': (1, 10),
-        'colsample_bytree': (0.4, 1.0),
-        'subsample': (0.6, 1.0),
-        'reg_alpha': (1e-3, 10.0),
-        'reg_lambda': (1e-3, 10.0),
-    }},
-    'assists': {{
-        'n_estimators': (100, 400),
-        'max_depth': (3, 7),
-        'learning_rate': (0.01, 0.3),
-        'min_child_weight': (1, 10),
-        'colsample_bytree': (0.4, 1.0),
-        'subsample': (0.6, 1.0),
-        'reg_alpha': (1e-3, 10.0),
-        'reg_lambda': (1e-3, 10.0),
-    }},
-    'minutes': {{
-        'n_estimators': (100, 400),
-        'max_depth': (3, 7),
-        'learning_rate': (0.01, 0.3),
-        'min_child_weight': (1, 15),
-        'colsample_bytree': (0.4, 1.0),
-        'subsample': (0.6, 1.0),
-        'reg_alpha': (1e-3, 10.0),
-        'reg_lambda': (1e-3, 10.0),
-    }},
-    'defcon': {{
-        'n_estimators': (100, 400),
-        'max_depth': (3, 7),
-        'learning_rate': (0.01, 0.3),
-        'min_child_weight': (1, 10),
-        'colsample_bytree': (0.4, 1.0),
-        'subsample': (0.6, 1.0),
-        'reg_alpha': (1e-3, 10.0),
-        'reg_lambda': (1e-3, 10.0),
-    }},
-    'saves': {{
-        'n_estimators': (100, 400),
-        'max_depth': (3, 7),
-        'learning_rate': (0.01, 0.3),
-        'min_child_weight': (1, 10),
-        'colsample_bytree': (0.4, 1.0),
-        'subsample': (0.6, 1.0),
-        'reg_alpha': (1e-3, 10.0),
-        'reg_lambda': (1e-3, 10.0),
-    }},
-}}
-
-PROTECTED = {{
-    'goals': ['pred_team_goals', 'pred_minutes'],
-    'assists': ['pred_team_goals', 'pred_minutes'],
-    'defcon': ['pred_minutes'],
-    'saves': [],
-}}
-MIN_FEATURES = {{
-    'goals': 15, 'assists': 5, 'defcon': 5, 'saves': 5,
-}}
-RANKING_METHODS = ['xgb_gain', 'xgb_cover', 'lgbm', 'permutation', 'mutual_info']
-
-model_name = "{model_name}"
-n_iter = {n_iter}
-score_name = "{score_name}"
-
-df_train = pd.read_csv(r"{temp_data_path}", encoding='utf-8')
-# pred_minutes and pred_team_goals are already in the CSV (OOF values from upstream models)
-model_class = MODEL_CLASSES[model_name]
-space = SEARCH_SPACES[model_name]
-scorer = SCORING[model_name]
-
-model_instance = model_class()
-all_features = [f for f in model_instance.FEATURES if f in df_train.columns]
-target = model_instance.TARGET
-n_total_features = len(all_features)
-protected = [f for f in PROTECTED.get(model_name, []) if f in all_features]
-min_feats = MIN_FEATURES.get(model_name, 5)
-
-# Filter to GKs only for saves model
-if model_name == 'saves':
-    df_train = df_train[df_train['is_gk'] == 1].copy()
-
-X_full = df_train[all_features].fillna(0).values
-y = df_train[target].fillna(0).values
-
-tscv = TimeSeriesSplit(n_splits=5)
-
-# Pre-compute feature rankings
-xgb_hint = {{'objective': 'count:poisson'}} if model_name in ('goals', 'assists', 'defcon') else {{}}
-print(f"Pre-computing feature rankings ({{n_total_features}} features, {{len(RANKING_METHODS)}} methods)...")
-rankings = compute_feature_rankings(X_full, y, all_features, task='regression', xgb_params=xgb_hint)
-print(f"Rankings computed. Starting Optuna search...")
-
-def objective(trial):
-    params = {{
-        'n_estimators': trial.suggest_int('n_estimators', space['n_estimators'][0], space['n_estimators'][1]),
-        'max_depth': trial.suggest_int('max_depth', space['max_depth'][0], space['max_depth'][1]),
-        'learning_rate': trial.suggest_float('learning_rate', space['learning_rate'][0], space['learning_rate'][1], log=True),
-        'min_child_weight': trial.suggest_int('min_child_weight', space['min_child_weight'][0], space['min_child_weight'][1]),
-        'colsample_bytree': trial.suggest_float('colsample_bytree', space['colsample_bytree'][0], space['colsample_bytree'][1]),
-        'subsample': trial.suggest_float('subsample', space['subsample'][0], space['subsample'][1]),
-        'reg_alpha': trial.suggest_float('reg_alpha', space['reg_alpha'][0], space['reg_alpha'][1], log=True),
-        'reg_lambda': trial.suggest_float('reg_lambda', space['reg_lambda'][0], space['reg_lambda'][1], log=True),
-        'random_state': 42,
-        'verbosity': 0,
-        'n_jobs': -1,
-    }}
-
-    if model_name in ('goals', 'assists', 'defcon'):
-        params['objective'] = 'count:poisson'
-
-    # Feature selection as hyperparameters
-    feat_method = trial.suggest_categorical('feat_method', RANKING_METHODS)
-    n_selectable = n_total_features - len(protected)
-    n_features = trial.suggest_int('n_features', min_feats, n_selectable)
-
-    selected = select_features(rankings, feat_method, n_features, protected)
-    feat_idx = [all_features.index(f) for f in selected]
-    X_sel = X_full[:, feat_idx]
-
-    model = xgb.XGBRegressor(**params)
-    scores = cross_val_score(model, X_sel, y, cv=tscv, scoring=scorer, n_jobs=1)
-    return -scores.mean()
-
-study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=42))
-study.optimize(objective, n_trials=n_iter, show_progress_bar=False)
-
-best_params = study.best_params.copy()
-best_feat_method = best_params.pop('feat_method')
-best_n_features = best_params.pop('n_features')
-selected_features = select_features(rankings, best_feat_method, best_n_features, protected)
-
-if model_name in ('goals', 'assists', 'defcon'):
-    best_params['objective'] = 'count:poisson'
-
-print(f"Best CV {{score_name}}: {{study.best_value:.4f}}")
-print(f"Feature method: {{best_feat_method}}, selected {{len(selected_features)}}/{{n_total_features}} features")
-
-result = {{
-    'best_params': best_params,
-    'best_score': study.best_value,
-    'selected_features': selected_features,
-}}
-
-with open(r"{temp_result_path}", 'w') as f:
-    json.dump(result, f)
-'''
-
-                # Run in subprocess
-                result = subprocess.run(
-                    [sys.executable, '-c', tune_script],
-                    capture_output=True,
-                    text=True
-                )
-
-                if result.returncode != 0:
-                    if verbose:
-                        print(f"  ERROR: {result.stderr}")
-                    continue
-
-                # Print subprocess output
-                if verbose and result.stdout:
-                    for line in result.stdout.strip().split('\n'):
-                        print(f"  {line}")
-
-                # Read results
-                try:
-                    with open(temp_result_path, 'r') as f:
-                        tune_result = json.load(f)
-                    tuned_params[model_name] = {
-                        **tune_result['best_params'],
-                        'selected_features': tune_result.get('selected_features', []),
-                    }
-                    cv_scores[model_name] = tune_result.get('best_score')
-                except Exception as e:
-                    if verbose:
-                        print(f"  Failed to read results: {e}")
-                finally:
-                    try:
-                        os.unlink(temp_result_path)
-                    except:
-                        pass
-        finally:
-            try:
-                os.unlink(temp_data_path)
-            except:
-                pass
-
-        return tuned_params, cv_scores
-
-    def _evaluate_on_test_set(self, models: list, df_train: pd.DataFrame,
-                               df_test: pd.DataFrame, verbose: bool):
-        """Train models on train set with tuned params and evaluate on test set.
-        
-        Reports metrics matching the tuning loss functions:
-        - Goals, Assists: Poisson deviance (count data)
-        - Defcon: RMSE (continuous metric)
-        - Minutes: Huber loss + MAE
-        - Clean Sheet: Poisson deviance (actual count data)
-        """
-        from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_poisson_deviance
-        import xgboost as xgb
-        
-        # Custom Huber loss
-        def huber_loss(y_true, y_pred, delta=10.0):
-            residual = np.abs(y_true - y_pred)
-            quadratic = np.minimum(residual, delta)
-            linear = residual - quadratic
-            return np.mean(0.5 * quadratic**2 + delta * linear)
-        
-        # RMSE helper
-        def rmse(y_true, y_pred):
-            return np.sqrt(mean_squared_error(y_true, y_pred))
-        
-        # Safe Poisson deviance (used for clean sheet goals conceded evaluation)
-        def safe_poisson_deviance(y_true, y_pred):
-            y_pred = np.clip(y_pred, 1e-8, None)
-            y_true = np.clip(y_true, 0, None)
-            return mean_poisson_deviance(y_true, y_pred)
-        
-        from sklearn.metrics import roc_auc_score
-        
-        MODEL_CLASSES = {
-            'goals': GoalsModel,
-            'assists': AssistsModel,
-            'minutes': MinutesModel,
-            'defcon': DefconModel,
-            'saves': SavesModel,
-        }
-
-        # Model-specific primary metrics (for regressors)
-        PRIMARY_METRICS = {
-            'goals': ('Poisson Dev', safe_poisson_deviance),
-            'assists': ('Poisson Dev', safe_poisson_deviance),
-            'defcon': ('Poisson Dev', safe_poisson_deviance),
-            'minutes': ('Huber Loss', huber_loss),
-            'saves': ('MAE', mean_absolute_error),
-        }
-        
-        # Store test metrics
-        test_metrics = {}
-        # Store per-player predictions for FPL points calculation
-        pred_store = {}
-
-        # Handle minutes FIRST — goals/assists models need pred_minutes as a feature
-        if 'minutes' in models and 'minutes' in self.tuned_params:
-            from sklearn.metrics import log_loss, accuracy_score, roc_auc_score as _roc_auc
-            params = self.tuned_params['minutes']
-            mins_model = MinutesModel(**params)
-            mins_model.fit(df_train, verbose=False)
-
-            # Test on played players only
-            test_played = df_test[df_test['minutes'] >= 1].copy()
-            y_test_mins = test_played['minutes'].values
-            y_pred_mins = mins_model.predict(test_played)
-
-            # Combined metrics
-            combined_huber = huber_loss(y_test_mins, y_pred_mins)
-            combined_mae = mean_absolute_error(y_test_mins, y_pred_mins)
-
-            test_metrics['minutes'] = {
-                'metric_name': 'Huber Loss',
-                'primary': combined_huber,
-                'MAE': combined_mae,
-            }
-            pred_store['minutes'] = {
-                'index': test_played.index,
-                'y_pred': y_pred_mins,
-                'y_test': y_test_mins,
-            }
-
-            # Additional classifier metrics
-            p_start = mins_model.classifier.predict_proba(test_played)
-            y_binary = (test_played['minutes'] >= 60).astype(int).values
-            cls_auc = _roc_auc(y_binary, p_start)
-            cls_acc = accuracy_score(y_binary, (p_start >= 0.5).astype(int))
-            cls_logloss = log_loss(y_binary, p_start)
-
-            # Starter/sub regressor MAEs on their subsets
-            starter_mask = test_played['minutes'] >= 60
-            sub_mask = (test_played['minutes'] >= 1) & (test_played['minutes'] < 60)
-            starter_mae = mean_absolute_error(y_test_mins[starter_mask], y_pred_mins[starter_mask]) if starter_mask.any() else 0
-            sub_mae = mean_absolute_error(y_test_mins[sub_mask], y_pred_mins[sub_mask]) if sub_mask.any() else 0
-
-            test_metrics['minutes']['classifier'] = {
-                'AUC': cls_auc, 'Accuracy': cls_acc, 'LogLoss': cls_logloss,
-            }
-            test_metrics['minutes']['starter_MAE'] = starter_mae
-            test_metrics['minutes']['sub_MAE'] = sub_mae
-
-        # Set pred_minutes for goals/assists models
-        # Training data: use actual minutes; test data: use minutes model predictions
-        df_train['pred_minutes'] = df_train['minutes']
-        if 'minutes' in pred_store:
-            mins_series = pd.Series(pred_store['minutes']['y_pred'], index=pred_store['minutes']['index'])
-            df_test['pred_minutes'] = mins_series.reindex(df_test.index).fillna(df_test['minutes'])
-        else:
-            df_test['pred_minutes'] = df_test['minutes']
-
-        # Handle regression models (goals, assists, defcon, saves)
-        for model_name in models:
-            if model_name in ('clean_sheet', 'minutes'):
-                continue  # Already handled above / handled below
-            if model_name not in MODEL_CLASSES or model_name not in self.tuned_params:
+                print(f"  {name}: temporal CV loss={study.best_value:.4f}")
+        return params_out, scores
+
+    def _tune_with_subprocess(self, models, n_iter, verbose, df_train):
+        """Same tuning implementation, one fresh spawned process per model."""
+        import multiprocessing as mp
+        tuned, scores = {}, {}
+        for name in ('minutes', 'clean_sheet', 'goals', 'assists', 'defcon', 'saves'):
+            if name not in models:
                 continue
+            with mp.get_context('spawn').Pool(1) as pool:
+                result, cv = pool.apply(_tune_worker, (
+                    str(self.data_dir), name, n_iter, verbose, df_train,
+                    {**self.tuned_params, **tuned}))
+            tuned.update(result)
+            scores.update(cv)
+        return tuned, scores
 
-            model_class = MODEL_CLASSES[model_name]
-            params = self.tuned_params[model_name]
-            metric_name, metric_fn = PRIMARY_METRICS[model_name]
+    def _evaluate_on_test_set(self, models, df_train, df_test, verbose=True):
+        """Holdout uses production wrappers and causal upstream features.
 
-            # Create model with tuned params (selected_features handled by constructor)
-            model_instance = model_class(**params)
-            features = [f for f in model_instance.features_to_use if f in df_train.columns]
-            target = model_instance.TARGET
-
-            # Filter to GKs only for saves model
-            eval_train = df_train
-            eval_test = df_test
-            if model_name == 'saves':
-                eval_train = df_train[df_train['is_gk'] == 1]
-                eval_test = df_test[df_test['is_gk'] == 1]
-
-            # Prepare train data
-            X_train = eval_train[features].fillna(0).values
-            y_train = eval_train[target].fillna(0).values
-
-            # Prepare test data
-            X_test = eval_test[features].fillna(0).values
-            y_test = eval_test[target].fillna(0).values
-
-            # Train on train set (filter out non-XGB params like selected_features)
-            xgb_params = {k: v for k, v in params.items() if k != 'selected_features'}
-            xgb_model = xgb.XGBRegressor(**xgb_params, random_state=42, verbosity=0, n_jobs=-1)
-            xgb_model.fit(X_train, y_train)
-
-            # Predict on test set
-            y_pred = xgb_model.predict(X_test)
-
-            # Calculate metrics
-            primary_metric = metric_fn(y_test, y_pred)
-            mae = mean_absolute_error(y_test, y_pred)
-
-            test_metrics[model_name] = {
-                'metric_name': metric_name,
-                'primary': primary_metric,
-                'MAE': mae
-            }
-            pred_store[model_name] = {
-                'index': eval_test.index,
-                'y_pred': y_pred,
-                'y_test': y_test,
-            }
-
-            # Estimate NB dispersion for defcon (mirrors DefconModel._estimate_dispersion)
-            if model_name == 'defcon':
-                y_train_pred = np.maximum(xgb_model.predict(X_train), 0.01)
-                pearson_chi2 = np.sum((y_train - y_train_pred) ** 2 / y_train_pred) / (len(y_train) - 1)
-                if pearson_chi2 > 1.0:
-                    pred_store['defcon']['dispersion_r'] = max(float(np.mean(y_train_pred) / (pearson_chi2 - 1)), 0.5)
-
-        # Handle clean_sheet (goals against regression) separately (team-level data)
-        if 'clean_sheet' in models and 'clean_sheet' in self.tuned_params:
-            params = {k: v for k, v in self.tuned_params['clean_sheet'].items() if k != 'selected_features'}
-            selected_features = self.tuned_params['clean_sheet'].get('selected_features', None)
-            cs_model = CleanSheetModel()
-            
-            # Prepare team-level train data
-            team_train = cs_model.prepare_team_features(df_train)
-            team_train = team_train.dropna(subset=['team_conceded_roll5', 'goals_conceded'])
-            
-            # Prepare team-level test data
-            team_test = cs_model.prepare_team_features(df_test)
-            team_test = team_test.dropna(subset=['team_conceded_roll5', 'goals_conceded'])
-            
-            features = selected_features if selected_features else [f for f in cs_model.FEATURES if f in team_train.columns]
-            
-            X_train = team_train[features].fillna(0).values
-            y_train = team_train['goals_conceded'].fillna(0).values
-            X_test = team_test[features].fillna(0).values
-            y_test = team_test['goals_conceded'].fillna(0).values
-            
-            # Train Poisson regressor
-            xgb_model = xgb.XGBRegressor(**params, random_state=42, verbosity=0, n_jobs=-1, objective='count:poisson')
-            xgb_model.fit(X_train, y_train)
-            
-            # Predict expected goals against
-            y_pred = np.clip(xgb_model.predict(X_test), 1e-8, None)
-            
-            # Calculate metrics
-            poisson_dev = safe_poisson_deviance(y_test, y_pred)
-            mae = mean_absolute_error(y_test, y_pred)
-            
-            test_metrics['clean_sheet'] = {
-                'metric_name': 'Poisson Dev',
-                'primary': poisson_dev,
-                'MAE': mae
-            }
-        
-        # Generate clean sheet predictions at player level for FPL points calc
-        if 'clean_sheet' in self.tuned_params:
-            try:
-                from scipy.stats import poisson as _poisson
-                cs_params = {k: v for k, v in self.tuned_params['clean_sheet'].items() if k != 'selected_features'}
-                cs_selected = self.tuned_params['clean_sheet'].get('selected_features', None)
-                cs_eval_model = CleanSheetModel()
-
-                team_train_cs = cs_eval_model.prepare_team_features(df_train)
-                team_train_cs = team_train_cs.dropna(subset=['team_conceded_roll5', 'goals_conceded'])
-                team_test_cs = cs_eval_model.prepare_team_features(df_test)
-                team_test_cs = team_test_cs.dropna(subset=['team_conceded_roll5', 'goals_conceded'])
-
-                cs_feats = cs_selected if cs_selected else [f for f in cs_eval_model.FEATURES if f in team_train_cs.columns]
-                cs_xgb = xgb.XGBRegressor(**cs_params, random_state=42, verbosity=0, n_jobs=-1, objective='count:poisson')
-                cs_xgb.fit(team_train_cs[cs_feats].fillna(0).values, team_train_cs['goals_conceded'].fillna(0).values)
-
-                # Predict goals_against lambda at team-match level
-                team_test_cs['_pred_goals_against'] = np.clip(cs_xgb.predict(team_test_cs[cs_feats].fillna(0).values), 1e-8, None)
-                team_test_cs['_pred_cs_prob'] = _poisson.pmf(0, team_test_cs['_pred_goals_against'])
-
-                # Map team-level predictions back to player rows via (team, season, gameweek)
-                team_test_cs['_team_norm'] = team_test_cs['team'].astype(str).str.lower().str.strip()
-                cs_lookup = team_test_cs[['_team_norm', 'season', 'gameweek', '_pred_cs_prob', '_pred_goals_against']].copy()
-
-                df_test['_team_norm'] = df_test['team'].astype(str).str.lower().str.strip()
-                # Map via index-preserving join instead of merge (avoids index reset)
-                cs_lookup = cs_lookup.set_index(['_team_norm', 'season', 'gameweek'])
-                df_test = df_test.join(
-                    cs_lookup,
-                    on=['_team_norm', 'season', 'gameweek'],
-                    how='left',
-                    rsuffix='_cs',
-                )
-                # Use joined columns, drop duplicates from join
-                for col in ['_pred_cs_prob', '_pred_goals_against']:
-                    if f'{col}_cs' in df_test.columns:
-                        df_test[col] = df_test[col].fillna(df_test[f'{col}_cs'])
-                        df_test.drop(columns=[f'{col}_cs'], inplace=True)
-                df_test['_pred_cs_prob'] = df_test['_pred_cs_prob'].fillna(0)
-                df_test['_pred_goals_against'] = df_test['_pred_goals_against'].fillna(1.3)
-                df_test.drop(columns=['_team_norm'], inplace=True)
-            except Exception as e:
-                if verbose:
-                    print(f"\nWarning: Could not generate CS predictions for FPL MAE: {e}")
-                df_test['_pred_cs_prob'] = 0
-                df_test['_pred_goals_against'] = 1.3
-        else:
-            df_test['_pred_cs_prob'] = 0
-            df_test['_pred_goals_against'] = 1.3
-
-        # Generate cards predictions for FPL points calc
-        try:
-            cards_model = CardsModel()
-            cards_model.fit(df_train, verbose=False)
-            pred_minutes_for_cards = pred_store['minutes']['y_pred'] if 'minutes' in pred_store else None
-            if pred_minutes_for_cards is not None:
-                mins_series = pd.Series(pred_minutes_for_cards, index=pred_store['minutes']['index'])
-                df_test['_pred_mins_cards'] = mins_series.reindex(df_test.index).fillna(df_test['minutes'])
+        Component/legacy reconstructed-points metrics remain conditional on an
+        appearance. This is not an official-points or all-roster evaluation.
+        """
+        from sklearn.metrics import mean_absolute_error
+        train, test = self._dependency_frames(df_train, df_test)
+        fitted = {'minutes': self._fit_model('minutes', train, self.tuned_params.get('minutes', {}))}
+        teams = CleanSheetModel().prepare_team_features(pd.concat([train, test], ignore_index=True))
+        fitted['clean_sheet'] = self._fit_model('clean_sheet',
+            teams[teams['match_id'].isin(train['match_id'])], self.tuned_params.get('clean_sheet', {}))
+        against = fitted['clean_sheet'].predict_goals_against(teams)
+        test['pred_goals_against'] = self._map_team_prediction(test, teams, against)
+        test['pred_team_goals'] = self._map_team_prediction(test, teams, against, opponent=True)
+        test['pred_cs_prob'] = np.exp(-test['pred_goals_against'])
+        metrics, pred_store = {}, {}
+        for name in ('minutes', 'goals', 'assists', 'defcon', 'saves'):
+            if name != 'minutes':
+                fitted[name] = self._fit_model(name, train, self.tuned_params.get(name, {}))
+            if name == 'saves':
+                target_rows = test[test['is_gk'] == 1]
+            elif name == 'defcon':
+                target_rows = test[
+                    test['fpl_position'].isin(['DEF', 'MID']) & test['defcon'].notna()
+                ]
             else:
-                df_test['_pred_mins_cards'] = df_test['minutes']
-            df_test['_pred_yellow'] = cards_model.predict_yellow_prob(df_test, df_test['_pred_mins_cards'].values)
-            df_test['_pred_red'] = cards_model.predict_red_prob(df_test, df_test['_pred_mins_cards'].values)
-            df_test.drop(columns=['_pred_mins_cards'], inplace=True)
-        except Exception as e:
-            if verbose:
-                print(f"\nWarning: Could not generate cards predictions for FPL MAE: {e}")
-            df_test['_pred_yellow'] = 0
-            df_test['_pred_red'] = 0
-
-        # Run BonusModel on test set predictions for inc-bonus MAE
-        try:
-            bonus_eval = BonusModel(n_simulations=self.n_sims)
-            bonus_eval.fit(df_train, verbose=False)
-
-            # Build predicted values aligned to df_test
-            mins_s = pd.Series(pred_store['minutes']['y_pred'], index=pred_store['minutes']['index']).reindex(df_test.index).fillna(df_test['minutes']) if 'minutes' in pred_store else df_test['minutes']
-            goals_s = pd.Series(pred_store['goals']['y_pred'], index=pred_store['goals']['index']).reindex(df_test.index).fillna(0) if 'goals' in pred_store else pd.Series(0, index=df_test.index)
-            assists_s = pd.Series(pred_store['assists']['y_pred'], index=pred_store['assists']['index']).reindex(df_test.index).fillna(0) if 'assists' in pred_store else pd.Series(0, index=df_test.index)
-            cs_s = df_test['_pred_cs_prob'] if '_pred_cs_prob' in df_test.columns else pd.Series(0, index=df_test.index)
-            yellow_s = df_test['_pred_yellow'] if '_pred_yellow' in df_test.columns else pd.Series(0, index=df_test.index)
-
-            fpl_pos = get_fpl_positions()
-            fpl_pos_arr = df_test.apply(lambda r: map_fpl_position(r.get('position'), r.get('player_name'), fpl_pos), axis=1).values
-
-            df_test['_pred_bonus'] = bonus_eval.predict(
-                df_test,
-                pred_goals=goals_s.values,
-                pred_assists=assists_s.values,
-                pred_cs_prob=cs_s.values,
-                pred_minutes=mins_s.values,
-                fpl_positions=fpl_pos_arr,
-                pred_yellow_prob=yellow_s.values,
-            )
-        except Exception as e:
-            if verbose:
-                print(f"\nWarning: Could not generate bonus predictions for FPL MAE: {e}")
-            df_test['_pred_bonus'] = 0
-
-        # Compute aggregate FPL points: actual vs predicted
-        # Uses actual stats to calculate "actual FPL points" and model predictions
-        # to calculate "predicted FPL points", then reports MAE between them.
-        fpl_mae = None
-        try:
-            fpl_mae = self._compute_fpl_points_mae(df_test, pred_store)
-        except Exception as e:
-            if verbose:
-                print(f"\nWarning: Could not compute FPL points MAE: {e}")
-
-        # Print test set performance
+                target_rows = test
+            if target_rows.empty:
+                continue
+            actual = target_rows[fitted[name].TARGET].fillna(0).to_numpy()
+            predicted = self._model_predict(name, fitted[name], target_rows)
+            pred_store[name] = {'index': target_rows.index, 'y_pred': predicted, 'y_test': actual}
+            if name == 'defcon':
+                pred_store[name]['dispersion_r'] = fitted[name].dispersion_r
+            if name in models:
+                metrics[name] = {
+                    'metric_name': 'Huber Loss' if name == 'minutes' else 'MAE' if name == 'saves' else 'Poisson Dev',
+                    'primary': self._loss(name, actual, predicted),
+                    'MAE': float(mean_absolute_error(actual, predicted))}
+        if 'clean_sheet' in models:
+            mask = teams['match_id'].isin(test['match_id'])
+            actual, predicted = teams.loc[mask, 'goals_conceded'].to_numpy(), against[mask]
+            metrics['clean_sheet'] = {
+                'metric_name': 'Poisson Dev', 'primary': self._loss('clean_sheet', actual, predicted),
+                'MAE': float(mean_absolute_error(actual, predicted))}
+        fitted['cards'] = CardsModel(**self.tuned_params.get('cards', {})).fit(train, verbose=False)
+        fitted['bonus'] = BonusModel(n_simulations=self.n_sims).fit(train, verbose=False)
+        test = self._predict_player_components(test, fitted)
+        # Bound memory by processing one deadline at a time; no files/live API calls.
+        for _, batch in test.groupby('forecast_time', sort=True):
+            probability, state_minutes = fitted['minutes'].predict_distribution(batch, appear_prob=np.ones(len(batch)))
+            scored, _ = self._simulate_points(batch, probability, state_minutes, fitted)
+            test.loc[batch.index, '_pred_points_shared'] = scored['exp_total_pts'].to_numpy()
+            test.loc[batch.index, '_pred_bonus'] = scored['pred_bonus'].to_numpy()
+        test['_pred_cs_prob'] = test['pred_cs_prob']
+        test['_pred_goals_against'] = test['pred_goals_against']
+        test['_pred_yellow'] = test['pred_yellow_prob']
+        test['_pred_red'] = test['pred_red_prob']
+        fpl = self._compute_fpl_points_mae(test, pred_store)
         if verbose:
-            print(f"\n{'Model':<15} {'Metric':<15} {'Test Value':<12} {'MAE':<12}")
-            print("-" * 54)
-            for model_name, metrics in test_metrics.items():
-                print(f"{model_name.upper():<15} {metrics['metric_name']:<15} {metrics['primary']:<12.4f} {metrics['MAE']:<12.4f}")
-                # Print minutes sub-model details
-                if model_name == 'minutes' and 'classifier' in metrics:
-                    cls = metrics['classifier']
-                    print(f"  {'Classifier':<13} {'AUC':<15} {cls['AUC']:<12.4f} {'LogLoss':<6} {cls['LogLoss']:.4f}")
-                    print(f"  {'Starter Reg':<13} {'MAE':<15} {metrics['starter_MAE']:<12.4f}")
-                    print(f"  {'Sub Reg':<13} {'MAE':<15} {metrics['sub_MAE']:<12.4f}")
-            if fpl_mae is not None:
-                print("-" * 54)
-                print(f"{'FPL POINTS':<15} {'inc-bonus MAE':<15} {fpl_mae['mae_inc_bonus']:<12.4f}")
-                if fpl_mae.get('poisson_dev_inc_bonus') is not None:
-                    print(f"{'':<15} {'Poisson Dev':<15} {fpl_mae['poisson_dev_inc_bonus']:<12.4f}")
-                if fpl_mae.get('poisson_dev_naive_median') is not None:
-                    naive = fpl_mae['poisson_dev_naive_median']
-                    median = fpl_mae.get('naive_median_value', 0)
-                    print(f"{'':<15} {'naive(med)':<15} {naive:<12.4f}  (predict {median:.1f} for all)")
-                if fpl_mae.get('spearman_inc_bonus') is not None:
-                    print(f"{'':<15} {'Spearman':<15} {fpl_mae['spearman_inc_bonus']:<12.4f}")
-                if 'bonus_mae' in fpl_mae:
-                    print(f"{'BONUS':<15} {'MAE':<15} {fpl_mae['bonus_mae']:<12.4f}")
-
-            # Add context for interpretation
-            print("\n(Lower is better for MAE / Poisson Deviance; higher is better for Spearman & captain hit rate)")
-            print("inc-bonus: predicted vs actual FPL points with bonus on both sides")
-
-        test_metrics['_fpl_points_mae'] = fpl_mae
-        return test_metrics
+            for name, result in metrics.items():
+                print(f"  {name}: {result['metric_name']}={result['primary']:.4f}, MAE={result['MAE']:.4f}")
+            print(f"  Reconstructed played-only FPL MAE (ex bonus): {fpl['mae_ex_bonus']:.4f}")
+        metrics['_fpl_points_mae'] = fpl
+        return metrics
 
     def _compute_fpl_points_mae(self, df_test: pd.DataFrame, pred_store: dict) -> dict:
         """Compute MAE between actual and predicted FPL points on the test set.
@@ -1804,11 +699,12 @@ with open(r"{temp_result_path}", 'w') as f:
         from sklearn.metrics import mean_absolute_error, mean_poisson_deviance
         from scipy.stats import poisson as _poisson, nbinom as _nbinom, spearmanr
 
-        POS_MAP = {0: 'GK', 1: 'DEF', 2: 'MID', 3: 'FWD'}
         _defcon_r = pred_store.get('defcon', {}).get('dispersion_r', None)
 
         df = df_test.copy()
-        df['pos_label'] = df['position'].map(POS_MAP).fillna('MID')
+        df['pos_label'] = df.get(
+            'fpl_position', pd.Series(pd.NA, index=df.index, dtype='string')
+        ).astype('string').str.upper()
 
         # Helper to safely get numeric value (handles NaN and missing columns)
         def _safe(row, col, default=0):
@@ -1945,7 +841,10 @@ with open(r"{temp_result_path}", 'w') as f:
 
             return pts
 
-        df['pred_fpl_pts'] = df.apply(pred_fpl_points, axis=1)
+        if '_pred_points_shared' in df:
+            df['pred_fpl_pts'] = df['_pred_points_shared'] - df['_pred_bonus'].fillna(0)
+        else:
+            df['pred_fpl_pts'] = df.apply(pred_fpl_points, axis=1)
 
         # Add predicted bonus to prediction side for inc-bonus comparison
         if '_pred_bonus' in df.columns:
@@ -2038,8 +937,9 @@ with open(r"{temp_result_path}", 'w') as f:
         _defcon_r = getattr(self, '_last_defcon_dispersion_r', None)
 
         df = self._last_fpl_detail.copy()
-        POS_MAP = {0: 'GK', 1: 'DEF', 2: 'MID', 3: 'FWD'}
-        df['pos_label'] = df['position'].map(POS_MAP).fillna('MID')
+        df['pos_label'] = df.get(
+            'fpl_position', pd.Series(pd.NA, index=df.index, dtype='string')
+        ).astype('string').str.upper()
 
         def _safe(col, default=0):
             if col in df.columns:
@@ -2262,6 +1162,13 @@ with open(r"{temp_result_path}", 'w') as f:
             print(f"PREDICTING GW{gameweek} ({season})")
             print("=" * 60)
         
+        # Live squad/availability APIs are not historical snapshots.
+        known = chronological_frame(self.df)
+        if season < known['season'].max():
+            raise ValueError("Historical seasons require chronological holdout evaluation, not live squad/availability data.")
+        target_known = known[known['season'].eq(season) & known['gameweek'].eq(gameweek)]
+        if not target_known.empty and known['result_time'].max() >= target_known['forecast_time'].min():
+            raise ValueError("predict() is for unplayed gameweeks. Use chronological holdout evaluation for historical forecasts.")
         # Get test data - latest features for players
         test_df = self._build_test_set(gameweek, season, verbose)
 
@@ -2284,34 +1191,20 @@ with open(r"{temp_result_path}", 'w') as f:
             lineup_p_start = ov['lineup_p_start'].values
             lineup_available = ov['lineup_available'].values
 
-        # Generate predictions
-        test_df['pred_minutes'] = self.models['minutes'].predict(
-            test_df, lineup_p_start=lineup_p_start
-        )
-
-        # P(features at all). Separate from pred_minutes, which is E[minutes | appears]
-        # and so says nothing about the chance of not being picked. Blended with the
-        # live FPL status: the model reads rotation risk from playing history, the API
-        # is authoritative on injuries and suspensions it cannot know about.
-        if self.models['minutes'].appear_is_fitted:
-            appear = self.models['minutes'].predict_appear_proba(test_df)
-            chance = pd.to_numeric(
-                test_df.get('fpl_chance_of_playing', 100), errors='coerce'
-            ).fillna(100).values / 100.0
-            test_df['pred_appear_prob'] = np.clip(appear * chance, 0.0, 1.0)
-        else:
-            test_df['pred_appear_prob'] = np.nan
-
-        # OUT / SUS / QUES on the lineup page is harder evidence than FPL's
-        # chance_of_playing, which lags team news. Scales P(appears): 0 rules a player
-        # out entirely, a doubt discounts them.
+        # Combine history and lineup priors as joint role probabilities.
+        # Live availability is applied once, after lineup evidence.
+        appear = (self.models['minutes'].predict_appear_proba(test_df)
+                  if self.models['minutes'].appear_is_fitted else np.ones(len(test_df)))
+        available = pd.to_numeric(test_df.get('fpl_chance_of_playing',
+            pd.Series(100, index=test_df.index)), errors='coerce').fillna(100).to_numpy() / 100.
         if lineup_available is not None:
-            have = ~np.isnan(lineup_available)
-            if have.any():
-                test_df.loc[have, 'pred_appear_prob'] = (
-                    test_df.loc[have, 'pred_appear_prob'].values * lineup_available[have]
-                )
-
+            available *= np.where(np.isfinite(lineup_available), lineup_available, 1.)
+        probability, state_minutes = self.models['minutes'].predict_distribution(
+            test_df, lineup_p_start=lineup_p_start, appear_prob=appear, availability=available)
+        test_df['pred_appear_prob'] = 1 - probability[:, 0]
+        test_df['pred_minutes'] = np.divide(
+            (probability * state_minutes).sum(axis=1), test_df['pred_appear_prob'],
+            out=np.zeros(len(test_df)), where=test_df['pred_appear_prob'].to_numpy() > 0)
 
         # Clean sheet / goals against FIRST (needed for pred_team_goals feature)
         cs_probs, two_plus_probs, pred_goals_against = self._predict_clean_sheet(test_df, gameweek, season, verbose)
@@ -2322,56 +1215,36 @@ with open(r"{temp_result_path}", 'w') as f:
         # Inject pred_team_goals: for each player, predicted goals their team will score
         # = predicted goals conceded by the OPPONENT (from CleanSheetModel)
         test_df['pred_team_goals'] = self._get_pred_team_goals(test_df, gameweek, season)
-        
-        # Goals/Assists predict raw match counts (pred_minutes is a feature)
-        test_df['pred_exp_goals'] = self.models['goals'].predict(test_df)
-        test_df['pred_exp_assists'] = self.models['assists'].predict(test_df)
-        test_df['pred_defcon_prob'] = self.models['defcon'].predict_threshold_prob(test_df, test_df['pred_minutes'])
 
-        # Cards predictions
-        test_df['pred_yellow_prob'] = self.models['cards'].predict_yellow_prob(test_df, test_df['pred_minutes'].values)
-        test_df['pred_red_prob'] = self.models['cards'].predict_red_prob(test_df, test_df['pred_minutes'].values)
-
-        # Saves predictions (GK only, 0 for outfield)
-        test_df['pred_exp_saves'] = 0.0
-        gk_mask = test_df['is_gk'] == 1
-        if gk_mask.any():
-            gk_df = test_df[gk_mask]
-            test_df.loc[gk_mask, 'pred_exp_saves'] = self.models['saves'].predict_expected_saves(
-                gk_df, gk_df['pred_minutes'].values
-            )
-
-        # 4+ goals conceded probability (from Poisson on predicted goals against)
-        from scipy.stats import poisson
-        test_df['pred_4plus_conceded'] = 1.0 - poisson.cdf(3, test_df['pred_goals_against'].values)
-
-        # FPL positions (needed for bonus)
+        # Refresh the target-week classification before DefCon prediction. A
+        # failed API lookup may retain an already cached FPL position, but it may
+        # never infer one from FotMob's on-pitch role.
         self.fpl_positions = get_fpl_positions()
-        test_df['fpl_position'] = test_df.apply(
-            lambda r: map_fpl_position(r.get('position'), r.get('player_name'), self.fpl_positions),
-            axis=1
-        )
-        
-        # Bonus - pass all predictions for proper simulation (including yellow cards)
-        test_df['pred_bonus'] = self.models['bonus'].predict(
-            test_df,
-            pred_goals=test_df['pred_exp_goals'].values,
-            pred_assists=test_df['pred_exp_assists'].values,
-            pred_cs_prob=test_df['pred_cs_prob'].values,
-            pred_minutes=test_df['pred_minutes'].values,
-            fpl_positions=test_df['fpl_position'].values,
-            pred_yellow_prob=test_df['pred_yellow_prob'].values,
-        )
+        live_position = test_df.apply(
+            lambda row: map_fpl_position(
+                row.get('position'), row.get('player_name'), self.fpl_positions,
+                fallback_to_fotmob=False),
+            axis=1,
+        ).astype('string').str.upper()
+        cached_position = test_df.get(
+            'fpl_position', pd.Series(pd.NA, index=test_df.index, dtype='string')
+        ).astype('string').str.upper()
+        test_df['fpl_position'] = live_position.where(
+            live_position.isin(['GK', 'DEF', 'MID', 'FWD']), cached_position)
+        if verbose:
+            unresolved = ~test_df['fpl_position'].isin(['GK', 'DEF', 'MID', 'FWD'])
+            if unresolved.any():
+                print(f"  WARNING: {int(unresolved.sum())} players have no FPL API position; "
+                      "they receive no DefCon projection")
 
-        # Store per-simulation arrays (keyed by player_name) for distribution plots
-        bonus_sims = self.models['bonus'].get_last_simulations()
+        test_df = self._predict_player_components(test_df, self.models)
+
+        test_df, bonus_sims = self._simulate_points(test_df, probability, state_minutes)
         self.last_simulations = {
-            'player_names': test_df['player_name'].values.tolist(),
+            'player_names': test_df['player_name'].tolist(),
+            'player_ids': test_df['player_id'].tolist(),
             **bonus_sims,
         }
-
-        # Calculate expected points (per fixture)
-        test_df = self._calculate_expected_points(test_df)
 
         # Save per-fixture predictions
         output_path = self.data_dir / 'predictions' / f'gw{gameweek}_{season.replace("/", "-")}.csv'
@@ -2456,6 +1329,12 @@ with open(r"{temp_result_path}", 'w') as f:
                 if col in group.columns:
                     base[col] = group[col].mean()
 
+            if 'exp_total_pts_uncond' in group:
+                appear = 1 - np.prod(1 - group['pred_appear_prob'].fillna(1).to_numpy())
+                base['pred_appear_prob'] = appear
+                base['exp_total_pts_cond'] = base['exp_total_pts_uncond'] / appear if appear > 0 else 0
+                base['pred_minutes_uncond'] = group['pred_minutes_uncond'].sum()
+                base['pred_60_prob'] = 1 - np.prod(1 - group['pred_60_prob'].to_numpy())
             # Join opponent names
             base['opponent'] = ', '.join(group['opponent'].astype(str).tolist())
             base['is_home'] = ', '.join(group['is_home'].astype(str).tolist())
@@ -2705,6 +1584,9 @@ with open(r"{temp_result_path}", 'w') as f:
                     with open(sim_dir / f'{key}.json', 'w') as f:
                         json.dump(val, f)
 
+        if getattr(self, 'last_predictions_per_fixture', None) is not None:
+            self.last_predictions_per_fixture.to_csv(run_dir / 'predictions_per_fixture.csv', index=False)
+
         # 3. Tuned params
         if self.tuned_params:
             # Convert numpy types for JSON serialization
@@ -2750,6 +1632,8 @@ with open(r"{temp_result_path}", 'w') as f:
             'timestamp': datetime.now().isoformat(),
             'n_sims': self.n_sims,
             'n_players': len(predictions),
+            'points_semantics': 'unconditional' if 'exp_total_pts_uncond' in predictions else 'legacy_conditional',
+            'simulation_schema': 2 if 'exp_total_pts_uncond' in predictions else 1,
         }
         with open(run_dir / 'meta.json', 'w') as f:
             json.dump(meta, f, indent=2)
@@ -2844,15 +1728,25 @@ with open(r"{temp_result_path}", 'w') as f:
                 print(f"WARNING: No fixtures found for GW{gameweek}")
             return pd.DataFrame()
 
-        # Latest identity row per active player (from raw historical data only)
-        prior_raw = self.raw_df[
-            ~((self.raw_df['season'] == season) & (self.raw_df['gameweek'] >= gameweek))
-        ].copy()
-        if len(prior_raw) == 0:
-            prior_raw = self.raw_df.copy()
+        fixture_dates = pd.to_datetime(fixtures.get('match_date', pd.Series(dtype=object)),
+                                       errors='coerce', utc=True)
+        if fixture_dates.notna().any():
+            cutoff = fixture_dates.min() - pd.Timedelta(minutes=90)
+        else:
+            known_target = chronological_frame(self.raw_df)
+            known_target = known_target[known_target['season'].eq(season) & known_target['gameweek'].eq(gameweek)]
+            cutoff = (known_target['forecast_time'].min() if not known_target.empty else
+                      pd.Timestamp.now(tz='UTC'))
+        # Current live forecasts cannot include results obtained after now, even
+        # when the target fixture is several weeks away.
+        cutoff = min(cutoff, pd.Timestamp.now(tz='UTC'))
+        history = chronological_frame(self.raw_df)
+        prior_raw = history[history['result_time'] < cutoff].copy()
+        if prior_raw.empty:
+            raise ValueError("No historical results are available before this forecast origin")
 
         latest_identity = (
-            prior_raw.sort_values(['player_id', 'season', 'gameweek'])
+            prior_raw.sort_values(['player_id', 'match_date'])
             .groupby('player_id').last().reset_index()
         )
 
@@ -2860,7 +1754,7 @@ with open(r"{temp_result_path}", 'w') as f:
         # FPL API names ('Spurs', 'Man City') must be translated to FotMob names
         # so synthetic rows join team/opponent rolling-stat history.
         fotmob_by_norm = {}
-        for _, r in self.raw_df[['team', 'season']].dropna().drop_duplicates().sort_values('season').iterrows():
+        for _, r in prior_raw[['team', 'season']].dropna().drop_duplicates().sort_values('season').iterrows():
             fotmob_by_norm[normalize_team_name(r['team'])] = r['team']
 
         def _to_fotmob(name):
@@ -3004,8 +1898,10 @@ with open(r"{temp_result_path}", 'w') as f:
         # FotMob naming so synthetic rows' team/opponent values join the
         # rolling-stat history (FPL API names like 'Spurs' would silently miss).
         fixture_teams = []
-        for _, fix in fixtures.iterrows():
+        for fixture_index, (_, fix) in enumerate(fixtures.iterrows()):
             fixture_teams.append({
+                'match_id': fix.get('match_id', -900000 - fixture_index),
+                'match_date': pd.to_datetime(fix.get('match_date', cutoff), utc=True),
                 'home_norm': normalize_team_name(fix['home_team']),
                 'away_norm': normalize_team_name(fix['away_team']),
                 'home_team': _to_fotmob(fix['home_team']),
@@ -3015,12 +1911,12 @@ with open(r"{temp_result_path}", 'w') as f:
         # Raw stat columns (everything except identity / fixture-linkage) are
         # zeroed out on synthetic rows so they don't contribute to rolling stats.
         raw_cols = list(self.raw_df.columns)
-        preserve = {'player_id', 'player_name', 'team', 'position', 'shirt_number',
-                    'season', 'match_id', 'gameweek', 'opponent', 'is_home'}
+        preserve = {'player_id', 'player_name', 'team', 'position', 'fpl_position', 'shirt_number',
+                    'season', 'match_id', 'gameweek', 'opponent', 'is_home',
+                    'match_date', 'forecast_time', 'result_time'}
         stat_cols = [c for c in raw_cols if c not in preserve]
 
         test_rows = []
-        synthetic_match_id = -900000  # negative IDs to avoid collision with real match_ids
         unmatched_teams = set()
         for _, player in latest_identity.iterrows():
             player_team_norm = normalize_team_name(player.get('team', ''))
@@ -3049,8 +1945,10 @@ with open(r"{temp_result_path}", 'w') as f:
                 row['season'] = season
                 row['opponent'] = fix['away_team'] if is_home_match else fix['home_team']
                 row['is_home'] = 1 if is_home_match else 0
-                row['match_id'] = synthetic_match_id
-                synthetic_match_id -= 1
+                row['match_id'] = fix['match_id']
+                row['match_date'] = fix['match_date'] if pd.notna(fix['match_date']) else cutoff
+                row['forecast_time'] = cutoff
+                row['result_time'] = row['match_date'] + pd.Timedelta(hours=3)
                 row['_synthetic'] = True
                 row['_fixture_num'] = fixture_num
                 row['_fpl_chance_of_playing'] = player.get('fpl_chance_of_playing', 100)
@@ -3073,8 +1971,8 @@ with open(r"{temp_result_path}", 'w') as f:
 
         synthetic_df = pd.DataFrame(test_rows)
 
-        # Append synthetic rows to full raw (incl. any already-played target-GW rows)
-        raw_full = self.raw_df.copy()
+        # Append synthetic rows only to information available at this forecast origin.
+        raw_full = prior_raw.copy()
         raw_full['_synthetic'] = False
         raw_full['_fixture_num'] = 1
         raw_full['_fpl_chance_of_playing'] = 100
@@ -3084,6 +1982,7 @@ with open(r"{temp_result_path}", 'w') as f:
         # Recompute all rolling features on the augmented dataset. At each
         # synthetic row, shift(1).rolling(N) over player/team/opponent groups
         # yields the mean of the N most recent actual matches.
+        augmented.attrs['data_dir'] = str(self.data_dir)
         augmented = compute_rolling_features(augmented, verbose=False)
 
         test_df = augmented[augmented['_synthetic'] == True].copy()
@@ -3209,6 +2108,8 @@ with open(r"{temp_result_path}", 'w') as f:
 
             if gw_fixtures:
                 result = pd.DataFrame([{
+                    'match_id': -1000000 - int(f['id']),
+                    'match_date': f.get('kickoff_time'),
                     'home_team': teams.get(f['team_h'], 'Unknown'),
                     'away_team': teams.get(f['team_a'], 'Unknown'),
                 } for f in gw_fixtures])
@@ -3233,7 +2134,11 @@ with open(r"{temp_result_path}", 'w') as f:
                     gw_col = 'gameweek' if 'gameweek' in local_fixtures.columns else 'round'
                     result = local_fixtures[
                         (local_fixtures['season'] == season) & (local_fixtures[gw_col] == gameweek)
-                    ][['home_team', 'away_team']]
+                    ].copy()
+                    dates_path = self.data_dir / 'matches' / 'match_details.csv'
+                    if 'match_date' not in result and dates_path.exists():
+                        dates = pd.read_csv(dates_path, usecols=['match_id', 'match_date']).drop_duplicates('match_id')
+                        result = result.merge(dates, on='match_id', how='left')
                     if len(result) > 0:
                         if verbose:
                             print(f"  Using {len(result)} fixtures from local {fname}")
@@ -3370,6 +2275,8 @@ with open(r"{temp_result_path}", 'w') as f:
                                              verbose: bool = True) -> dict:
         """Build one shift-safe CleanSheetModel prediction per target fixture."""
         fixture_cols = ['team', 'opponent', 'season', 'gameweek', 'is_home']
+        fixture_cols += [c for c in ('match_id', 'match_date', 'forecast_time', 'result_time') if c in test_df]
+        fixture_cols += [c for c in test_df if c.startswith('manager_raw_') or c == 'manager_prior_games']
         fixture_cols += [
             f'manager_emb_{i}' for i in range(8)
             if f'manager_emb_{i}' in test_df.columns
@@ -3379,7 +2286,8 @@ with open(r"{temp_result_path}", 'w') as f:
             keep='first'
         )
         team_features = self.models['clean_sheet'].prepare_team_features(
-            self.df, prediction_fixtures=fixtures
+            chronological_frame(self.df).loc[lambda history: history['result_time'] <
+                chronological_frame(test_df)['forecast_time'].min()], prediction_fixtures=fixtures
         )
         prediction_mask = (
             team_features['_is_prediction'].astype(bool)
@@ -3491,83 +2399,68 @@ with open(r"{temp_result_path}", 'w') as f:
             print(f"  WARNING: Used team-goals fallback for {len(missing)} unmatched fixtures")
         return np.array(pred_team_goals)
     
-    def _calculate_expected_points(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate expected FPL points."""
+    @staticmethod
+    def _predict_player_components(frame, models):
+        """Raw model expectations conditional on appearing; minutes remains a feature."""
+        frame = frame.copy()
+        frame['pred_exp_goals'] = models['goals'].predict(frame)
+        frame['pred_exp_assists'] = models['assists'].predict(frame)
+        frame['pred_exp_defcon'] = models['defcon'].predict(frame)
+        frame['pred_defcon_prob'] = models['defcon'].predict_threshold_prob(frame)
+        frame['pred_yellow_prob'] = models['cards'].predict_yellow_prob(frame, frame['pred_minutes'].to_numpy())
+        frame['pred_red_prob'] = models['cards'].predict_red_prob(frame, frame['pred_minutes'].to_numpy())
+        frame['pred_exp_saves'] = 0.
+        gk = frame['is_gk'] == 1
+        if gk.any():
+            frame.loc[gk, 'pred_exp_saves'] = models['saves'].predict_expected_saves(
+                frame.loc[gk], frame.loc[gk, 'pred_minutes'].to_numpy())
         from scipy.stats import poisson
-        df = df.copy()
-        
-        def calc_points(row):
-            pos = row.get('fpl_position', 'MID')
-            mins = row.get('pred_minutes', 0)
-            
-            # Appearance
-            if mins >= 60:
-                app_pts = FPL_POINTS['appearance_60']
-            elif mins >= 1:
-                app_pts = FPL_POINTS['appearance_1']
-            else:
-                app_pts = 0
-            
-            # Goals
-            goal_pts = row.get('pred_exp_goals', 0) * FPL_POINTS['goal'].get(pos, 5)
-            
-            # Assists
-            assist_pts = row.get('pred_exp_assists', 0) * FPL_POINTS['assist']
-            
-            # Clean sheet (only if 60+ mins)
-            cs_pts = row.get('pred_cs_prob', 0) * FPL_POINTS['clean_sheet'].get(pos, 0) if mins >= 60 else 0
-            
-            # Goals conceded penalty (GK/DEF only, 60+ mins)
-            # FPL: lose 1 point per 2 goals conceded (i.e., floor(goals/2) * -1)
-            # Expected penalty = sum over k>=2: floor(k/2) * P(goals_against=k) * (-1)
-            conceded_penalty = 0
-            if pos in ['GK', 'DEF'] and mins >= 60:
-                lam = row.get('pred_goals_against', 1.2)
-                # Compute expected floor(k/2) penalty using Poisson probabilities
-                # Sum P(k) * floor(k/2) for k=2..10 (truncate at 10, negligible beyond)
-                expected_neg = 0
-                for k in range(2, 11):
-                    expected_neg += poisson.pmf(k, lam) * (k // 2)
-                # Also add the tail probability (11+) approximated
-                tail_prob = 1 - poisson.cdf(10, lam)
-                expected_neg += tail_prob * 5  # Conservative: 5 for 11+ goals
-                conceded_penalty = -expected_neg  # Negative points
-            
-            # Defcon (DEF/MID only, 60+ mins)
-            defcon_pts = 0
-            if pos in ['DEF', 'MID'] and mins >= 60:
-                defcon_pts = row.get('pred_defcon_prob', 0) * FPL_POINTS['defcon']
-            
-            # Saves (GK only) - 1 point per 3 saves
-            saves_pts = 0
-            if pos == 'GK':
-                exp_saves = row.get('pred_exp_saves', 0)
-                saves_pts = (exp_saves / 3) * FPL_POINTS['saves_per_3']
+        frame['pred_4plus_conceded'] = poisson.sf(3, frame['pred_goals_against'])
+        return frame
 
-            # Bonus
-            bonus_pts = row.get('pred_bonus', 0)
+    def _simulate_points(self, frame, probability, state_minutes, models=None,
+                         n_simulations=None, seed=42):
+        models = self.models if models is None else models
+        frame = frame.copy()
+        state_minutes = np.asarray(state_minutes)
+        if state_minutes.ndim == 1:
+            state_minutes = np.broadcast_to(state_minutes, np.asarray(probability).shape)
+        probability = np.asarray(probability)
+        frame['pred_minutes_uncond'] = (probability * state_minutes).sum(axis=1)
+        frame['pred_appear_prob'] = (probability * (state_minutes > 0)).sum(axis=1)
+        p60 = (probability * (state_minutes >= 60)).sum(axis=1)
+        frame['pred_60_prob'] = p60
+        frame['pred_60_prob_cond'] = np.divide(p60, frame['pred_appear_prob'],
+            out=np.zeros(len(frame)), where=frame['pred_appear_prob'].to_numpy() > 0)
+        simulations = models['bonus'].simulate(
+            frame, probability, state_minutes, n_simulations=n_simulations,
+            seed=seed, defcon_r=models['defcon'].dispersion_r)
+        return self._calculate_expected_points(frame, simulations), simulations
 
-            # Yellow/Red cards (all positions)
-            yellow_pts = row.get('pred_yellow_prob', 0) * FPL_POINTS['yellow_card']
-            red_pts = row.get('pred_red_prob', 0) * FPL_POINTS['red_card']
+    def _calculate_expected_points(self, df, simulations=None):
+        """Unconditional point expectations from the same draws shown in charts.
 
-            return pd.Series({
-                'exp_goals_pts': goal_pts,
-                'exp_assists_pts': assist_pts,
-                'exp_cs_pts': cs_pts,
-                'exp_conceded_penalty': conceded_penalty,
-                'exp_saves_pts': saves_pts,
-                'exp_defcon_pts': defcon_pts,
-                'exp_bonus_pts': bonus_pts,
-                'exp_yellow_pts': yellow_pts,
-                'exp_red_pts': red_pts,
-                'exp_appearance_pts': app_pts,
-                'exp_total_pts': app_pts + goal_pts + assist_pts + cs_pts + conceded_penalty + saves_pts + defcon_pts + bonus_pts + yellow_pts + red_pts
-            })
-        
-        points_df = df.apply(calc_points, axis=1)
-        return pd.concat([df, points_df], axis=1)
-    
+        exp_total_pts_uncond is an explicit alias; exp_total_pts_cond retains the
+        old conditional interpretation for consumers that need it. Historical
+        saved runs without the alias keep their legacy meaning in the optimizer.
+        """
+        from .models.bonus import score_simulations
+        if simulations is None:
+            probability, state_minutes = self.models['minutes'].predict_distribution(
+                df, appear_prob=df.get('pred_appear_prob', pd.Series(1., index=df.index)).fillna(1).to_numpy())
+            return self._simulate_points(df, probability, state_minutes)[0]
+        frame = df.copy()
+        components = score_simulations(frame, simulations, FPL_POINTS)
+        for column, draws in components.items():
+            frame[column] = draws.mean(axis=0)
+        frame['exp_total_pts'] = simulations['total_points'].mean(axis=0)
+        frame['exp_total_pts_uncond'] = frame['exp_total_pts']
+        frame['pred_bonus'] = simulations['bonus'].mean(axis=0)
+        appear = frame.get('pred_appear_prob', pd.Series(1., index=frame.index)).to_numpy()
+        frame['exp_total_pts_cond'] = np.divide(frame['exp_total_pts'], appear,
+                                              out=np.zeros(len(frame)), where=appear > 0)
+        return frame
+
     def get_top_players(self, predictions: pd.DataFrame, n: int = 30) -> pd.DataFrame:
         """Get top N players by expected points."""
         cols = ['player_name', 'team', 'fpl_position', 'fixture_num', 'opponent', 'is_home',

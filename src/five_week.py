@@ -16,7 +16,7 @@ import xgboost as xgb
 from sklearn.metrics import log_loss, mean_absolute_error
 
 from .data_loader import get_fpl_positions, map_fpl_position
-from .features import APPEARANCE_FEATURES, _compute_calendar_minutes_features
+from .features import APPEARANCE_FEATURES, _compute_calendar_minutes_features, chronological_frame, prior_stat
 from .pipeline import FPL_POINTS
 
 
@@ -49,14 +49,11 @@ def build_role_grid(df: pd.DataFrame) -> pd.DataFrame:
     returned ``role_state``/``target_minutes`` columns describe GW ``g`` and are
     labels only.
     """
-    grid = _compute_calendar_minutes_features(df, include_appeared=True)
+    grid = _compute_calendar_minutes_features(df, include_appeared=True, per_fixture=True)
 
-    minutes = (
-        df.groupby(["player_id", "season", "gameweek"], as_index=False)["minutes"]
-        .max()
-        .rename(columns={"minutes": "target_minutes"})
-    )
-    grid = grid.merge(minutes, on=["player_id", "season", "gameweek"], how="left")
+    keys = ["player_id", "match_id"] if "match_id" in grid else ["player_id", "season", "gameweek"]
+    minutes = df.groupby(keys, as_index=False)["minutes"].max().rename(columns={"minutes": "target_minutes"})
+    grid = grid.merge(minutes, on=keys, how="left")
     grid["target_minutes"] = grid["target_minutes"].fillna(0).clip(0, 90)
     grid["role_state"] = _role_state(grid["target_minutes"])
     grid["started"] = (grid["target_minutes"] >= 60).astype(int)
@@ -64,14 +61,14 @@ def build_role_grid(df: pd.DataFrame) -> pd.DataFrame:
 
     pos_cols = [c for c in ("is_gk", "is_def", "is_mid", "is_fwd") if c in df.columns]
     if pos_cols:
-        positions = df.groupby("player_id", as_index=False)[pos_cols].max()
+        positions = chronological_frame(df).sort_values("match_date").groupby("player_id", as_index=False)[pos_cols].first()
         grid = grid.merge(positions, on="player_id", how="left")
     for col in ("is_gk", "is_def", "is_mid", "is_fwd"):
         if col not in grid:
             grid[col] = 0
         grid[col] = grid[col].fillna(0).astype(int)
 
-    grid = grid.sort_values(["player_id", "season", "gameweek"]).reset_index(drop=True)
+    grid = chronological_frame(grid).sort_values(["player_id", "match_date"]).reset_index(drop=True)
     career_group = grid.groupby("player_id", sort=False)
 
     for source, prefix in (
@@ -79,14 +76,9 @@ def build_role_grid(df: pd.DataFrame) -> pd.DataFrame:
         ("started", "starter"),
         ("full90", "full90"),
     ):
-        grid[f"{prefix}_rate_roll20"] = career_group[source].transform(
-            lambda values: values.shift(1).rolling(20, min_periods=1).mean()
-        )
-        grid[f"career_{prefix}_rate"] = career_group[source].transform(
-            lambda values: values.shift(1).expanding(min_periods=1).mean()
-        )
-
-    grid["career_gws_prior"] = career_group.cumcount()
+        grid[f"{prefix}_rate_roll20"] = prior_stat(grid, "player_id", source, 20)
+        grid[f"career_{prefix}_rate"] = prior_stat(grid, "player_id", source)
+    grid["career_gws_prior"] = prior_stat(grid.assign(_one=1), "player_id", "_one", aggregation="sum").fillna(0)
     defaults = {
         "appear_rate_roll20": 0.75,
         "starter_rate_roll20": 0.55,
@@ -108,10 +100,10 @@ def build_horizon_training_frame(
     """Expand weekly player snapshots into direct GW+1 ... GW+5 targets."""
     grid = build_role_grid(df)
     first_gw = grid.groupby(["player_id", "season"])["gameweek"].transform("min")
-    anchors = grid[grid["gameweek"] > first_gw].copy()
+    anchors = grid[grid["gameweek"] > first_gw].drop_duplicates(["player_id", "season", "gameweek"]).copy()
     target = grid[
-        ["player_id", "season", "gameweek", "role_state", "target_minutes"]
-    ].rename(columns={"gameweek": "target_gameweek"})
+        ["player_id", "season", "gameweek", "role_state", "target_minutes", "result_time"]
+    ].rename(columns={"gameweek": "target_gameweek", "result_time": "target_result_time"})
 
     frames = []
     for horizon in horizons:
@@ -215,6 +207,9 @@ def evaluate_role_model(
     test: pd.DataFrame,
     use_durability: bool,
 ) -> Tuple[HorizonRoleModel, Dict]:
+    if "target_result_time" in train and "forecast_time" in test:
+        train = train[pd.to_datetime(train["target_result_time"], utc=True) <
+                      pd.to_datetime(test["forecast_time"], utc=True).min()].copy()
     model = HorizonRoleModel(use_durability=use_durability).fit(train)
     probability = model.predict_proba(test)
     actual_role = test["role_state"].astype(int).to_numpy()
@@ -404,6 +399,19 @@ class FiveWeekForecaster:
         future["pred_2plus_conceded"] = two_plus
         future["pred_goals_against"] = against
         future["pred_team_goals"] = p._get_pred_team_goals(future, gameweek, season)
+        live_position = future.apply(
+            lambda row: map_fpl_position(
+                row.get("position"), row.get("player_name"), self.fpl_positions,
+                fallback_to_fotmob=False,
+            ),
+            axis=1,
+        ).astype("string").str.upper()
+        cached_position = future.get(
+            "fpl_position", pd.Series(pd.NA, index=future.index, dtype="string")
+        ).astype("string").str.upper()
+        future["fpl_position"] = live_position.where(
+            live_position.isin(["GK", "DEF", "MID", "FWD"]), cached_position
+        )
         future["pred_exp_goals"] = p.models["goals"].predict(future)
         future["pred_exp_assists"] = p.models["assists"].predict(future)
         future["pred_defcon_prob"] = p.models["defcon"].predict_threshold_prob(
@@ -421,74 +429,18 @@ class FiveWeekForecaster:
             future.loc[gk, "pred_exp_saves"] = p.models["saves"].predict_expected_saves(
                 future.loc[gk], future.loc[gk, "pred_minutes"].to_numpy()
             )
-        future["fpl_position"] = future.apply(
-            lambda row: map_fpl_position(
-                row.get("position"), row.get("player_name"), self.fpl_positions
-            ),
-            axis=1,
-        )
-        future["pred_bonus"] = p.models["bonus"].predict(
-            future,
-            pred_goals=future["pred_exp_goals"].to_numpy(),
-            pred_assists=future["pred_exp_assists"].to_numpy(),
-            pred_cs_prob=future["pred_cs_prob"].to_numpy(),
-            pred_minutes=future["pred_minutes"].to_numpy(),
-            fpl_positions=future["fpl_position"].to_numpy(),
-            pred_yellow_prob=future["pred_yellow_prob"].to_numpy(),
-        )
-        future = p._calculate_expected_points(future).reset_index(drop=True)
-        simulations = self._simulate(future, probability, gameweek)
-        future["exp_total_pts_uncond"] = [
-            float(simulations[i].mean()) for i in range(len(future))
-        ]
+        future["pred_exp_defcon"] = p.models["defcon"].predict(future)
+        future, draws = p._simulate_points(
+            future, probability, self.role_model.state_minutes,
+            n_simulations=self.n_sims, seed=self.seed + int(gameweek) * 1009)
+        future = future.reset_index(drop=True)
+        simulations = {i: draws["total_points"][:, i] for i in range(len(future))}
         return WeekForecast(future, simulations)
 
     def _simulate(self, frame: pd.DataFrame, probability: np.ndarray,
                   gameweek: int) -> Dict[int, np.ndarray]:
-        n_sims, n_players = self.n_sims, len(frame)
-        rng = np.random.default_rng(self.seed + int(gameweek) * 1009)
-        cumulative = np.cumsum(probability, axis=1)
-        draw = rng.random((n_sims, n_players))
-        state = (draw[:, :, None] > cumulative[None, :, :]).sum(axis=2).clip(0, 3)
-        minutes = self.role_model.state_minutes[state]
-        base_minutes = np.clip(frame["pred_minutes"].to_numpy(dtype=float), 1.0, 90.0)
-        scale = minutes / base_minutes[None, :]
-
-        goals = rng.poisson(np.maximum(frame["pred_exp_goals"].to_numpy()[None, :] * scale, 0))
-        assists = rng.poisson(np.maximum(frame["pred_exp_assists"].to_numpy()[None, :] * scale, 0))
-        app = np.where(minutes >= 60, 2, np.where(minutes > 0, 1, 0))
-        positions = frame["fpl_position"].to_numpy()
-        goal_values = np.array([FPL_POINTS["goal"].get(pos, 5) for pos in positions])
-        total = app + goals * goal_values[None, :] + assists * FPL_POINTS["assist"]
-
-        against = rng.poisson(
-            np.maximum(frame["pred_goals_against"].to_numpy()[None, :], 0.01),
-            size=(n_sims, n_players),
-        )
-        cs_draw = against == 0
-        cs_values = np.array([FPL_POINTS["clean_sheet"].get(pos, 0) for pos in positions])
-        total = total + cs_draw * (minutes >= 60) * cs_values[None, :]
-
-        def_or_gk = np.isin(positions, ["DEF", "GK"])[None, :]
-        total = total - (against // 2) * (minutes >= 60) * def_or_gk
-
-        defcon = rng.random((n_sims, n_players)) < frame["pred_defcon_prob"].to_numpy()[None, :]
-        eligible_defcon = np.isin(positions, ["DEF", "MID"])[None, :]
-        total = total + defcon * (minutes >= 60) * eligible_defcon * FPL_POINTS["defcon"]
-
-        save_lambda = np.maximum(frame["pred_exp_saves"].to_numpy()[None, :] * scale, 0)
-        saves = rng.poisson(save_lambda)
-        total = total + (saves // 3) * (positions == "GK")[None, :]
-
-        yellow_p = np.clip(frame["pred_yellow_prob"].to_numpy()[None, :] * scale, 0, 1)
-        red_p = np.clip(frame["pred_red_prob"].to_numpy()[None, :] * scale, 0, 1)
-        total = total - rng.binomial(1, yellow_p) - 3 * rng.binomial(1, red_p)
-
-        bonus = self.pipeline.models["bonus"].get_last_simulations().get("bonus")
-        if isinstance(bonus, np.ndarray) and bonus.shape == total.shape:
-            total = total + bonus * (minutes > 0)
-        else:
-            bonus_mean = np.clip(frame["pred_bonus"].to_numpy(), 0, 3)
-            total = total + rng.poisson(bonus_mean[None, :] * (minutes > 0))
-
-        return {index: total[:, index].astype(float) for index in range(n_players)}
+        """Compatibility helper delegated to the weekly match simulator."""
+        _, draws = self.pipeline._simulate_points(
+            frame, probability, self.role_model.state_minutes,
+            n_simulations=self.n_sims, seed=self.seed + int(gameweek) * 1009)
+        return {i: draws["total_points"][:, i] for i in range(len(frame))}

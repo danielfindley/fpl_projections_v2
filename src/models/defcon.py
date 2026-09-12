@@ -34,8 +34,8 @@ class DefconModel(BaseModel):
         'lifetime_defcon_per90',
         'lifetime_tackles_per90', 'lifetime_interceptions_per90', 'lifetime_clearances_per90',
 
-        # Position
-        'is_def', 'is_mid',
+        # Fantasy position (never FotMob's observed on-pitch role)
+        'fpl_is_def', 'fpl_is_mid',
 
         # Opponent context (more attacks = more defensive actions)
         'opp_xg_roll1', 'opp_xg_roll2', 'opp_xg_roll3', 'opp_xg_roll5', 'opp_xg_roll7', 'opp_xg_roll10',
@@ -61,9 +61,24 @@ class DefconModel(BaseModel):
     TARGET = 'defcon'
 
     def __init__(self, **xgb_params):
+        # Existing tuned-parameter files remain loadable, but their position
+        # features must follow the new FPL-only contract.
+        selected = xgb_params.get('selected_features')
+        if selected:
+            replacements = {'is_def': 'fpl_is_def', 'is_mid': 'fpl_is_mid'}
+            xgb_params['selected_features'] = list(dict.fromkeys(
+                replacements.get(feature, feature) for feature in selected
+            ))
         xgb_params.setdefault('objective', 'count:poisson')
         super().__init__(**xgb_params)
         self.dispersion_r = None
+
+    @staticmethod
+    def _eligible(df: pd.DataFrame) -> pd.Series:
+        position = df.get(
+            'fpl_position', pd.Series(pd.NA, index=df.index, dtype='string')
+        ).astype('string').str.upper()
+        return position.isin(['DEF', 'MID'])
 
     def _get_y_max(self) -> float:
         return 30.0
@@ -87,9 +102,13 @@ class DefconModel(BaseModel):
         self.dispersion_r = max(self.dispersion_r, 0.5)
 
     def fit(self, df: pd.DataFrame, verbose: bool = True):
-        super().fit(df, verbose=verbose)
+        train_df = df[
+            self._eligible(df) & df[self.TARGET].notna() & (df['minutes'] >= 1)
+        ].copy()
+        if train_df.empty:
+            raise ValueError("DefconModel requires rows with an FPL API position of DEF or MID")
 
-        train_df = df[df['minutes'] >= 1].copy()
+        super().fit(train_df, verbose=verbose)
         self._estimate_dispersion(train_df)
 
         if verbose:
@@ -101,6 +120,11 @@ class DefconModel(BaseModel):
 
         return self
 
+    def predict(self, df: pd.DataFrame) -> np.ndarray:
+        """Predict only for FPL-eligible rows; unknown roles are never inferred."""
+        expected = super().predict(df)
+        return np.where(self._eligible(df).to_numpy(), expected, 0.0)
+
     def predict_threshold_prob(self, df, pred_minutes=None) -> np.ndarray:
         """Predict P(defcon >= threshold) using Negative Binomial distribution.
 
@@ -110,7 +134,11 @@ class DefconModel(BaseModel):
         expected = self.predict(df)
         expected = np.maximum(expected, 0.01)
 
-        thresholds = np.where(df['is_def'] == 1, 10, 12)
+        position = df.get(
+            'fpl_position', pd.Series(pd.NA, index=df.index, dtype='string')
+        ).astype('string').str.upper()
+        eligible = position.isin(['DEF', 'MID']).to_numpy()
+        thresholds = np.where(position.eq('DEF').fillna(False), 10, 12)
 
         if self.dispersion_r is not None:
             r = self.dispersion_r
@@ -120,4 +148,4 @@ class DefconModel(BaseModel):
             from scipy.stats import poisson
             probs = 1 - poisson.cdf(thresholds - 1, expected)
 
-        return np.clip(probs, 0, 1)
+        return np.where(eligible, np.clip(probs, 0, 1), 0.0)
