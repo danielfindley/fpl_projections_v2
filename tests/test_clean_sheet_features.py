@@ -240,23 +240,27 @@ def test_rolling_per90_pools_minutes_exposure_and_remains_deadline_safe():
     assert changed_result.iloc[2] == result.iloc[2]
 
 
-def test_defcon_components_and_threshold_follow_fpl_position_not_fotmob(tmp_path):
+def test_defcon_prefers_fpl_position_then_falls_back_to_fotmob(tmp_path):
     from src.features import compute_rolling_features
     raw = _dated_history(3)
     outfield = raw['position'].eq(2)
     raw.loc[outfield, ['tackles', 'interceptions', 'clearances', 'blocks', 'recoveries']] = [1, 2, 3, 4, 20]
-    # Both are FotMob midfielders; fantasy classification alone chooses CBIT vs CBIRT.
+    # Both are FotMob midfielders. The authoritative FPL DEF uses CBIT, while
+    # the row without an FPL classification falls back to FotMob MID/CBIRT.
     raw.loc[raw['player_id'].eq(1), 'fpl_position'] = 'DEF'
-    raw.loc[raw['player_id'].eq(3), 'fpl_position'] = 'MID'
+    raw.loc[raw['player_id'].eq(3), 'fpl_position'] = pd.NA
     raw.attrs['data_dir'] = str(tmp_path)
     features = compute_rolling_features(raw, verbose=False)
 
     fantasy_def = features[features['player_id'].eq(1)]
     fantasy_mid = features[features['player_id'].eq(3)]
     assert fantasy_def['is_mid'].eq(1).all()
-    assert fantasy_def['fpl_is_def'].eq(1).all()
+    assert fantasy_def['defcon_is_def'].eq(1).all()
+    assert fantasy_def['defcon_position_source'].eq('FPL').all()
     assert fantasy_def['defcon'].eq(10).all()
     assert fantasy_def['defcon_threshold'].eq(10).all()
+    assert fantasy_mid['defcon_is_mid'].eq(1).all()
+    assert fantasy_mid['defcon_position_source'].eq('FotMob').all()
     assert fantasy_mid['defcon'].eq(30).all()
     assert fantasy_mid['defcon_threshold'].eq(12).all()
 
@@ -267,7 +271,7 @@ def test_defcon_probability_uses_fpl_position_and_excludes_other_roles():
     model = DefconModel(n_estimators=1)
     model.predict = lambda frame: np.full(len(frame), 11.0)
     frame = pd.DataFrame({
-        'fpl_position': ['DEF', 'MID', 'FWD', pd.NA],
+        'defcon_position': ['DEF', 'MID', 'FWD', pd.NA],
         # Deliberately contradictory FotMob flags must have no effect.
         'is_def': [0, 1, 1, 1],
     })
@@ -275,6 +279,30 @@ def test_defcon_probability_uses_fpl_position_and_excludes_other_roles():
     assert probability[0] == pytest.approx(1 - poisson.cdf(9, 11))
     assert probability[1] == pytest.approx(1 - poisson.cdf(11, 11))
     np.testing.assert_array_equal(probability[2:], [0.0, 0.0])
+
+
+def test_shared_scoring_handles_missing_fpl_positions_and_uses_defcon_fallback():
+    from src.models.bonus import score_simulations
+    from src.pipeline import FPL_POINTS
+    frame = pd.DataFrame({
+        'fpl_position': [pd.NA, pd.NA, 'FWD', pd.NA],
+        'defcon_position': ['DEF', 'MID', 'FWD', pd.NA],
+    })
+    zeros = np.zeros((1, len(frame)), dtype=int)
+    simulations = {
+        'minutes': np.full_like(zeros, 90),
+        'goals': zeros.copy(),
+        'assists': zeros.copy(),
+        'cs': zeros.copy(),
+        'goals_against': zeros.copy(),
+        'saves': zeros.copy(),
+        'defcon': np.array([[11, 12, 99, 99]]),
+        'bonus': zeros.copy(),
+        'yellows': zeros.copy(),
+        'reds': zeros.copy(),
+    }
+    scored = score_simulations(frame, simulations, FPL_POINTS)
+    np.testing.assert_array_equal(scored['exp_defcon_pts'], [[2, 2, 0, 0]])
 
 
 def test_deadline_features_do_not_see_first_dgw_result_or_postponed_result(tmp_path):
@@ -422,7 +450,7 @@ def test_train_predict_holdout_use_shared_wrappers_without_production_files(tmp_
                ('minutes', 'clean_sheet', 'goals', 'assists', 'defcon', 'saves'))
 
 
-def test_tuning_feature_rankings_are_fold_local(tmp_path, monkeypatch):
+def test_fast_tuning_keeps_oof_dependencies_causal(tmp_path, monkeypatch):
     from src.features import compute_rolling_features
     from src.pipeline import FPLPipeline
     raw = _dated_history(7)
@@ -437,7 +465,7 @@ def test_tuning_feature_rankings_are_fold_local(tmp_path, monkeypatch):
     monkeypatch.setattr(FPLPipeline, '_fit_model', staticmethod(fit))
     params, scores = pipeline._tune_in_process(['clean_sheet'], 1, False, frame)
     assert len(set(training_deadlines)) > 1
-    assert training_deadlines[-1] == frame['forecast_time'].max()  # final ranking only
+    assert max(training_deadlines) < frame['forecast_time'].max()
     assert np.isfinite(scores['clean_sheet'])
     assert params['clean_sheet']['selected_features']
 

@@ -229,6 +229,36 @@ PER90_CAPS = {
 MIN_MINUTES_FOR_PER90 = 20
 
 
+def resolve_defcon_positions(frame: pd.DataFrame) -> pd.DataFrame:
+    """Resolve the position used by DefCon, preferring authoritative FPL data.
+
+    Historical FPL position data is incomplete. When it is unavailable, retain
+    the full defensive-contribution history by falling back to the player's
+    FotMob position for that match. Rows missing both sources remain unknown.
+    """
+    out = frame.copy()
+    fpl_position = out.get(
+        'fpl_position', pd.Series(pd.NA, index=out.index, dtype='string')
+    ).astype('string').str.upper()
+    fpl_known = fpl_position.isin(['GK', 'DEF', 'MID', 'FWD'])
+    fotmob_position = pd.to_numeric(
+        out.get('position', pd.Series(np.nan, index=out.index)), errors='coerce'
+    ).map({0: 'GK', 1: 'DEF', 2: 'MID', 3: 'FWD'}).astype('string')
+
+    out['defcon_position'] = fpl_position.where(fpl_known, fotmob_position)
+    fotmob_known = fotmob_position.isin(['GK', 'DEF', 'MID', 'FWD'])
+    out['defcon_position_source'] = pd.Series(
+        np.where(fpl_known, 'FPL', np.where(fotmob_known, 'FotMob', pd.NA)),
+        index=out.index, dtype='string')
+    out['fpl_is_def'] = fpl_position.eq('DEF').fillna(False).astype(int)
+    out['fpl_is_mid'] = fpl_position.eq('MID').fillna(False).astype(int)
+    out['fpl_is_fwd'] = fpl_position.eq('FWD').fillna(False).astype(int)
+    out['defcon_is_def'] = out['defcon_position'].eq('DEF').fillna(False).astype(int)
+    out['defcon_is_mid'] = out['defcon_position'].eq('MID').fillna(False).astype(int)
+    out['defcon_is_fwd'] = out['defcon_position'].eq('FWD').fillna(False).astype(int)
+    return out
+
+
 def _compute_calendar_minutes_features(df: pd.DataFrame,
                                        include_appeared: bool = False,
                                        per_fixture: bool = False,
@@ -730,20 +760,17 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     df['is_mid'] = (pos == 2).astype(int)
     df['is_fwd'] = (pos == 3).astype(int)
 
-    # Defcon classification is an FPL rule, so only the FPL API position may
-    # choose its components and threshold. FotMob's on-pitch role is deliberately
-    # ignored here (for example, an FPL DEF may play as a winger).
-    fpl_pos = df.get('fpl_position', pd.Series(pd.NA, index=df.index)).astype('string').str.upper()
-    df['fpl_is_def'] = fpl_pos.eq('DEF').fillna(False).astype(int)
-    df['fpl_is_mid'] = fpl_pos.eq('MID').fillna(False).astype(int)
-    df['fpl_is_fwd'] = fpl_pos.eq('FWD').fillna(False).astype(int)
-    fpl_def = fpl_pos.eq('DEF').fillna(False)
-    fpl_mid = fpl_pos.eq('MID').fillna(False)
-    eligible_defcon = fpl_def | fpl_mid
-    df['defcon'] = np.where(fpl_def, df['CBIT'],
-                            np.where(fpl_mid, df['CBIRT'], np.nan))
-    df['defcon_threshold'] = np.where(fpl_def, 10,
-                                      np.where(fpl_mid, 12, np.nan))
+    # FPL position is authoritative whenever known (so an FPL DEF playing as a
+    # winger still uses CBIT/10). Historical gaps fall back to that match's
+    # FotMob role rather than discarding otherwise useful DefCon history.
+    df = resolve_defcon_positions(df)
+    defcon_def = df['defcon_position'].eq('DEF').fillna(False)
+    defcon_mid = df['defcon_position'].eq('MID').fillna(False)
+    eligible_defcon = defcon_def | defcon_mid
+    df['defcon'] = np.where(defcon_def, df['CBIT'],
+                            np.where(defcon_mid, df['CBIRT'], np.nan))
+    df['defcon_threshold'] = np.where(defcon_def, 10,
+                                      np.where(defcon_mid, 12, np.nan))
     df['hit_threshold'] = np.where(
         eligible_defcon, (df['defcon'] >= df['defcon_threshold']).astype(int), np.nan)
 

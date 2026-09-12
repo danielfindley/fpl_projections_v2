@@ -16,7 +16,8 @@ import xgboost as xgb
 from sklearn.metrics import log_loss, mean_absolute_error
 
 from .data_loader import get_fpl_positions, map_fpl_position
-from .features import APPEARANCE_FEATURES, _compute_calendar_minutes_features, chronological_frame, prior_stat
+from .features import (APPEARANCE_FEATURES, _compute_calendar_minutes_features,
+                       chronological_frame, prior_stat, resolve_defcon_positions)
 from .pipeline import FPL_POINTS
 
 
@@ -412,6 +413,7 @@ class FiveWeekForecaster:
         future["fpl_position"] = live_position.where(
             live_position.isin(["GK", "DEF", "MID", "FWD"]), cached_position
         )
+        future = resolve_defcon_positions(future)
         future["pred_exp_goals"] = p.models["goals"].predict(future)
         future["pred_exp_assists"] = p.models["assists"].predict(future)
         future["pred_defcon_prob"] = p.models["defcon"].predict_threshold_prob(

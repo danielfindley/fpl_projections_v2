@@ -34,8 +34,8 @@ class DefconModel(BaseModel):
         'lifetime_defcon_per90',
         'lifetime_tackles_per90', 'lifetime_interceptions_per90', 'lifetime_clearances_per90',
 
-        # Fantasy position (never FotMob's observed on-pitch role)
-        'fpl_is_def', 'fpl_is_mid',
+        # Effective DefCon position: FPL when known, historical FotMob fallback
+        'defcon_is_def', 'defcon_is_mid',
 
         # Opponent context (more attacks = more defensive actions)
         'opp_xg_roll1', 'opp_xg_roll2', 'opp_xg_roll3', 'opp_xg_roll5', 'opp_xg_roll7', 'opp_xg_roll10',
@@ -62,10 +62,13 @@ class DefconModel(BaseModel):
 
     def __init__(self, **xgb_params):
         # Existing tuned-parameter files remain loadable, but their position
-        # features must follow the new FPL-only contract.
+        # features must follow the FPL-first historical-fallback contract.
         selected = xgb_params.get('selected_features')
         if selected:
-            replacements = {'is_def': 'fpl_is_def', 'is_mid': 'fpl_is_mid'}
+            replacements = {
+                'is_def': 'defcon_is_def', 'is_mid': 'defcon_is_mid',
+                'fpl_is_def': 'defcon_is_def', 'fpl_is_mid': 'defcon_is_mid',
+            }
             xgb_params['selected_features'] = list(dict.fromkeys(
                 replacements.get(feature, feature) for feature in selected
             ))
@@ -76,7 +79,7 @@ class DefconModel(BaseModel):
     @staticmethod
     def _eligible(df: pd.DataFrame) -> pd.Series:
         position = df.get(
-            'fpl_position', pd.Series(pd.NA, index=df.index, dtype='string')
+            'defcon_position', pd.Series(pd.NA, index=df.index, dtype='string')
         ).astype('string').str.upper()
         return position.isin(['DEF', 'MID'])
 
@@ -106,7 +109,7 @@ class DefconModel(BaseModel):
             self._eligible(df) & df[self.TARGET].notna() & (df['minutes'] >= 1)
         ].copy()
         if train_df.empty:
-            raise ValueError("DefconModel requires rows with an FPL API position of DEF or MID")
+            raise ValueError("DefconModel requires an FPL/FotMob-resolved DEF or MID position")
 
         super().fit(train_df, verbose=verbose)
         self._estimate_dispersion(train_df)
@@ -121,7 +124,7 @@ class DefconModel(BaseModel):
         return self
 
     def predict(self, df: pd.DataFrame) -> np.ndarray:
-        """Predict only for FPL-eligible rows; unknown roles are never inferred."""
+        """Predict only for resolved DEF/MID rows; unknown roles are excluded."""
         expected = super().predict(df)
         return np.where(self._eligible(df).to_numpy(), expected, 0.0)
 
@@ -135,7 +138,7 @@ class DefconModel(BaseModel):
         expected = np.maximum(expected, 0.01)
 
         position = df.get(
-            'fpl_position', pd.Series(pd.NA, index=df.index, dtype='string')
+            'defcon_position', pd.Series(pd.NA, index=df.index, dtype='string')
         ).astype('string').str.upper()
         eligible = position.isin(['DEF', 'MID']).to_numpy()
         thresholds = np.where(position.eq('DEF').fillna(False), 10, 12)

@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from .data_loader import load_player_stats, load_fixtures, merge_fixtures, get_fpl_positions, map_fpl_position, get_fpl_availability, merge_fpl_card_data, get_fpl_current_squads, normalize_player_name
-from .features import compute_rolling_features, build_appearance_grid, chronological_frame, deadline_splits
+from .features import (compute_rolling_features, build_appearance_grid,
+                       chronological_frame, deadline_splits,
+                       resolve_defcon_positions)
 from .models import GoalsModel, AssistsModel, MinutesModel, DefconModel, CleanSheetModel, BonusModel, CardsModel, SavesModel
 from .models.minutes import StarterClassifier, StarterMinutesModel, SubMinutesModel, ALL_FEATURES as MINUTES_ALL_FEATURES, STARTER_FEATURES, SUB_FEATURES
 from .experiment_log import log_experiment, get_history, get_best_run, log_predictions, get_predictions, clear_experiments
@@ -127,11 +129,9 @@ class FPLPipeline:
         # Merge FPL yellow/red card data (required for CardsModel)
         self.df = merge_fpl_card_data(self.df, str(self.data_dir), verbose)
 
-        # DefCon is a fantasy scoring rule, so its position cannot come from the
-        # role FotMob observed on the pitch. Exact season/GW positions from the
-        # FPL cache take precedence; the current FPL API fills older rows for
-        # players who are still in the game. Unmatched rows remain unknown and
-        # are excluded from DefCon rather than falling back to FotMob.
+        # Exact season/GW positions from the FPL cache take precedence; the
+        # current FPL API fills older rows for players still in the game.
+        # Feature engineering uses FotMob only for the remaining historical gaps.
         self.fpl_positions = get_fpl_positions()
         api_position = self.df.apply(
             lambda row: map_fpl_position(
@@ -147,7 +147,7 @@ class FPLPipeline:
         if verbose:
             known_position = self.df['fpl_position'].isin(['GK', 'DEF', 'MID', 'FWD'])
             print(f"  FPL positions: {int(known_position.sum()):,}/{len(self.df):,} rows resolved; "
-                  "unresolved rows excluded from DefCon")
+                  "historical gaps use FotMob for DefCon")
 
         # Carry actual match timing into every feature and validation window.
         date_path = self.data_dir / 'matches' / 'match_details.csv'
@@ -504,115 +504,1004 @@ class FPLPipeline:
 
         return self
     
-    def _tune_in_process(self, models, n_iter, verbose, df_train):
-        """Deadline-blocked CV, fold-local ranking/PCA, production model wrappers.
+    def _tune_in_process(self, models: list, n_iter: int, verbose: bool, df_train: pd.DataFrame) -> Dict:
+        """Run tuning in the current process using Optuna with TimeSeriesSplit CV.
 
-        Minutes trials optimize the deployed mixture's Huber loss, not three
-        unrelated proxy objectives. Upstream OOF features are rebuilt within each
-        downstream fold; already-tuned upstream hyperparameters are held fixed.
+        Feature selection is integrated into Optuna: ranking method and number of
+        features are hyperparameters. Rankings are pre-computed once per model before
+        trials begin, so each trial just slices the top-N from the chosen ranking.
+
+        Uses TimeSeriesSplit for time-aware cross-validation.
         """
         import optuna
+        from sklearn.model_selection import cross_val_score, TimeSeriesSplit
+        from sklearn.metrics import make_scorer, mean_poisson_deviance
+        import xgboost as xgb
+        from .feature_selection import compute_feature_rankings, select_features
+
         optuna.logging.set_verbosity(optuna.logging.WARNING)
-        params_out, scores = {}, {}
-        frame = chronological_frame(df_train).sort_values('match_date').reset_index(drop=True)
-        order = [name for name in ('minutes', 'clean_sheet', 'goals', 'assists', 'defcon', 'saves')
-                 if name in models]
-        for name in order:
-            source = (CleanSheetModel().prepare_team_features(frame)
-                      if name == 'clean_sheet' else frame.copy())
-            if name == 'saves':
-                source = source[source['is_gk'] == 1].copy()
-            elif name == 'defcon':
-                # Unknown and ineligible fantasy positions are not zero-DefCon
-                # observations. They are outside this model's population.
-                source = source[
-                    source['fpl_position'].isin(['DEF', 'MID'])
-                    & source['defcon'].notna()
-                ].copy()
-            source = source.reset_index(drop=True)
-            folds = []
-            for ti, vi in deadline_splits(source):
-                tr, va = source.iloc[ti].copy(), source.iloc[vi].copy()
-                if name in ('goals', 'assists', 'defcon'):
-                    tr, va = self._dependency_frames(tr, va, need_team=name != 'defcon')
-                folds.append((tr, va))
-            if not folds:
-                raise ValueError(f"Not enough historical deadlines to tune {name}")
-            full = source
-            if name in ('goals', 'assists', 'defcon'):
-                full = self._dependency_frames(source, need_team=name != 'defcon')
-            available = [f for f in self._model_class(name).FEATURES if f in full.columns]
-            protected = [f for f in ('pred_minutes', 'pred_team_goals') if f in available]
 
-            def rank(training):
-                # Fitting the actual wrapper also makes ranking respect weights,
-                # target caps, clean-sheet offsets and training-only manager PCA.
-                probe = self._fit_model(name, training,
-                                        {'n_estimators': 60, 'max_depth': 3})
-                if name == 'minutes':
-                    sub = probe.classifier
-                    if getattr(sub, 'constant_probability', None) is not None:
-                        return list(available)
-                    importance = dict(zip(sub.features_to_use, sub.model.feature_importances_))
-                    return sorted(available, key=lambda f: importance.get(f, 0), reverse=True)
-                importance = probe.feature_importance().set_index('feature')['importance']
-                return sorted(available, key=lambda f: importance.get(f, 0), reverse=True)
+        tscv = TimeSeriesSplit(n_splits=5)
 
-            rankings = [rank(tr) for tr, _ in folds]
-            selectable = max(1, len(available) - len(protected))
+        def huber_loss(y_true, y_pred, delta=10.0):
+            residual = np.abs(y_true - y_pred)
+            quadratic = np.minimum(residual, delta)
+            linear = residual - quadratic
+            return np.mean(0.5 * quadratic**2 + delta * linear)
 
-            def select(ranking, count):
-                return protected + [f for f in ranking if f not in protected][:count]
+        huber_scorer = make_scorer(huber_loss, greater_is_better=False)
 
-            def objective(trial):
-                candidate = {
-                    'n_estimators': trial.suggest_int('n_estimators', 50 if name == 'clean_sheet' else 100, 300),
-                    'max_depth': trial.suggest_int('max_depth', 3, 7),
-                    'learning_rate': trial.suggest_float('learning_rate', .01, .3, log=True),
-                    'min_child_weight': trial.suggest_int('min_child_weight', 1, 15),
-                    'colsample_bytree': trial.suggest_float('colsample_bytree', .4, 1.),
-                    'subsample': trial.suggest_float('subsample', .6, 1.),
-                    'reg_alpha': trial.suggest_float('reg_alpha', .001, 10., log=True),
-                    'reg_lambda': trial.suggest_float('reg_lambda', .001, 10., log=True),
-                }
-                count = trial.suggest_int('n_features', min(5, selectable), selectable)
-                losses, sizes = [], []
-                for (tr, va), ranking in zip(folds, rankings):
-                    model = self._fit_model(name, tr, {
-                        **candidate, 'selected_features': select(ranking, count)})
-                    target = 'goals_conceded' if name == 'clean_sheet' else model.TARGET
-                    losses.append(self._loss(name, va[target].fillna(0).to_numpy(),
-                                             self._model_predict(name, model, va)))
-                    sizes.append(len(va))
-                return float(np.average(losses, weights=sizes))
+        def safe_poisson_deviance(y_true, y_pred):
+            y_pred = np.clip(y_pred, 1e-8, None)
+            y_true = np.clip(y_true, 0, None)
+            return mean_poisson_deviance(y_true, y_pred)
 
-            study = optuna.create_study(direction='minimize',
-                                       sampler=optuna.samplers.TPESampler(seed=42))
-            study.optimize(objective, n_trials=n_iter, show_progress_bar=verbose)
-            best = study.best_params.copy()
-            count = best.pop('n_features')
-            best['selected_features'] = select(rank(full), count)
-            params_out[name] = best
-            scores[name] = study.best_value
-            self.tuned_params[name] = best
+        poisson_scorer = make_scorer(safe_poisson_deviance, greater_is_better=False)
+
+        mae_scorer = 'neg_mean_absolute_error'
+        SCORING = {
+            'goals': ('Poisson Deviance', poisson_scorer),
+            'assists': ('Poisson Deviance', poisson_scorer),
+            'defcon': ('Poisson Deviance', poisson_scorer),
+            'minutes': ('Huber Loss', huber_scorer),
+            'saves': ('MAE', mae_scorer),
+        }
+
+        SEARCH_SPACES = {
+            'goals': {
+                'n_estimators': (100, 400),
+                'max_depth': (3, 7),
+                'learning_rate': (0.01, 0.3, 'log'),
+                'min_child_weight': (1, 10),
+                'colsample_bytree': (0.4, 1.0),
+                'subsample': (0.6, 1.0),
+                'reg_alpha': (1e-3, 10.0, 'log'),
+                'reg_lambda': (1e-3, 10.0, 'log'),
+            },
+            'assists': {
+                'n_estimators': (100, 400),
+                'max_depth': (3, 7),
+                'learning_rate': (0.01, 0.3, 'log'),
+                'min_child_weight': (1, 10),
+                'colsample_bytree': (0.4, 1.0),
+                'subsample': (0.6, 1.0),
+                'reg_alpha': (1e-3, 10.0, 'log'),
+                'reg_lambda': (1e-3, 10.0, 'log'),
+            },
+            'minutes': {
+                'n_estimators': (100, 400),
+                'max_depth': (3, 7),
+                'learning_rate': (0.01, 0.3, 'log'),
+                'min_child_weight': (1, 15),
+                'colsample_bytree': (0.4, 1.0),
+                'subsample': (0.6, 1.0),
+                'reg_alpha': (1e-3, 10.0, 'log'),
+                'reg_lambda': (1e-3, 10.0, 'log'),
+            },
+            'defcon': {
+                'n_estimators': (100, 400),
+                'max_depth': (3, 7),
+                'learning_rate': (0.01, 0.3, 'log'),
+                'min_child_weight': (1, 10),
+                'colsample_bytree': (0.4, 1.0),
+                'subsample': (0.6, 1.0),
+                'reg_alpha': (1e-3, 10.0, 'log'),
+                'reg_lambda': (1e-3, 10.0, 'log'),
+            },
+            'clean_sheet': {
+                'n_estimators': (50, 300),
+                'max_depth': (3, 8),
+                'learning_rate': (0.01, 0.3, 'log'),
+                'min_child_weight': (1, 10),
+                'colsample_bytree': (0.4, 1.0),
+                'subsample': (0.6, 1.0),
+                'reg_alpha': (1e-3, 10.0, 'log'),
+                'reg_lambda': (1e-3, 10.0, 'log'),
+            },
+            'saves': {
+                'n_estimators': (100, 400),
+                'max_depth': (3, 7),
+                'learning_rate': (0.01, 0.3, 'log'),
+                'min_child_weight': (1, 10),
+                'colsample_bytree': (0.4, 1.0),
+                'subsample': (0.6, 1.0),
+                'reg_alpha': (1e-3, 10.0, 'log'),
+                'reg_lambda': (1e-3, 10.0, 'log'),
+            },
+        }
+
+        # Min features per model (excluding protected features)
+        MIN_FEATURES = {
+            'goals': 15, 'assists': 5, 'defcon': 5, 'saves': 5,
+        }
+
+        # Protected features that must always be included
+        PROTECTED = {
+            'goals': ['pred_team_goals', 'pred_minutes'],
+            'assists': ['pred_team_goals', 'pred_minutes'],
+            'defcon': ['pred_minutes'],
+            'saves': [],
+        }
+
+        RANKING_METHODS = ['xgb_gain', 'xgb_cover', 'lgbm', 'permutation', 'mutual_info']
+
+        MODEL_CLASSES = {
+            'goals': GoalsModel,
+            'assists': AssistsModel,
+            'minutes': MinutesModel,
+            'defcon': DefconModel,
+            'clean_sheet': CleanSheetModel,
+            'saves': SavesModel,
+        }
+
+        tuned_params = {}
+        cv_scores = {}
+
+        # --- Dependency-ordered tuning with OOF feature generation ---
+        # 1. Minutes first → OOF pred_minutes for downstream models
+        # 2. Clean sheet → OOF pred_team_goals for goals/assists
+        # 3. Everything else uses the OOF predictions as features
+
+        # Stage 1: Tune minutes (no upstream dependencies)
+        if 'minutes' in models:
+            mins_result = self._tune_minutes_in_process(
+                n_iter, verbose, df_train, SEARCH_SPACES['minutes']
+            )
+            tuned_params['minutes'] = mins_result['params']
+            cv_scores['minutes'] = mins_result['cv_score']
+
+            # Generate OOF pred_minutes for downstream models
             if verbose:
-                print(f"  {name}: temporal CV loss={study.best_value:.4f}")
-        return params_out, scores
+                print(f"\n  Generating OOF pred_minutes for downstream models...")
+            df_train['pred_minutes'] = self._generate_oof_minutes(df_train, tuned_params['minutes'], verbose)
+        else:
+            # Fallback: use actual minutes
+            df_train['pred_minutes'] = df_train['minutes']
 
-    def _tune_with_subprocess(self, models, n_iter, verbose, df_train):
-        """Same tuning implementation, one fresh spawned process per model."""
-        import multiprocessing as mp
-        tuned, scores = {}, {}
-        for name in ('minutes', 'clean_sheet', 'goals', 'assists', 'defcon', 'saves'):
-            if name not in models:
+        # Stage 2: Tune clean_sheet (no upstream dependencies)
+        if 'clean_sheet' in models:
+            cs_result = self._tune_clean_sheet_in_process(
+                n_iter, verbose, df_train, SEARCH_SPACES['clean_sheet']
+            )
+            tuned_params['clean_sheet'] = cs_result['params']
+            cv_scores['clean_sheet'] = cs_result['cv_score']
+
+            # Generate OOF pred_team_goals for downstream models
+            if verbose:
+                print(f"\n  Generating OOF pred_team_goals for downstream models...")
+            df_train = self._generate_oof_team_goals_for_tuning(df_train, tuned_params['clean_sheet'], verbose)
+
+        # Stage 3: Tune remaining models (goals, assists, defcon, saves)
+        # These now have OOF pred_minutes and pred_team_goals available as features
+        remaining = [m for m in models if m not in ('minutes', 'clean_sheet')]
+        for model_name in remaining:
+            if model_name not in MODEL_CLASSES:
                 continue
-            with mp.get_context('spawn').Pool(1) as pool:
-                result, cv = pool.apply(_tune_worker, (
-                    str(self.data_dir), name, n_iter, verbose, df_train,
-                    {**self.tuned_params, **tuned}))
-            tuned.update(result)
-            scores.update(cv)
-        return tuned, scores
+
+            model_class = MODEL_CLASSES[model_name]
+            space = SEARCH_SPACES.get(model_name, {})
+            score_name, scorer = SCORING.get(model_name, ('RMSE', 'neg_root_mean_squared_error'))
+
+            model_instance = model_class()
+            all_features = [f for f in model_instance.FEATURES if f in df_train.columns]
+            target = model_instance.TARGET
+            n_total_features = len(all_features)
+            protected = [f for f in PROTECTED.get(model_name, []) if f in all_features]
+            min_feats = MIN_FEATURES.get(model_name, 5)
+
+            # Filter to GKs only for saves model
+            tune_df = df_train
+            if model_name == 'saves':
+                tune_df = df_train[df_train['is_gk'] == 1].copy()
+            elif model_name == 'defcon':
+                tune_df = df_train[
+                    df_train['defcon_position'].isin(['DEF', 'MID'])
+                    & df_train['defcon'].notna()
+                ].copy()
+
+            X_full = tune_df[all_features].fillna(0).values
+            y = tune_df[target].fillna(0).values
+
+            if verbose:
+                print(f"\nTuning {model_name.upper()} ({n_iter} trials, TimeSeriesSplit CV, {score_name})...")
+                print(f"  Pre-computing feature rankings ({n_total_features} features, {len(RANKING_METHODS)} methods)...")
+
+            # Pre-compute rankings once
+            xgb_hint = {'objective': 'count:poisson'} if model_name in ('goals', 'assists', 'defcon') else {}
+            rankings = compute_feature_rankings(X_full, y, all_features, task='regression', xgb_params=xgb_hint)
+
+            if verbose:
+                print(f"  Rankings computed. Starting Optuna search...")
+
+            # Optuna tunes hyperparams + feature selection jointly
+            def objective(trial, _rankings=rankings, _all_features=all_features,
+                          _protected=protected, _min_feats=min_feats, _n_total=n_total_features):
+                params = {
+                    'n_estimators': trial.suggest_int('n_estimators', space['n_estimators'][0], space['n_estimators'][1]),
+                    'max_depth': trial.suggest_int('max_depth', space['max_depth'][0], space['max_depth'][1]),
+                    'learning_rate': trial.suggest_float('learning_rate', space['learning_rate'][0], space['learning_rate'][1], log=True),
+                    'min_child_weight': trial.suggest_int('min_child_weight', space['min_child_weight'][0], space['min_child_weight'][1]),
+                    'colsample_bytree': trial.suggest_float('colsample_bytree', space['colsample_bytree'][0], space['colsample_bytree'][1]),
+                    'subsample': trial.suggest_float('subsample', space['subsample'][0], space['subsample'][1]),
+                    'reg_alpha': trial.suggest_float('reg_alpha', space['reg_alpha'][0], space['reg_alpha'][1], log=True),
+                    'reg_lambda': trial.suggest_float('reg_lambda', space['reg_lambda'][0], space['reg_lambda'][1], log=True),
+                    'random_state': 42,
+                    'verbosity': 0,
+                    'n_jobs': -1,
+                }
+
+                if model_name in ('goals', 'assists', 'defcon'):
+                    params['objective'] = 'count:poisson'
+
+                # Feature selection as hyperparameters
+                feat_method = trial.suggest_categorical('feat_method', RANKING_METHODS)
+                n_selectable = _n_total - len(_protected)
+                n_features = trial.suggest_int('n_features', _min_feats, n_selectable)
+
+                selected = select_features(_rankings, feat_method, n_features, _protected)
+                feat_idx = [_all_features.index(f) for f in selected]
+                X_sel = X_full[:, feat_idx]
+
+                model = xgb.XGBRegressor(**params)
+                scores = cross_val_score(model, X_sel, y, cv=tscv, scoring=scorer, n_jobs=1)
+                return -scores.mean()
+
+            study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=42))
+            study.optimize(objective, n_trials=n_iter, show_progress_bar=verbose)
+
+            best_params = study.best_params.copy()
+
+            # Extract feature selection params
+            best_feat_method = best_params.pop('feat_method')
+            best_n_features = best_params.pop('n_features')
+            selected_features = select_features(rankings, best_feat_method, best_n_features, protected)
+
+            if model_name in ('goals', 'assists', 'defcon'):
+                best_params['objective'] = 'count:poisson'
+
+            tuned_params[model_name] = {
+                **best_params,
+                'selected_features': selected_features,
+            }
+            cv_scores[model_name] = study.best_value
+
+            if verbose:
+                print(f"  Best CV {score_name}: {study.best_value:.4f}")
+                print(f"  Feature method: {best_feat_method}, selected {len(selected_features)}/{n_total_features} features")
+
+        return tuned_params, cv_scores
+
+    def _tune_clean_sheet_in_process(self, n_iter: int, verbose: bool,
+                                      df_train: pd.DataFrame, space: dict) -> Dict:
+        """Tune CleanSheetModel (Poisson regression for goals against).
+
+        Feature selection is integrated into Optuna: ranking method and number of
+        features are hyperparameters alongside XGBoost params.
+        """
+        import optuna
+        from sklearn.model_selection import cross_val_score, TimeSeriesSplit
+        from sklearn.metrics import make_scorer, mean_poisson_deviance
+        import xgboost as xgb
+        from .feature_selection import compute_feature_rankings, select_features
+
+        RANKING_METHODS = ['xgb_gain', 'xgb_cover', 'lgbm', 'permutation', 'mutual_info']
+
+        def safe_poisson_deviance(y_true, y_pred):
+            y_pred = np.clip(y_pred, 1e-8, None)
+            y_true = np.clip(y_true, 0, None)
+            return mean_poisson_deviance(y_true, y_pred)
+        poisson_scorer = make_scorer(safe_poisson_deviance, greater_is_better=False)
+
+        tscv = TimeSeriesSplit(n_splits=5)
+
+        # Prepare team-level data (already sorted temporally by prepare_team_features)
+        cs_model = CleanSheetModel()
+        team_df = cs_model.prepare_team_features(df_train)
+        team_df = team_df.dropna(subset=['team_conceded_roll5', 'goals_conceded'])
+
+        all_features = [f for f in cs_model.FEATURES if f in team_df.columns]
+        n_total_features = len(all_features)
+        X_full = team_df[all_features].fillna(0).values
+        y = team_df['goals_conceded'].fillna(0).values
+
+        if verbose:
+            print(f"\nTuning GOALS_AGAINST ({n_iter} trials, TimeSeriesSplit CV, Poisson Deviance)...")
+            print(f"  Pre-computing feature rankings ({n_total_features} features, {len(RANKING_METHODS)} methods)...")
+            print(f"  Team-matches: {len(X_full)}, Avg conceded: {y.mean():.3f}")
+
+        # Pre-compute rankings
+        rankings = compute_feature_rankings(X_full, y, all_features, task='regression',
+                                            xgb_params={'objective': 'count:poisson'})
+
+        if verbose:
+            print(f"  Rankings computed. Starting Optuna search...")
+
+        def objective(trial):
+            params = {
+                'n_estimators': trial.suggest_int('n_estimators', space['n_estimators'][0], space['n_estimators'][1]),
+                'max_depth': trial.suggest_int('max_depth', space['max_depth'][0], space['max_depth'][1]),
+                'learning_rate': trial.suggest_float('learning_rate', space['learning_rate'][0], space['learning_rate'][1], log=True),
+                'min_child_weight': trial.suggest_int('min_child_weight', space['min_child_weight'][0], space['min_child_weight'][1]),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', space['colsample_bytree'][0], space['colsample_bytree'][1]),
+                'subsample': trial.suggest_float('subsample', space['subsample'][0], space['subsample'][1]),
+                'reg_alpha': trial.suggest_float('reg_alpha', space['reg_alpha'][0], space['reg_alpha'][1], log=True),
+                'reg_lambda': trial.suggest_float('reg_lambda', space['reg_lambda'][0], space['reg_lambda'][1], log=True),
+                'random_state': 42,
+                'verbosity': 0,
+                'n_jobs': -1,
+                'objective': 'count:poisson',
+            }
+
+            # Feature selection as hyperparameters
+            feat_method = trial.suggest_categorical('feat_method', RANKING_METHODS)
+            n_features = trial.suggest_int('n_features', 5, n_total_features)
+
+            selected = select_features(rankings, feat_method, n_features)
+            feat_idx = [all_features.index(f) for f in selected]
+            X_sel = X_full[:, feat_idx]
+
+            model = xgb.XGBRegressor(**params)
+            scores = cross_val_score(model, X_sel, y, cv=tscv, scoring=poisson_scorer, n_jobs=1)
+            return -scores.mean()
+
+        study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=42))
+        study.optimize(objective, n_trials=n_iter, show_progress_bar=verbose)
+
+        best_params = study.best_params.copy()
+
+        # Extract feature selection params
+        best_feat_method = best_params.pop('feat_method')
+        best_n_features = best_params.pop('n_features')
+        selected_features = select_features(rankings, best_feat_method, best_n_features)
+
+        if verbose:
+            print(f"  Best CV Poisson Deviance: {study.best_value:.4f}")
+            print(f"  Feature method: {best_feat_method}, selected {len(selected_features)}/{n_total_features} features")
+
+        return {
+            'params': {**best_params, 'selected_features': selected_features},
+            'cv_score': study.best_value,
+        }
+
+    def _tune_minutes_in_process(self, n_iter: int, verbose: bool,
+                                  df_train: pd.DataFrame, space: dict) -> dict:
+        """Tune the two-stage MinutesModel: classifier + starter regressor + sub regressor.
+
+        Each sub-model gets its own Optuna pass with integrated feature selection.
+        Returns nested params dict.
+        """
+        import optuna
+        from sklearn.model_selection import cross_val_score, TimeSeriesSplit
+        from sklearn.metrics import make_scorer, log_loss
+        import xgboost as xgb
+        from .feature_selection import compute_feature_rankings, select_features
+
+        RANKING_METHODS = ['xgb_gain', 'xgb_cover', 'lgbm', 'permutation', 'mutual_info']
+
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        tscv = TimeSeriesSplit(n_splits=5)
+
+        df_played = df_train[df_train['minutes'] >= 1].copy()
+        df_played = df_played.sort_values(['season', 'gameweek'])
+
+        if verbose:
+            print(f"\nTuning MINUTES (two-stage, {n_iter} trials each)...")
+            print(f"  Total played: {len(df_played):,}")
+
+        # ---- 1. StarterClassifier (log-loss) ----
+        cls_features = [f for f in MINUTES_ALL_FEATURES if f in df_played.columns]
+        X_cls = df_played[cls_features].fillna(0).values
+        y_cls = (df_played['minutes'] >= 60).astype(int).values
+        n_cls_features = len(cls_features)
+
+        if verbose:
+            print(f"\n  [1/3] StarterClassifier ({n_cls_features} features, {y_cls.mean():.1%} starters)")
+            print(f"    Pre-computing feature rankings...")
+
+        cls_rankings = compute_feature_rankings(X_cls, y_cls, cls_features, task='classification')
+
+        def cls_objective(trial):
+            params = {
+                'n_estimators': trial.suggest_int('n_estimators', space['n_estimators'][0], space['n_estimators'][1]),
+                'max_depth': trial.suggest_int('max_depth', space['max_depth'][0], space['max_depth'][1]),
+                'learning_rate': trial.suggest_float('learning_rate', space['learning_rate'][0], space['learning_rate'][1], log=True),
+                'min_child_weight': trial.suggest_int('min_child_weight', space['min_child_weight'][0], space['min_child_weight'][1]),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', space['colsample_bytree'][0], space['colsample_bytree'][1]),
+                'subsample': trial.suggest_float('subsample', space['subsample'][0], space['subsample'][1]),
+                'reg_alpha': trial.suggest_float('reg_alpha', space['reg_alpha'][0], space['reg_alpha'][1], log=True),
+                'reg_lambda': trial.suggest_float('reg_lambda', space['reg_lambda'][0], space['reg_lambda'][1], log=True),
+                'random_state': 42, 'verbosity': 0, 'n_jobs': -1,
+                'eval_metric': 'logloss', 'use_label_encoder': False,
+            }
+            feat_method = trial.suggest_categorical('feat_method', RANKING_METHODS)
+            n_features = trial.suggest_int('n_features', 5, n_cls_features)
+            selected = select_features(cls_rankings, feat_method, n_features)
+            feat_idx = [cls_features.index(f) for f in selected]
+            X_sel = X_cls[:, feat_idx]
+
+            model = xgb.XGBClassifier(**params)
+            scores = cross_val_score(model, X_sel, y_cls, cv=tscv, scoring='neg_log_loss', n_jobs=1)
+            return -scores.mean()
+
+        study_cls = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=42))
+        study_cls.optimize(cls_objective, n_trials=n_iter, show_progress_bar=verbose)
+        cls_best = study_cls.best_params.copy()
+        cls_feat_method = cls_best.pop('feat_method')
+        cls_n_features = cls_best.pop('n_features')
+        cls_selected = select_features(cls_rankings, cls_feat_method, cls_n_features)
+
+        if verbose:
+            print(f"    Best CV LogLoss: {study_cls.best_value:.4f}")
+            print(f"    Feature method: {cls_feat_method}, selected {len(cls_selected)}/{n_cls_features} features")
+
+        # ---- 2. StarterMinutesModel (MAE, trained on 60+ only) ----
+        df_starters = df_played[df_played['minutes'] >= 60].copy()
+        starter_features = [f for f in STARTER_FEATURES if f in df_starters.columns]
+        X_start = df_starters[starter_features].fillna(0).values
+        y_start = df_starters['minutes'].values
+        n_starter_features = len(starter_features)
+
+        if verbose:
+            print(f"\n  [2/3] StarterMinutesModel ({n_starter_features} features, {len(df_starters):,} samples)")
+            print(f"    Pre-computing feature rankings...")
+
+        starter_rankings = compute_feature_rankings(X_start, y_start, starter_features, task='regression')
+
+        def starter_objective(trial):
+            params = {
+                'n_estimators': trial.suggest_int('n_estimators', space['n_estimators'][0], space['n_estimators'][1]),
+                'max_depth': trial.suggest_int('max_depth', space['max_depth'][0], space['max_depth'][1]),
+                'learning_rate': trial.suggest_float('learning_rate', space['learning_rate'][0], space['learning_rate'][1], log=True),
+                'min_child_weight': trial.suggest_int('min_child_weight', space['min_child_weight'][0], space['min_child_weight'][1]),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', space['colsample_bytree'][0], space['colsample_bytree'][1]),
+                'subsample': trial.suggest_float('subsample', space['subsample'][0], space['subsample'][1]),
+                'reg_alpha': trial.suggest_float('reg_alpha', space['reg_alpha'][0], space['reg_alpha'][1], log=True),
+                'reg_lambda': trial.suggest_float('reg_lambda', space['reg_lambda'][0], space['reg_lambda'][1], log=True),
+                'random_state': 42, 'verbosity': 0, 'n_jobs': -1,
+            }
+            feat_method = trial.suggest_categorical('feat_method', RANKING_METHODS)
+            n_features = trial.suggest_int('n_features', 5, n_starter_features)
+            selected = select_features(starter_rankings, feat_method, n_features)
+            feat_idx = [starter_features.index(f) for f in selected]
+            X_sel = X_start[:, feat_idx]
+
+            model = xgb.XGBRegressor(**params)
+            scores = cross_val_score(model, X_sel, y_start, cv=tscv, scoring='neg_mean_absolute_error', n_jobs=1)
+            return -scores.mean()
+
+        study_start = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=43))
+        study_start.optimize(starter_objective, n_trials=n_iter, show_progress_bar=verbose)
+        starter_best = study_start.best_params.copy()
+        starter_feat_method = starter_best.pop('feat_method')
+        starter_n_features = starter_best.pop('n_features')
+        starter_selected = select_features(starter_rankings, starter_feat_method, starter_n_features)
+
+        if verbose:
+            print(f"    Best CV MAE: {study_start.best_value:.4f}")
+            print(f"    Feature method: {starter_feat_method}, selected {len(starter_selected)}/{n_starter_features} features")
+
+        # ---- 3. SubMinutesModel (MAE, trained on 1-59 only) ----
+        df_subs = df_played[(df_played['minutes'] >= 1) & (df_played['minutes'] < 60)].copy()
+        sub_features = [f for f in SUB_FEATURES if f in df_subs.columns]
+        X_sub = df_subs[sub_features].fillna(0).values
+        y_sub = df_subs['minutes'].values
+        n_sub_features = len(sub_features)
+
+        if verbose:
+            print(f"\n  [3/3] SubMinutesModel ({n_sub_features} features, {len(df_subs):,} samples)")
+            print(f"    Pre-computing feature rankings...")
+
+        sub_rankings = compute_feature_rankings(X_sub, y_sub, sub_features, task='regression')
+
+        def sub_objective(trial):
+            params = {
+                'n_estimators': trial.suggest_int('n_estimators', space['n_estimators'][0], space['n_estimators'][1]),
+                'max_depth': trial.suggest_int('max_depth', space['max_depth'][0], space['max_depth'][1]),
+                'learning_rate': trial.suggest_float('learning_rate', space['learning_rate'][0], space['learning_rate'][1], log=True),
+                'min_child_weight': trial.suggest_int('min_child_weight', space['min_child_weight'][0], space['min_child_weight'][1]),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', space['colsample_bytree'][0], space['colsample_bytree'][1]),
+                'subsample': trial.suggest_float('subsample', space['subsample'][0], space['subsample'][1]),
+                'reg_alpha': trial.suggest_float('reg_alpha', space['reg_alpha'][0], space['reg_alpha'][1], log=True),
+                'reg_lambda': trial.suggest_float('reg_lambda', space['reg_lambda'][0], space['reg_lambda'][1], log=True),
+                'random_state': 42, 'verbosity': 0, 'n_jobs': -1,
+            }
+            feat_method = trial.suggest_categorical('feat_method', RANKING_METHODS)
+            n_features = trial.suggest_int('n_features', 3, n_sub_features)
+            selected = select_features(sub_rankings, feat_method, n_features)
+            feat_idx = [sub_features.index(f) for f in selected]
+            X_sel = X_sub[:, feat_idx]
+
+            model = xgb.XGBRegressor(**params)
+            scores = cross_val_score(model, X_sel, y_sub, cv=tscv, scoring='neg_mean_absolute_error', n_jobs=1)
+            return -scores.mean()
+
+        study_sub = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=44))
+        study_sub.optimize(sub_objective, n_trials=n_iter, show_progress_bar=verbose)
+        sub_best = study_sub.best_params.copy()
+        sub_feat_method = sub_best.pop('feat_method')
+        sub_n_features = sub_best.pop('n_features')
+        sub_selected = select_features(sub_rankings, sub_feat_method, sub_n_features)
+
+        if verbose:
+            print(f"    Best CV MAE: {study_sub.best_value:.4f}")
+            print(f"    Feature method: {sub_feat_method}, selected {len(sub_selected)}/{n_sub_features} features")
+
+        # Build nested params
+        nested_params = {
+            'classifier_params': {**cls_best, 'selected_features': cls_selected},
+            'starter_params': {**starter_best, 'selected_features': starter_selected},
+            'sub_params': {**sub_best, 'selected_features': sub_selected},
+        }
+
+        # Combined CV score: weighted average of classifier log-loss (as proxy)
+        combined_cv = study_cls.best_value
+
+        return {
+            'params': nested_params,
+            'cv_score': combined_cv,
+        }
+
+    def _legacy_generate_oof_minutes_unused(self, df_train: pd.DataFrame, mins_params: dict,
+                                             verbose: bool = True) -> np.ndarray:
+        """Generate out-of-fold predicted minutes on training data.
+
+        Uses TimeSeriesSplit to produce leak-free pred_minutes that downstream
+        models (goals, assists, defcon) see during tuning — matching what they'll
+        see at inference time when actual minutes are unknown.
+
+        Returns an array of OOF predictions aligned to df_train's index.
+        """
+        from sklearn.model_selection import TimeSeriesSplit
+
+        df_played = df_train[df_train['minutes'] >= 1].copy()
+        df_played = df_played.sort_values(['season', 'gameweek']).reset_index(drop=True)
+
+        tscv = TimeSeriesSplit(n_splits=5)
+        oof_preds = np.full(len(df_played), np.nan)
+
+        for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(df_played)):
+            fold_train = df_played.iloc[train_idx]
+            fold_val = df_played.iloc[val_idx]
+
+            fold_model = MinutesModel(**mins_params)
+            fold_model.fit(fold_train, verbose=False)
+            oof_preds[val_idx] = fold_model.predict(fold_val)
+
+        # For rows not covered by any val fold (early data), use actual minutes
+        missing = np.isnan(oof_preds)
+        oof_preds[missing] = df_played.loc[missing, 'minutes'].values
+
+        # Map back to original df_train index
+        result = pd.Series(df_train['minutes'].values, index=df_train.index)
+        # df_played was sorted and reset, so map via player_id + season + gameweek
+        oof_series = pd.Series(oof_preds, index=df_played.index)
+        # Since df_played is a filtered/sorted copy, merge back by matching original indices
+        played_original_idx = df_train[df_train['minutes'] >= 1].sort_values(['season', 'gameweek']).index
+        for i, orig_idx in enumerate(played_original_idx):
+            result.loc[orig_idx] = oof_preds[i]
+
+        if verbose:
+            valid = (~np.isnan(oof_preds)).sum()
+            mae = np.nanmean(np.abs(oof_preds - df_played['minutes'].values))
+            print(f"  OOF pred_minutes: {valid:,} predictions, MAE={mae:.2f}")
+
+        return result.values
+
+    def _legacy_generate_oof_team_goals_for_tuning_unused(
+            self, df_train: pd.DataFrame, cs_params: dict,
+            verbose: bool = True) -> pd.DataFrame:
+        """Generate out-of-fold predicted team goals on training data.
+
+        Uses TimeSeriesSplit on team-level data to produce leak-free pred_team_goals,
+        then maps back to player-level rows so goals/assists models see realistic
+        predictions during tuning.
+
+        Returns df_train with pred_team_goals column added/updated.
+        """
+        from sklearn.model_selection import TimeSeriesSplit
+        import xgboost as xgb
+
+        cs_model = CleanSheetModel()
+        team_df = cs_model.prepare_team_features(df_train)
+        team_df = team_df.dropna(subset=['team_conceded_roll5', 'goals_conceded'])
+        team_df = team_df.sort_values(['season', 'gameweek']).reset_index(drop=True)
+
+        selected_features = cs_params.get('selected_features', None)
+        features = selected_features if selected_features else [f for f in cs_model.FEATURES if f in team_df.columns]
+        X = team_df[features].fillna(0).values
+        y = team_df['goals_conceded'].fillna(0).values
+
+        xgb_params = {k: v for k, v in cs_params.items() if k not in ('selected_features',)}
+        xgb_params.setdefault('objective', 'count:poisson')
+        xgb_params.setdefault('random_state', 42)
+        xgb_params.setdefault('verbosity', 0)
+
+        tscv = TimeSeriesSplit(n_splits=5)
+        oof_preds = np.full(len(y), np.nan)
+
+        for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(X)):
+            model = xgb.XGBRegressor(**xgb_params)
+            model.fit(X[train_idx], y[train_idx])
+            oof_preds[val_idx] = np.clip(model.predict(X[val_idx]), 1e-6, 10.0)
+
+        # Fill early folds with actual values
+        missing = np.isnan(oof_preds)
+        oof_preds[missing] = y[missing]
+
+        team_df['oof_goals_conceded'] = oof_preds
+
+        # Map to player-level: pred_team_goals = opponent's predicted goals conceded
+        def normalize_name(name):
+            if pd.isna(name):
+                return ''
+            return str(name).lower().replace(' ', '_').replace("'", "").strip()
+
+        opp_lookup = team_df[['team', 'season', 'gameweek', 'oof_goals_conceded']].copy()
+        opp_lookup = opp_lookup.rename(columns={
+            'team': 'opponent',
+            'oof_goals_conceded': 'pred_team_goals'
+        })
+        opp_lookup['opponent_norm'] = opp_lookup['opponent'].apply(normalize_name)
+        opp_lookup = opp_lookup.drop_duplicates(subset=['opponent_norm', 'season', 'gameweek'], keep='first')
+
+        df_train['opponent_norm'] = df_train['opponent'].apply(normalize_name)
+
+        if 'pred_team_goals' in df_train.columns:
+            df_train = df_train.drop(columns=['pred_team_goals'])
+
+        n_before = len(df_train)
+        df_train = df_train.merge(
+            opp_lookup[['opponent_norm', 'season', 'gameweek', 'pred_team_goals']],
+            on=['opponent_norm', 'season', 'gameweek'],
+            how='left'
+        )
+        if len(df_train) != n_before:
+            df_train = df_train.drop_duplicates(subset=['player_id', 'season', 'gameweek'], keep='first')
+
+        df_train['pred_team_goals'] = df_train['pred_team_goals'].fillna(1.3)
+        df_train = df_train.drop(columns=['opponent_norm'], errors='ignore')
+
+        if verbose:
+            valid = df_train['pred_team_goals'].notna().sum()
+            print(f"  OOF pred_team_goals: mapped to {valid:,}/{len(df_train):,} player rows")
+            print(f"  Mean pred_team_goals: {df_train['pred_team_goals'].mean():.3f}")
+
+        return df_train
+
+    def _tune_with_subprocess(self, models: list, n_iter: int, verbose: bool, df_train: pd.DataFrame) -> Dict:
+        """Run each model's tuning in a separate subprocess to save RAM.
+
+        Dependency-ordered: minutes and clean_sheet tune first (in-process) to
+        generate OOF predictions. Remaining models run in subprocesses with
+        OOF pred_minutes and pred_team_goals available as features.
+        """
+        import subprocess
+        import sys
+        import json
+        import tempfile
+        import os
+
+        SCORING_NAMES = {
+            'goals': 'Poisson Deviance',
+            'assists': 'Poisson Deviance',
+            'defcon': 'Poisson Deviance',
+            'minutes': 'Huber Loss',
+            'clean_sheet': 'Poisson Deviance',
+            'saves': 'MAE',
+        }
+
+        SEARCH_SPACES_CS = {
+            'n_estimators': (50, 300),
+            'max_depth': (3, 8),
+            'learning_rate': (0.01, 0.3, 'log'),
+            'min_child_weight': (1, 10),
+            'colsample_bytree': (0.4, 1.0),
+            'subsample': (0.6, 1.0),
+            'reg_alpha': (1e-3, 10.0, 'log'),
+            'reg_lambda': (1e-3, 10.0, 'log'),
+        }
+
+        tuned_params = {}
+        cv_scores = {}
+
+        # --- Stage 1: Tune minutes (in-process) + generate OOF pred_minutes ---
+        if 'minutes' in models:
+            mins_result = self._tune_minutes_in_process(
+                n_iter, verbose, df_train, {
+                    'n_estimators': (100, 400),
+                    'max_depth': (3, 7),
+                    'learning_rate': (0.01, 0.3, 'log'),
+                    'min_child_weight': (1, 15),
+                    'colsample_bytree': (0.4, 1.0),
+                    'subsample': (0.6, 1.0),
+                    'reg_alpha': (1e-3, 10.0, 'log'),
+                    'reg_lambda': (1e-3, 10.0, 'log'),
+                }
+            )
+            tuned_params['minutes'] = mins_result['params']
+            cv_scores['minutes'] = mins_result['cv_score']
+
+            if verbose:
+                print(f"\n  Generating OOF pred_minutes for downstream models...")
+            df_train['pred_minutes'] = self._generate_oof_minutes(df_train, tuned_params['minutes'], verbose)
+        else:
+            df_train['pred_minutes'] = df_train['minutes']
+
+        # --- Stage 2: Tune clean_sheet (in-process) + generate OOF pred_team_goals ---
+        if 'clean_sheet' in models:
+            cs_result = self._tune_clean_sheet_in_process(
+                n_iter, verbose, df_train, SEARCH_SPACES_CS
+            )
+            tuned_params['clean_sheet'] = cs_result['params']
+            cv_scores['clean_sheet'] = cs_result['cv_score']
+
+            if verbose:
+                print(f"\n  Generating OOF pred_team_goals for downstream models...")
+            df_train = self._generate_oof_team_goals_for_tuning(df_train, tuned_params['clean_sheet'], verbose)
+
+        # --- Stage 3: Remaining models in subprocess (with OOF features in CSV) ---
+        remaining = [m for m in models if m not in ('minutes', 'clean_sheet')]
+
+        # Save training data (now including OOF pred_minutes and pred_team_goals)
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, encoding='utf-8') as f:
+            temp_data_path = f.name
+            df_train.to_csv(f, index=False)
+
+        try:
+            for model_name in remaining:
+                score_name = SCORING_NAMES.get(model_name, 'RMSE')
+                if verbose:
+                    print(f"\nTuning {model_name.upper()} ({n_iter} trials, TimeSeriesSplit CV, {score_name}) in subprocess...")
+
+                # Create temp file for results
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                    temp_result_path = f.name
+
+                # Python script to run in subprocess
+                tune_script = f'''
+import pandas as pd
+import numpy as np
+import json
+import sys
+import optuna
+from sklearn.model_selection import cross_val_score, TimeSeriesSplit
+from sklearn.metrics import make_scorer, mean_poisson_deviance
+import xgboost as xgb
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+sys.path.insert(0, r"{self.data_dir.parent}")
+from src.models import GoalsModel, AssistsModel, MinutesModel, DefconModel, SavesModel
+from src.feature_selection import compute_feature_rankings, select_features
+
+def huber_loss(y_true, y_pred, delta=10.0):
+    residual = np.abs(y_true - y_pred)
+    quadratic = np.minimum(residual, delta)
+    linear = residual - quadratic
+    return np.mean(0.5 * quadratic**2 + delta * linear)
+
+huber_scorer = make_scorer(huber_loss, greater_is_better=False)
+
+def safe_poisson_deviance(y_true, y_pred):
+    y_pred = np.clip(y_pred, 1e-8, None)
+    y_true = np.clip(y_true, 0, None)
+    return mean_poisson_deviance(y_true, y_pred)
+
+poisson_scorer = make_scorer(safe_poisson_deviance, greater_is_better=False)
+
+SCORING = {{
+    'goals': poisson_scorer,
+    'assists': poisson_scorer,
+    'defcon': poisson_scorer,
+    'minutes': huber_scorer,
+    'saves': 'neg_mean_absolute_error',
+}}
+
+MODEL_CLASSES = {{
+    'goals': GoalsModel,
+    'assists': AssistsModel,
+    'minutes': MinutesModel,
+    'defcon': DefconModel,
+    'saves': SavesModel,
+}}
+
+SEARCH_SPACES = {{
+    'goals': {{
+        'n_estimators': (100, 400),
+        'max_depth': (3, 7),
+        'learning_rate': (0.01, 0.3),
+        'min_child_weight': (1, 10),
+        'colsample_bytree': (0.4, 1.0),
+        'subsample': (0.6, 1.0),
+        'reg_alpha': (1e-3, 10.0),
+        'reg_lambda': (1e-3, 10.0),
+    }},
+    'assists': {{
+        'n_estimators': (100, 400),
+        'max_depth': (3, 7),
+        'learning_rate': (0.01, 0.3),
+        'min_child_weight': (1, 10),
+        'colsample_bytree': (0.4, 1.0),
+        'subsample': (0.6, 1.0),
+        'reg_alpha': (1e-3, 10.0),
+        'reg_lambda': (1e-3, 10.0),
+    }},
+    'minutes': {{
+        'n_estimators': (100, 400),
+        'max_depth': (3, 7),
+        'learning_rate': (0.01, 0.3),
+        'min_child_weight': (1, 15),
+        'colsample_bytree': (0.4, 1.0),
+        'subsample': (0.6, 1.0),
+        'reg_alpha': (1e-3, 10.0),
+        'reg_lambda': (1e-3, 10.0),
+    }},
+    'defcon': {{
+        'n_estimators': (100, 400),
+        'max_depth': (3, 7),
+        'learning_rate': (0.01, 0.3),
+        'min_child_weight': (1, 10),
+        'colsample_bytree': (0.4, 1.0),
+        'subsample': (0.6, 1.0),
+        'reg_alpha': (1e-3, 10.0),
+        'reg_lambda': (1e-3, 10.0),
+    }},
+    'saves': {{
+        'n_estimators': (100, 400),
+        'max_depth': (3, 7),
+        'learning_rate': (0.01, 0.3),
+        'min_child_weight': (1, 10),
+        'colsample_bytree': (0.4, 1.0),
+        'subsample': (0.6, 1.0),
+        'reg_alpha': (1e-3, 10.0),
+        'reg_lambda': (1e-3, 10.0),
+    }},
+}}
+
+PROTECTED = {{
+    'goals': ['pred_team_goals', 'pred_minutes'],
+    'assists': ['pred_team_goals', 'pred_minutes'],
+    'defcon': ['pred_minutes'],
+    'saves': [],
+}}
+MIN_FEATURES = {{
+    'goals': 15, 'assists': 5, 'defcon': 5, 'saves': 5,
+}}
+RANKING_METHODS = ['xgb_gain', 'xgb_cover', 'lgbm', 'permutation', 'mutual_info']
+
+model_name = "{model_name}"
+n_iter = {n_iter}
+score_name = "{score_name}"
+
+df_train = pd.read_csv(r"{temp_data_path}", encoding='utf-8')
+# pred_minutes and pred_team_goals are already in the CSV (OOF values from upstream models)
+model_class = MODEL_CLASSES[model_name]
+space = SEARCH_SPACES[model_name]
+scorer = SCORING[model_name]
+
+model_instance = model_class()
+all_features = [f for f in model_instance.FEATURES if f in df_train.columns]
+target = model_instance.TARGET
+n_total_features = len(all_features)
+protected = [f for f in PROTECTED.get(model_name, []) if f in all_features]
+min_feats = MIN_FEATURES.get(model_name, 5)
+
+# Filter to GKs only for saves model
+if model_name == 'saves':
+    df_train = df_train[df_train['is_gk'] == 1].copy()
+elif model_name == 'defcon':
+    df_train = df_train[
+        df_train['defcon_position'].isin(['DEF', 'MID'])
+        & df_train['defcon'].notna()
+    ].copy()
+
+X_full = df_train[all_features].fillna(0).values
+y = df_train[target].fillna(0).values
+
+tscv = TimeSeriesSplit(n_splits=5)
+
+# Pre-compute feature rankings
+xgb_hint = {{'objective': 'count:poisson'}} if model_name in ('goals', 'assists', 'defcon') else {{}}
+print(f"Pre-computing feature rankings ({{n_total_features}} features, {{len(RANKING_METHODS)}} methods)...")
+rankings = compute_feature_rankings(X_full, y, all_features, task='regression', xgb_params=xgb_hint)
+print(f"Rankings computed. Starting Optuna search...")
+
+def objective(trial):
+    params = {{
+        'n_estimators': trial.suggest_int('n_estimators', space['n_estimators'][0], space['n_estimators'][1]),
+        'max_depth': trial.suggest_int('max_depth', space['max_depth'][0], space['max_depth'][1]),
+        'learning_rate': trial.suggest_float('learning_rate', space['learning_rate'][0], space['learning_rate'][1], log=True),
+        'min_child_weight': trial.suggest_int('min_child_weight', space['min_child_weight'][0], space['min_child_weight'][1]),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', space['colsample_bytree'][0], space['colsample_bytree'][1]),
+        'subsample': trial.suggest_float('subsample', space['subsample'][0], space['subsample'][1]),
+        'reg_alpha': trial.suggest_float('reg_alpha', space['reg_alpha'][0], space['reg_alpha'][1], log=True),
+        'reg_lambda': trial.suggest_float('reg_lambda', space['reg_lambda'][0], space['reg_lambda'][1], log=True),
+        'random_state': 42,
+        'verbosity': 0,
+        'n_jobs': -1,
+    }}
+
+    if model_name in ('goals', 'assists', 'defcon'):
+        params['objective'] = 'count:poisson'
+
+    # Feature selection as hyperparameters
+    feat_method = trial.suggest_categorical('feat_method', RANKING_METHODS)
+    n_selectable = n_total_features - len(protected)
+    n_features = trial.suggest_int('n_features', min_feats, n_selectable)
+
+    selected = select_features(rankings, feat_method, n_features, protected)
+    feat_idx = [all_features.index(f) for f in selected]
+    X_sel = X_full[:, feat_idx]
+
+    model = xgb.XGBRegressor(**params)
+    scores = cross_val_score(model, X_sel, y, cv=tscv, scoring=scorer, n_jobs=1)
+    return -scores.mean()
+
+study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=42))
+study.optimize(objective, n_trials=n_iter, show_progress_bar=False)
+
+best_params = study.best_params.copy()
+best_feat_method = best_params.pop('feat_method')
+best_n_features = best_params.pop('n_features')
+selected_features = select_features(rankings, best_feat_method, best_n_features, protected)
+
+if model_name in ('goals', 'assists', 'defcon'):
+    best_params['objective'] = 'count:poisson'
+
+print(f"Best CV {{score_name}}: {{study.best_value:.4f}}")
+print(f"Feature method: {{best_feat_method}}, selected {{len(selected_features)}}/{{n_total_features}} features")
+
+result = {{
+    'best_params': best_params,
+    'best_score': study.best_value,
+    'selected_features': selected_features,
+}}
+
+with open(r"{temp_result_path}", 'w') as f:
+    json.dump(result, f)
+'''
+
+                # Run in subprocess
+                result = subprocess.run(
+                    [sys.executable, '-c', tune_script],
+                    capture_output=True,
+                    text=True
+                )
+
+                if result.returncode != 0:
+                    if verbose:
+                        print(f"  ERROR: {result.stderr}")
+                    continue
+
+                # Print subprocess output
+                if verbose and result.stdout:
+                    for line in result.stdout.strip().split('\n'):
+                        print(f"  {line}")
+
+                # Read results
+                try:
+                    with open(temp_result_path, 'r') as f:
+                        tune_result = json.load(f)
+                    tuned_params[model_name] = {
+                        **tune_result['best_params'],
+                        'selected_features': tune_result.get('selected_features', []),
+                    }
+                    cv_scores[model_name] = tune_result.get('best_score')
+                except Exception as e:
+                    if verbose:
+                        print(f"  Failed to read results: {e}")
+                finally:
+                    try:
+                        os.unlink(temp_result_path)
+                    except:
+                        pass
+        finally:
+            try:
+                os.unlink(temp_data_path)
+            except:
+                pass
+
+        return tuned_params, cv_scores
 
     def _evaluate_on_test_set(self, models, df_train, df_test, verbose=True):
         """Holdout uses production wrappers and causal upstream features.
@@ -638,7 +1527,7 @@ class FPLPipeline:
                 target_rows = test[test['is_gk'] == 1]
             elif name == 'defcon':
                 target_rows = test[
-                    test['fpl_position'].isin(['DEF', 'MID']) & test['defcon'].notna()
+                    test['defcon_position'].isin(['DEF', 'MID']) & test['defcon'].notna()
                 ]
             else:
                 target_rows = test
@@ -704,7 +1593,10 @@ class FPLPipeline:
         df = df_test.copy()
         df['pos_label'] = df.get(
             'fpl_position', pd.Series(pd.NA, index=df.index, dtype='string')
-        ).astype('string').str.upper()
+        ).astype('string').str.upper().fillna('')
+        df['defcon_pos_label'] = df.get(
+            'defcon_position', pd.Series(pd.NA, index=df.index, dtype='string')
+        ).astype('string').str.upper().fillna('')
 
         # Helper to safely get numeric value (handles NaN and missing columns)
         def _safe(row, col, default=0):
@@ -723,6 +1615,7 @@ class FPLPipeline:
         # --- Actual FPL points from real stats ---
         def actual_fpl_points(row):
             pos = row['pos_label']
+            defcon_pos = row['defcon_pos_label']
             mins = _safe(row, 'minutes')
 
             # Appearance
@@ -753,7 +1646,7 @@ class FPLPipeline:
                 pts += (int(_safe(row, 'saves')) // 3) * FPL_POINTS['saves_per_3']
 
             # Defcon (DEF/MID, 60+ mins) — actual threshold hit
-            if pos in ('DEF', 'MID') and mins >= 60:
+            if defcon_pos in ('DEF', 'MID') and mins >= 60:
                 pts += _safe(row, 'hit_threshold') * FPL_POINTS['defcon']
 
             # Bonus (actual from data — may not exist)
@@ -788,6 +1681,7 @@ class FPLPipeline:
 
         def pred_fpl_points(row):
             pos = row['pos_label']
+            defcon_pos = row['defcon_pos_label']
             mins = row['_pred_minutes']
 
             if mins >= 60:
@@ -825,9 +1719,9 @@ class FPLPipeline:
                 pts += (exp_saves / 3) * FPL_POINTS['saves_per_3']
 
             # Defcon (DEF/MID, 60+ mins)
-            if pos in ('DEF', 'MID') and mins >= 60:
+            if defcon_pos in ('DEF', 'MID') and mins >= 60:
                 exp_defcon = max(row['_pred_defcon'], 0.01)
-                threshold = 10 if pos == 'DEF' else 12
+                threshold = 10 if defcon_pos == 'DEF' else 12
                 if _defcon_r is not None:
                     p = _defcon_r / (_defcon_r + exp_defcon)
                     defcon_prob = 1 - _nbinom.cdf(threshold - 1, _defcon_r, p)
@@ -939,7 +1833,10 @@ class FPLPipeline:
         df = self._last_fpl_detail.copy()
         df['pos_label'] = df.get(
             'fpl_position', pd.Series(pd.NA, index=df.index, dtype='string')
-        ).astype('string').str.upper()
+        ).astype('string').str.upper().fillna('')
+        df['defcon_pos_label'] = df.get(
+            'defcon_position', pd.Series(pd.NA, index=df.index, dtype='string')
+        ).astype('string').str.upper().fillna('')
 
         def _safe(col, default=0):
             if col in df.columns:
@@ -1050,12 +1947,12 @@ class FPLPipeline:
         })
 
         # --- Defcon (DEF/MID, 60+ mins) ---
-        def_mid_60 = df['pos_label'].isin(['DEF', 'MID']) & (df['_pred_minutes'] >= 60)
+        def_mid_60 = df['defcon_pos_label'].isin(['DEF', 'MID']) & (df['_pred_minutes'] >= 60)
         pred_defcon_pts = pd.Series(0.0, index=df.index)
         actual_defcon_pts = pd.Series(0.0, index=df.index)
         if def_mid_60.any():
             exp_defcon = df['_pred_defcon']
-            threshold = df['pos_label'].map({'DEF': 10, 'MID': 12}).fillna(12)
+            threshold = df['defcon_pos_label'].map({'DEF': 10, 'MID': 12}).fillna(12)
             for idx in df.index[def_mid_60]:
                 mu = max(exp_defcon[idx], 0.01)
                 thr = threshold[idx]
@@ -1231,11 +2128,12 @@ class FPLPipeline:
         ).astype('string').str.upper()
         test_df['fpl_position'] = live_position.where(
             live_position.isin(['GK', 'DEF', 'MID', 'FWD']), cached_position)
+        test_df = resolve_defcon_positions(test_df)
         if verbose:
             unresolved = ~test_df['fpl_position'].isin(['GK', 'DEF', 'MID', 'FWD'])
             if unresolved.any():
                 print(f"  WARNING: {int(unresolved.sum())} players have no FPL API position; "
-                      "they receive no DefCon projection")
+                      "DefCon uses their FotMob position fallback")
 
         test_df = self._predict_player_components(test_df, self.models)
 

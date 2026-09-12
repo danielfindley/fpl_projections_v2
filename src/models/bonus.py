@@ -668,12 +668,17 @@ class BonusModel:
 def score_simulations(frame, simulations, rules):
     """Score the existing event draws once, using the pipeline's configured rules."""
     minutes = simulations['minutes']
-    positions = frame['fpl_position'].to_numpy()
+    positions = frame.get(
+        'fpl_position', pd.Series('', index=frame.index, dtype='string')
+    ).astype('string').str.upper().fillna('').to_numpy(dtype=object)
+    defcon_positions = frame.get(
+        'defcon_position', pd.Series('', index=frame.index, dtype='string')
+    ).astype('string').str.upper().fillna('').to_numpy(dtype=object)
     sixty = minutes >= 60
     goal_values = np.array([rules['goal'].get(p, 5) for p in positions])
     cs_values = np.array([rules['clean_sheet'].get(p, 0) for p in positions])
     gc_values = np.array([rules['goals_conceded_2'].get(p, 0) for p in positions])
-    thresholds = np.where(positions == 'DEF', 10, 12)
+    thresholds = np.where(defcon_positions == 'DEF', 10, 12)
     components = {
         'exp_appearance_pts': np.where(sixty, rules['appearance_60'],
                                       np.where(minutes > 0, rules['appearance_1'], 0)),
@@ -683,7 +688,7 @@ def score_simulations(frame, simulations, rules):
         'exp_conceded_penalty': (simulations['goals_against'] // 2) * gc_values * sixty,
         'exp_saves_pts': (simulations['saves'] // 3) * (positions == 'GK') * rules['saves_per_3'],
         'exp_defcon_pts': ((simulations['defcon'] >= thresholds) * sixty *
-                           np.isin(positions, ['DEF', 'MID']) * rules['defcon']),
+                           np.isin(defcon_positions, ['DEF', 'MID']) * rules['defcon']),
         'exp_bonus_pts': simulations['bonus'],
         'exp_yellow_pts': simulations['yellows'] * rules['yellow_card'],
         'exp_red_pts': simulations['reds'] * rules['red_card'],
