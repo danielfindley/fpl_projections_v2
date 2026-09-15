@@ -999,15 +999,6 @@ function render() {
       .attr('fill', color).attr('font-size', '10px')
       .text(sub);
 
-    // Stats
-    const stats = `E[pts]=${player.exp_pts}  med=${player.median}  `
-      + `P10-P90=[${player.p10}\u2013${player.p90}]  P(10+)=${player.p_10plus}%`;
-    g.append('text')
-      .attr('x', MARGIN.left + 12)
-      .attr('y', baseY - ROW_HEIGHT + 40)
-      .attr('fill', '#484f58').attr('font-size', '10px')
-      .text(stats);
-
     // Hover rect (covers the row band only)
     g.append('rect')
       .attr('x', MARGIN.left).attr('y', baseY - ROW_HEIGHT)

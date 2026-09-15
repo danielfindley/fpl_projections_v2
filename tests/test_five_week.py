@@ -206,6 +206,8 @@ def test_chart_consumes_saved_totals_and_dgw_sum_without_resampling(tmp_path):
     assert '__N_SIMS__' not in html
     assert 'including non-appearances' in html
     assert 'P10-P90 range' in html
+    assert 'const stats = `E[pts]=' not in html
+    assert '.text(stats)' not in html
     assert '90% CI' not in html
     assert 'Optimal Squad' not in html
     assert '__SQUAD__' not in html
