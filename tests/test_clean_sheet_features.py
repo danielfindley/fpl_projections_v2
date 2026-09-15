@@ -324,6 +324,10 @@ def test_deadline_features_do_not_see_first_dgw_result_or_postponed_result(tmp_p
 
     changed = frame.copy()
     changed.loc[changed['gameweek'].ge(3), ['goals', 'xg', 'minutes']] = [8, 7., 1]
+    changed.loc[changed['gameweek'].ge(3), [
+        'accurate_passes', 'passes_attempted', 'saves_inside_box',
+        'penalty_goals',
+    ]] = [999, 1000, 20, 4]
     changed.attrs['data_dir'] = str(tmp_path)
     changed_features = compute_rolling_features(changed, verbose=False)
     columns = [c for c in features if '_roll' in c or c.startswith('lifetime_')]

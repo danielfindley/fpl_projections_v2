@@ -223,7 +223,38 @@ PER90_CAPS = {
     'xa_per90': 1.5,
     'shots_per90': 8.0,
     'key_passes_per90': 6.0,
+    'accurate_passes_per90': 150.0,
+    'passes_attempted_per90': 180.0,
+    'big_chances_created_per90': 5.0,
+    'accurate_crosses_per90': 10.0,
+    'successful_dribbles_per90': 12.0,
+    'clearance_off_the_line_per90': 2.0,
+    'was_fouled_per90': 10.0,
+    'shots_on_target_per90': 8.0,
+    'big_chances_missed_per90': 6.0,
+    'error_led_to_goal_per90': 2.0,
+    'offsides_per90': 6.0,
+    'shots_off_target_per90': 8.0,
+    'conceded_penalty_per90': 2.0,
+    'missed_penalty_per90': 2.0,
+    'saved_penalties_per90': 2.0,
+    'own_goal_per90': 2.0,
+    'saves_inside_box_per90': 12.0,
+    'penalty_goals_per90': 3.0,
 }
+
+BPS_COMPONENT_WINDOWS = {
+    'accurate_passes': (5,), 'passes_attempted': (5,),
+    'big_chances_created': (5,), 'accurate_crosses': (5,),
+    'successful_dribbles': (5,), 'clearance_off_the_line': (10,),
+    'was_fouled': (5,), 'shots_on_target': (5,),
+    'big_chances_missed': (5,), 'error_led_to_goal': (10,),
+    'offsides': (5,), 'shots_off_target': (5,),
+    'conceded_penalty': (10,), 'missed_penalty': (10,),
+    'saved_penalties': (10,), 'own_goal': (10,),
+    'saves_inside_box': (5,), 'penalty_goals': (10,),
+}
+BPS_COMPONENT_STATS = tuple(BPS_COMPONENT_WINDOWS)
 
 # Minimum minutes to compute meaningful per90 stats
 MIN_MINUTES_FOR_PER90 = 20
@@ -672,6 +703,68 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
 
     for window in ROLLING_WINDOWS:
         df[f'goal_involvements_roll{window}'] = df[f'goals_roll{window}'] + df[f'assists_roll{window}']
+
+    # =========================================================================
+    # BONUS POINT SYSTEM COMPONENTS
+    # =========================================================================
+    # These are match-event stats used by the official BPS. Every feature is a
+    # deadline-aware prior exposure rate; the current match never leaks into its
+    # own forecast row. The target can still use the unshifted event counts.
+    missing_bps_stats = {
+        col: np.zeros(len(df), dtype=float)
+        for col in BPS_COMPONENT_STATS if col not in df.columns
+    }
+    if missing_bps_stats:
+        df = pd.concat(
+            [df, pd.DataFrame(missing_bps_stats, index=df.index)], axis=1)
+
+    bps_features = {}
+    for col in BPS_COMPONENT_STATS:
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        per90_col = f'{col}_per90'
+        bps_features[per90_col] = pd.Series(
+            np.where(sufficient_minutes, df[col] / mins_90, np.nan),
+            index=df.index,
+        ).clip(upper=PER90_CAPS[per90_col])
+        for window in BPS_COMPONENT_WINDOWS[col]:
+            bps_features[f'{col}_per90_roll{window}'] = prior_exposure_rate(
+                df, 'player_id', col, window, PER90_CAPS[per90_col])
+
+    # Pass-completion BPS uses both volume and percentage. Pool prior completed
+    # and attempted passes so short appearances do not dominate the percentage.
+    for window in (5,):
+        completed = prior_stat(
+            df, 'player_id', 'accurate_passes', window, 'sum', 1).fillna(0)
+        attempted = prior_stat(
+            df, 'player_id', 'passes_attempted', window, 'sum', 1).fillna(0)
+        bps_features[f'pass_completion_roll{window}'] = np.divide(
+            completed, attempted,
+            out=np.zeros(len(df), dtype=float), where=attempted.to_numpy() > 0,
+        ).clip(0, 1)
+
+    # A direct penalty goal is worth 12 BPS for every position. Estimate which
+    # simulated goals are penalties from the player's shifted scoring history.
+    penalty_rate = bps_features['penalty_goals_per90_roll10'].fillna(0).to_numpy()
+    goal_rate = df['goals_per90_roll10'].fillna(0).to_numpy()
+    bps_features['penalty_goal_share_roll10'] = np.divide(
+        penalty_rate, goal_rate,
+        out=np.zeros(len(df), dtype=float), where=goal_rate > 0,
+    ).clip(0, 1)
+
+    inside_rate = bps_features['saves_inside_box_per90_roll5'].fillna(0).to_numpy()
+    if 'saves' not in df.columns:
+        df['saves'] = 0.0
+    else:
+        df['saves'] = pd.to_numeric(df['saves'], errors='coerce').fillna(0)
+    save_rate = prior_exposure_rate(
+        df, 'player_id', 'saves', 5, 12.0).fillna(0).to_numpy()
+    bps_features['inside_box_save_share_roll5'] = np.divide(
+        inside_rate, save_rate,
+        out=np.zeros(len(df), dtype=float), where=save_rate > 0,
+    ).clip(0, 1)
+    # Add all BPS columns at once and consolidate the frame. This avoids a
+    # fragmented DataFrame slowing every downstream weekly feature operation.
+    df = pd.concat([df, pd.DataFrame(bps_features, index=df.index)], axis=1).copy()
 
     # =========================================================================
     # FOULS COMMITTED (for card prediction)

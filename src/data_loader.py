@@ -12,6 +12,7 @@ import time
 COLUMN_MAP = {
     'name': 'player_name',
     'minutes_played': 'minutes',
+    'accurate_passes_attempted': 'passes_attempted',
     'expected_goals_(xg)': 'xg',
     'expected_assists_(xa)': 'xa',
     'xg_non-penalty': 'npxg',
@@ -76,6 +77,38 @@ def load_player_stats(data_dir: Path, verbose: bool = True) -> pd.DataFrame:
     
     # Drop temp columns
     df = df.drop(columns=['_player_norm', '_team_norm'])
+
+    # Penalty goals have a flat 12-BPS value in 2026/27, unlike normal goals
+    # whose value depends on position. FotMob exposes the distinction in the
+    # shot map rather than the player-stat payload, so attach the count here.
+    shotmap_file = data_dir / 'matches' / 'shotmap.csv'
+    df['penalty_goals'] = 0
+    if shotmap_file.exists() and {'match_id', 'player_id'} <= set(df.columns):
+        try:
+            shots = pd.read_csv(
+                shotmap_file,
+                usecols=['match_id', 'player_id', 'event_type', 'situation'],
+                on_bad_lines='skip',
+            )
+            penalty_goals = shots[
+                shots['event_type'].astype(str).str.casefold().eq('goal')
+                & shots['situation'].astype(str).str.casefold().eq('penalty')
+            ].copy()
+            if not penalty_goals.empty:
+                penalty_goals['match_id'] = pd.to_numeric(
+                    penalty_goals['match_id'], errors='coerce')
+                penalty_goals['player_id'] = pd.to_numeric(
+                    penalty_goals['player_id'], errors='coerce')
+                counts = penalty_goals.groupby(
+                    ['match_id', 'player_id']).size()
+                keys = pd.MultiIndex.from_arrays([
+                    pd.to_numeric(df['match_id'], errors='coerce'),
+                    pd.to_numeric(df['player_id'], errors='coerce'),
+                ])
+                df['penalty_goals'] = counts.reindex(keys, fill_value=0).to_numpy()
+        except (OSError, ValueError, KeyError):
+            # Old/minimal datasets may not carry the full shot-map schema.
+            pass
     
     n_dupes = n_before - len(df)
     
@@ -354,8 +387,8 @@ def fetch_fpl_actual_points(gameweeks: list = None, cache_dir: str = None,
 
     Returns:
         DataFrame with columns: fpl_id, player_name, web_name, team, gameweek,
-        actual_total_points, minutes, goals_scored, assists, bonus, clean_sheets,
-        yellow_cards, red_cards, saves, goals_conceded
+        actual_total_points, minutes, goals_scored, assists, bonus, bps,
+        clean_sheets, yellow_cards, red_cards, saves, goals_conceded
     """
     import requests
 
@@ -413,9 +446,14 @@ def fetch_fpl_actual_points(gameweeks: list = None, cache_dir: str = None,
     # Check cache for already-fetched GWs (cache is per-season; GW numbers repeat)
     cached_gws = set()
     if cached_df is not None:
-        cached_gws = set(cached_df.loc[cached_df['season'] == api_season, 'gameweek'].unique())
+        current_cache = cached_df[cached_df['season'] == api_season]
+        # A pre-migration cache has no BPS. Re-fetch those current-season GWs
+        # rather than silently treating the incomplete rows as authoritative.
+        if 'bps' in current_cache.columns:
+            cached_gws = set(
+                current_cache.loc[current_cache['bps'].notna(), 'gameweek'].unique())
         if verbose:
-            print(f"  Cache has {len(cached_gws)} GWs already for {api_season}")
+            print(f"  Cache has {len(cached_gws)} complete BPS GWs already for {api_season}")
 
     gws_to_fetch = [gw for gw in gameweeks if gw not in cached_gws]
 
@@ -442,6 +480,7 @@ def fetch_fpl_actual_points(gameweeks: list = None, cache_dir: str = None,
                     'goals_scored': stats.get('goals_scored', 0),
                     'assists': stats.get('assists', 0),
                     'bonus': stats.get('bonus', 0),
+                    'bps': stats.get('bps'),
                     'clean_sheets': stats.get('clean_sheets', 0),
                     'yellow_cards': stats.get('yellow_cards', 0),
                     'red_cards': stats.get('red_cards', 0),
@@ -463,6 +502,12 @@ def fetch_fpl_actual_points(gameweeks: list = None, cache_dir: str = None,
     else:
         result = new_df
 
+    # Re-fetched rows replace incomplete cache entries instead of duplicating
+    # a player-gameweek in the cache.
+    dedupe_keys = [c for c in ('season', 'gameweek', 'fpl_id') if c in result.columns]
+    if len(dedupe_keys) == 3:
+        result = result.drop_duplicates(dedupe_keys, keep='last')
+
     # Save cache
     if cache_path and len(result) > 0:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -482,7 +527,9 @@ _FPL_TEAM_NORMALIZE = {
     'aston villa': 'aston villa',
     'bournemouth': 'afc bournemouth',
     'brentford': 'brentford',
-    'brighton': 'brighton & hove albion',
+    'brighton': 'brighton',
+    'brighton & hove albion': 'brighton',
+    'brighton and hove albion': 'brighton',
     'chelsea': 'chelsea',
     'crystal palace': 'crystal palace',
     'everton': 'everton',
@@ -524,18 +571,8 @@ def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
     Returns:
         DataFrame with yellow_cards and red_cards columns added where matched.
     """
-    import unicodedata
-
-    def _strip_accents(s):
-        return ''.join(
-            c for c in unicodedata.normalize('NFD', str(s))
-            if unicodedata.category(c) != 'Mn'
-        )
-
     def _norm_name(name):
-        if pd.isna(name):
-            return ''
-        return _strip_accents(str(name)).lower().strip()
+        return normalize_player_name(name)
 
     def _norm_team(name):
         if pd.isna(name):
@@ -574,17 +611,26 @@ def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
 
     # Build FPL lookup: (name_norm, team_norm, gameweek) -> dict of FPL stats
     fpl_lookup = {}
+    team_gw_candidates = {}
     position_sets = {}
     for _, row in fpl_df.iterrows():
         entry = {
+            'fpl_id': row.get('fpl_id'),
             'yellow_cards': row.get('yellow_cards', 0),
             'red_cards': row.get('red_cards', 0),
             'bonus': row.get('bonus', 0),
+            'bps': row.get('bps', np.nan),
             'actual_total_points': row.get('actual_total_points', 0),
             'fpl_position': row.get('fpl_position', pd.NA),
         }
         key = (row['_name_norm'], row['_team_norm'], row['season'], row['gameweek'])
         fpl_lookup[key] = entry
+        candidate_key = (row['_team_norm'], row['season'], row['gameweek'])
+        candidate_names = {
+            name for name in (row['_name_norm'], row.get('_web_norm', '')) if name
+        }
+        team_gw_candidates.setdefault(candidate_key, []).append(
+            (row.get('fpl_id'), candidate_names, entry))
         if row['_name_norm']:
             position_sets.setdefault(
                 (row['_name_norm'], row['season']), set()
@@ -603,6 +649,32 @@ def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
         if len(positions) == 1
     }
 
+    def _match_team_candidate(name, team, season, gameweek):
+        """Resolve FPL middle/compound-name differences within one club/GW."""
+        player_tokens = set(name.split())
+        if not player_tokens:
+            return None
+        candidates = team_gw_candidates.get((team, season, gameweek), [])
+
+        def unique_hit(predicate):
+            hits = {}
+            for fpl_id, names, entry in candidates:
+                if any(predicate(set(candidate.split())) for candidate in names):
+                    hits[fpl_id] = entry
+            return next(iter(hits.values())) if len(hits) == 1 else None
+
+        if len(player_tokens) >= 2:
+            result = unique_hit(
+                lambda candidate: len(candidate) >= 2 and (
+                    player_tokens <= candidate or candidate <= player_tokens))
+            if result is not None:
+                return result
+
+        # FPL often carries extra surnames or an initialised web name. A unique
+        # surname within the already-scoped club is conservative enough.
+        surname = name.split()[-1]
+        return unique_hit(lambda candidate: surname in candidate)
+
     # Detect DGW: count FotMob rows per player per gameweek.
     # FPL reports cards per gameweek, not per match, so in a DGW we can't
     # attribute which match the yellow came from. Exclude DGW rows from
@@ -614,6 +686,7 @@ def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
     yellows = np.full(len(df), np.nan)
     reds = np.full(len(df), np.nan)
     bonus = np.full(len(df), np.nan)
+    bps = np.full(len(df), np.nan)
     fpl_total_pts = np.full(len(df), np.nan)
     fpl_positions = np.full(len(df), None, dtype=object)
     matched = 0
@@ -633,6 +706,9 @@ def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
             if len(parts) > 1:
                 last_key = (parts[-1], row['_team_norm'], row['season'], gw)
                 result = fpl_lookup.get(last_key)
+        if result is None:
+            result = _match_team_candidate(
+                row['_name_norm'], row['_team_norm'], row['season'], gw)
         if result is not None:
             fpl_positions[i] = result['fpl_position']
         else:
@@ -650,12 +726,14 @@ def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
             yellows[i] = result['yellow_cards']
             reds[i] = result['red_cards']
             bonus[i] = result['bonus']
+            bps[i] = result['bps']
             fpl_total_pts[i] = result['actual_total_points']
             matched += 1
 
     df['yellow_cards'] = yellows
     df['red_cards'] = reds
     df['bonus'] = bonus
+    df['bps'] = bps
     df['fpl_total_points'] = fpl_total_pts
     df['fpl_position'] = pd.Series(fpl_positions, index=df.index, dtype='string')
 

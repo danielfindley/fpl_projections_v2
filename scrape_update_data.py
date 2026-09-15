@@ -65,6 +65,62 @@ def save_raw_match(match_id, payload):
         json.dump(payload, f, separators=(",", ":"))
 
 
+def backfill_fraction_totals(df):
+    """Recover fraction denominators omitted by older scraper versions.
+
+    The raw match archive is authoritative and already exists locally. This is
+    intentionally limited to fields consumed by the prediction pipeline so a
+    normal incremental scrape cheaply repairs the historical CSV once.
+    """
+    if df.empty or not RAW_DIR.exists() or not {'match_id', 'player_id'} <= set(df):
+        return df
+
+    total_columns = {'Accurate passes': 'accurate_passes_attempted'}
+    df = df.copy()
+    for column in total_columns.values():
+        if column not in df:
+            df[column] = pd.NA
+
+    needs_total = df[list(total_columns.values())].isna().any(axis=1)
+    needed_matches = set(pd.to_numeric(
+        df.loc[needs_total, 'match_id'], errors='coerce').dropna().astype(int))
+    recovered = {column: {} for column in total_columns.values()}
+
+    for match_id in needed_matches:
+        path = RAW_DIR / f'{match_id}.json.gz'
+        if not path.exists():
+            continue
+        try:
+            with gzip.open(path, 'rt', encoding='utf-8') as handle:
+                players = json.load(handle).get('content', {}).get('playerStats', {})
+        except (OSError, json.JSONDecodeError):
+            continue
+        for player_key, player in players.items():
+            try:
+                player_id = int(player.get('id', player_key))
+            except (TypeError, ValueError):
+                continue
+            for category in player.get('stats', []):
+                stats = category.get('stats', {})
+                if not isinstance(stats, dict):
+                    continue
+                for stat_name, column in total_columns.items():
+                    stat = stats.get(stat_name, {}).get('stat', {})
+                    if stat.get('total') is not None:
+                        recovered[column][(match_id, player_id)] = stat['total']
+
+    keys = pd.MultiIndex.from_arrays([
+        pd.to_numeric(df['match_id'], errors='coerce'),
+        pd.to_numeric(df['player_id'], errors='coerce'),
+    ])
+    for column, values in recovered.items():
+        if values:
+            restored = pd.Series(values).reindex(keys).to_numpy()
+            df[column] = pd.to_numeric(df[column], errors='coerce').fillna(
+                pd.Series(restored, index=df.index))
+    return df
+
+
 def extract_manager_data(match_id, payload):
     """Extract manager and formation fields used by manager embeddings."""
     lineup = payload.get('content', {}).get('lineup', {})
@@ -314,6 +370,12 @@ def extract_match_data(match_id, browser=None):
                     value = stat_obj.get('value')
                     col_name = stat_name.replace(' ', '_').lower()
                     player_row[col_name] = value
+                    # FotMob fraction stats expose the denominator separately
+                    # (for example accurate passes: value=34, total=36). Keep
+                    # it so the BPS model can reproduce pass-completion bands.
+                    total = stat_obj.get('total')
+                    if total is not None:
+                        player_row[f'{col_name}_attempted'] = total
 
         players_data.append(player_row)
 
@@ -654,6 +716,7 @@ def update_data(gameweeks=None, season=None, auto=False, force=False, verbose=Tr
         df_players = df_players.drop_duplicates(subset=['match_id', 'player_id'], keep='last')
     else:
         df_players = df_players_new
+    df_players = backfill_fraction_totals(df_players)
     df_players.to_csv(PLAYER_STATS_FILE, index=False)
     print(f"Saved: {PLAYER_STATS_FILE} ({len(df_players)} total records)")
 

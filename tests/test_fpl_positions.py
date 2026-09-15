@@ -83,7 +83,7 @@ class FPLPositionMatchingTests(unittest.TestCase):
             'player_name': 'Anan Khalaili', 'web_name': 'Khalaili',
             'team': 'Crystal Palace', 'season': '2026/2027', 'gameweek': 1,
             'fpl_position': 'DEF', 'yellow_cards': 0, 'red_cards': 0,
-            'bonus': 0, 'actual_total_points': 1,
+            'bonus': 0, 'bps': 17, 'actual_total_points': 1,
         }])
         raw = pd.DataFrame({
             'player_name': ['Anan Khalaili', 'Anan Khalaili'],
@@ -93,6 +93,28 @@ class FPLPositionMatchingTests(unittest.TestCase):
         })
         merged = merge_fpl_card_data(raw, verbose=False)
         self.assertEqual(merged['fpl_position'].tolist(), ['DEF', 'DEF'])
+        self.assertEqual(merged.loc[0, 'bps'], 17)
+        self.assertTrue(pd.isna(merged.loc[1, 'bps']))
+
+    @patch("src.data_loader.fetch_fpl_actual_points")
+    def test_stats_match_team_alias_and_extra_fpl_name_tokens(self, fetch):
+        fetch.return_value = pd.DataFrame([{
+            'fpl_id': 124, 'player_name': 'Pascal Gross Example',
+            'web_name': 'Gross', 'team': 'Brighton',
+            'season': '2026/2027', 'gameweek': 4,
+            'fpl_position': 'MID', 'yellow_cards': 0, 'red_cards': 0,
+            'bonus': 3, 'bps': 56, 'actual_total_points': 10,
+        }])
+        raw = pd.DataFrame([{
+            'player_name': 'Pascal Gross',
+            'team': 'Brighton and Hove Albion',
+            'season': '2026/2027', 'gameweek': 4,
+        }])
+
+        merged = merge_fpl_card_data(raw, verbose=False)
+
+        self.assertEqual(merged.loc[0, 'bonus'], 3)
+        self.assertEqual(merged.loc[0, 'bps'], 56)
 
 
 if __name__ == "__main__":

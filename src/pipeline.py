@@ -1807,7 +1807,45 @@ with open(r"{temp_result_path}", 'w') as f:
             bonus_mask = mask & df['_pred_bonus'].notna()
             bonus_played = df.loc[bonus_mask]
             if len(bonus_played) > 0:
-                result['bonus_mae'] = mean_absolute_error(bonus_played['actual_bonus'], bonus_played['_pred_bonus'])
+                result['bonus_mae'] = mean_absolute_error(
+                    bonus_played['actual_bonus'], bonus_played['_pred_bonus'])
+                # Report the sparse zero baseline, but do not treat it as the
+                # sole expected-value benchmark: MAE naturally favors the
+                # conditional median (usually zero) for a rank-awarded target.
+                result['bonus_zero_mae'] = mean_absolute_error(
+                    bonus_played['actual_bonus'], np.zeros(len(bonus_played)))
+                result['bonus_mae_skill_vs_zero'] = (
+                    result['bonus_zero_mae'] - result['bonus_mae'])
+                if 'match_id' in bonus_played:
+                    group = bonus_played.groupby('match_id')
+                    uniform_bonus = (
+                        group['actual_bonus'].transform('sum') /
+                        group['actual_bonus'].transform('size'))
+                    actual_fixture = group['actual_bonus'].sum()
+                    predicted_fixture = group['_pred_bonus'].sum()
+                    result['bonus_fixture_total_mae'] = mean_absolute_error(
+                        actual_fixture, predicted_fixture)
+                else:
+                    uniform_bonus = np.full(
+                        len(bonus_played), bonus_played['actual_bonus'].mean())
+                result['bonus_uniform_mae'] = mean_absolute_error(
+                    bonus_played['actual_bonus'], uniform_bonus)
+                result['bonus_mae_skill_vs_uniform'] = (
+                    result['bonus_uniform_mae'] - result['bonus_mae'])
+                actual_bonus = bonus_played['actual_bonus'].to_numpy(dtype=float)
+                predicted_bonus = bonus_played['_pred_bonus'].to_numpy(dtype=float)
+                result['bonus_rmse'] = float(np.sqrt(np.mean(
+                    (actual_bonus - predicted_bonus) ** 2)))
+                result['bonus_zero_rmse'] = float(np.sqrt(np.mean(actual_bonus ** 2)))
+                if (len(bonus_played) > 1 and np.ptp(actual_bonus) > 0 and
+                        np.ptp(predicted_bonus) > 0):
+                    bonus_corr, _ = spearmanr(actual_bonus, predicted_bonus)
+                    result['bonus_spearman'] = (
+                        float(bonus_corr) if not np.isnan(bonus_corr) else None)
+                else:
+                    result['bonus_spearman'] = None
+                result['actual_bonus_mean'] = float(actual_bonus.mean())
+                result['predicted_bonus_mean'] = float(predicted_bonus.mean())
 
         # Store detailed DataFrame for breakdown analysis
         self._last_fpl_detail = played.copy()

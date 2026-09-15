@@ -283,3 +283,38 @@ def test_bonus_baseline_removes_shared_penalties_before_simulation():
         'opponent_goals': [2], 'yellow_cards': [1], 'red_cards': [0], 'bps': [10.]})
     # DEF goal +12, conceded -8, yellow -3: events contribute +1, baseline is 9.
     np.testing.assert_allclose(BaselineBPSModel()._compute_baseline_bps(frame), [9.])
+
+
+def test_bonus_baseline_uses_2026_penalty_and_goalkeeper_save_rules():
+    from src.models.bonus import BaselineBPSModel
+    frame = pd.DataFrame({
+        'season': ['2026/2027', '2026/2027'],
+        'fpl_position': ['FWD', 'GK'],
+        'minutes': [90, 90], 'goals': [1, 0], 'penalty_goals': [1, 0],
+        'assists': [0, 0], 'opponent_goals': [1, 1],
+        'yellow_cards': [0, 0], 'red_cards': [0, 0],
+        'saves': [0, 4], 'saves_inside_box': [0, 3],
+        'saved_penalties': [0, 0], 'bps': [8., 5.],
+    })
+    # Penalty goal is +12 for a forward. GK events are -4 conceded +8 saves
+    # +3 inside-box saves, so both residual baselines are allowed to be -4/-2.
+    np.testing.assert_allclose(
+        BaselineBPSModel()._compute_baseline_bps(frame), [-4., -2.])
+
+
+def test_bonus_simulation_scores_penalties_and_goalkeeper_saves_in_bps():
+    frame, model = _match_forecast(), _bonus_model(300)
+    frame['season'] = '2026/2027'
+    frame['penalty_goal_share_roll10'] = [1., 0., 0., 0.]
+    frame['inside_box_save_share_roll5'] = [0., 1., 0., 0.]
+    frame.loc[0, 'fpl_position'] = 'FWD'
+    frame.loc[1, 'fpl_position'] = 'GK'
+    frame.loc[1, 'pred_exp_saves'] = 5.
+    probability = np.tile([0., 0., 1.], (4, 1))
+    states = np.tile([0., 20., 90.], (4, 1))
+
+    draws = model.simulate(frame, probability, states, seed=19)
+
+    np.testing.assert_array_equal(draws['penalty_goals'][:, 0], draws['goals'][:, 0])
+    np.testing.assert_array_equal(draws['saves_inside_box'][:, 1], draws['saves'][:, 1])
+    np.testing.assert_array_equal(draws['save_bps'][:, 1], 3 * draws['saves'][:, 1])

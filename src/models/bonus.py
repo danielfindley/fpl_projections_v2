@@ -18,12 +18,13 @@ from sklearn.metrics import mean_absolute_error, r2_score
 import requests
 
 
-# BPS scoring rules (2025-26 season)
+# BPS scoring rules (2026-27 season)
 BPS_RULES = {
     # Major events (simulated)
     'goal': {
         'GK': 12, 'DEF': 12, 'MID': 18, 'FWD': 24
     },
+    'penalty_goal': 12,
     'assist': 9,
     'clean_sheet': {
         'GK': 12, 'DEF': 12, 'MID': 0, 'FWD': 0
@@ -32,11 +33,17 @@ BPS_RULES = {
     'goal_conceded': {
         'GK': -4, 'DEF': -4, 'MID': 0, 'FWD': 0
     },
+    'save': 2,
+    'save_inside_box': 1,
+    'save_big_chance': 1,
+    'cbi_divisor': 3,
+    'recovery_divisor': 3,
     'yellow_card': -3,
     'red_card': -9,
     'own_goal': -6,
     'penalty_miss': -6,
-    'penalty_save': 15,
+    # The generic save/inside-box/big-chance points are additive to this.
+    'penalty_save': 7,
 }
 
 # Caps for per90 stats to prevent inflation from low-minutes appearances
@@ -178,6 +185,20 @@ class BaselineBPSModel(ManagerFeatureMixin):
         # Passing/possession stats (primary contributors to baseline BPS)
         'key_passes_per90_roll5',
         'key_passes_per90_roll3',
+
+        # Passing and chance creation BPS
+        'accurate_passes_per90_roll5',
+        'passes_attempted_per90_roll5',
+        'pass_completion_roll5',
+        'big_chances_created_per90_roll5',
+        'accurate_crosses_per90_roll5',
+        'successful_dribbles_per90_roll5',
+        'was_fouled_per90_roll5',
+        'shots_on_target_per90_roll5',
+        'big_chances_missed_per90_roll5',
+        'shots_off_target_per90_roll5',
+        'offsides_per90_roll5',
+        'fouls_committed_per90_roll5',
         
         # Defensive stats (contribute to BPS)
         'tackles_per90_roll5',
@@ -187,6 +208,19 @@ class BaselineBPSModel(ManagerFeatureMixin):
         'clearances_per90_roll5',
         'blocks_per90_roll5',
         'recoveries_per90_roll5',
+        'clearance_off_the_line_per90_roll10',
+        'error_led_to_goal_per90_roll10',
+        'conceded_penalty_per90_roll10',
+        'missed_penalty_per90_roll10',
+        'saved_penalties_per90_roll10',
+        'own_goal_per90_roll10',
+
+        # 2026/27 goalkeeper BPS: every save plus inside-box/big-chance extras
+        'saves_per90_roll5',
+        'saves_per90_roll3',
+        'saves_inside_box_per90_roll5',
+        'inside_box_save_share_roll5',
+        'xgot_faced_per90_roll5',
         
         # Shots (contribute to BPS even if not scored)
         'shots_per90_roll5',
@@ -208,6 +242,7 @@ class BaselineBPSModel(ManagerFeatureMixin):
         'lifetime_defcon_per90',
         'lifetime_tackles_per90',
         'lifetime_interceptions_per90',
+        'lifetime_saves_per90',
         'lifetime_minutes',
         
         # Position indicators
@@ -248,92 +283,123 @@ class BaselineBPSModel(ManagerFeatureMixin):
     
     def _compute_baseline_bps(self, df: pd.DataFrame) -> pd.Series:
         """
-        Compute baseline BPS by subtracting major event BPS from total BPS.
-        
-        baseline_bps = bps - (goals * goal_bps) - (assists * 9) - (cs * cs_bps) + penalties
+        Compute baseline BPS by subtracting events simulated elsewhere.
+
+        Actual FPL BPS is the authoritative target. Goals, assists, clean
+        sheets, goals conceded, cards and ordinary save BPS are removed here
+        because the Monte Carlo model adds those same events back per draw.
         """
         df = df.copy()
-        
+
+        def values(column, default=0.0):
+            return pd.to_numeric(
+                df.get(column, pd.Series(default, index=df.index)),
+                errors='coerce',
+            ).fillna(default)
+
         # Get position for position-dependent BPS
         fallback_pos = df.get('position', pd.Series(2, index=df.index)).map(
             {0: 'GK', 1: 'DEF', 2: 'MID', 3: 'FWD'}).fillna('MID')
-        fpl_pos = df.get('fpl_position', fallback_pos)
-        
-        # Calculate BPS from major events
+        fpl_pos = df.get('fpl_position', fallback_pos).astype('string').str.upper()
+        fpl_pos = fpl_pos.where(fpl_pos.isin(['GK', 'DEF', 'MID', 'FWD']), fallback_pos)
+
         goal_bps = fpl_pos.map(lambda p: BPS_RULES['goal'].get(p, 18))
         cs_bps = fpl_pos.map(lambda p: BPS_RULES['clean_sheet'].get(p, 0))
-        
-        goals = df['goals'].fillna(0) if 'goals' in df.columns else pd.Series(0, index=df.index)
-        assists = df['assists'].fillna(0) if 'assists' in df.columns else pd.Series(0, index=df.index)
-        
+
+        goals = values('goals')
+        penalty_goals = values('penalty_goals').clip(lower=0)
+        penalty_goals = np.minimum(penalty_goals, goals)
+        non_penalty_goals = goals - penalty_goals
+        assists = values('assists')
+
         # Clean sheet: 1 if opponent_goals == 0 and player played 60+ mins
-        opponent_goals = df.get('_bps_goals_against', df.get('opponent_goals',
-            df.get('goals_conceded', pd.Series(1., index=df.index)))).fillna(1)
-        minutes = df['minutes'].fillna(0) if 'minutes' in df.columns else pd.Series(60, index=df.index)
+        opponent_goals = pd.to_numeric(df.get(
+            '_bps_goals_against',
+            df.get('opponent_goals', df.get(
+                'goals_conceded', pd.Series(1., index=df.index)))),
+            errors='coerce').fillna(1)
+        minutes = values('minutes', 60)
         clean_sheet = ((opponent_goals == 0) & (minutes >= 60)).astype(int)
-        
-        # Total BPS from major events
+
         conceded_bps = fpl_pos.map(lambda p: BPS_RULES['goal_conceded'].get(p, 0))
-        yellow = df.get('yellow_cards', pd.Series(0., index=df.index)).fillna(0)
-        red = df.get('red_cards', pd.Series(0., index=df.index)).fillna(0)
-        major_event_bps = (goals * goal_bps + assists * BPS_RULES['assist'] +
+        yellow, red = values('yellow_cards'), values('red_cards')
+
+        # In 2026/27 a goalkeeper earns two BPS for every save and one more
+        # for saves inside the box. Big-chance saves are not a dedicated FotMob
+        # column; a saved penalty is at least one known big-chance save.
+        saves = values('saves')
+        inside_saves = np.minimum(values('saves_inside_box'), saves)
+        known_big_chance_saves = np.minimum(values('saved_penalties'), saves)
+        save_event_bps = BPS_RULES['save'] * saves
+        save_event_bps += BPS_RULES['save_inside_box'] * inside_saves
+        save_event_bps += BPS_RULES['save_big_chance'] * known_big_chance_saves
+
+        major_event_bps = (non_penalty_goals * goal_bps +
+                           penalty_goals * BPS_RULES['penalty_goal'] +
+                           assists * BPS_RULES['assist'] +
                            clean_sheet * cs_bps + opponent_goals * conceded_bps * (minutes >= 60) +
-                           yellow * BPS_RULES['yellow_card'] + red * BPS_RULES['red_card'])
-        
-        # Baseline = total - major events
-        total_bps = df['bps'].fillna(0) if 'bps' in df.columns else pd.Series(0, index=df.index)
-        baseline = total_bps - major_event_bps
-        
-        # Floor at 0
-        return np.maximum(baseline, 0)
+                           yellow * BPS_RULES['yellow_card'] + red * BPS_RULES['red_card'] +
+                           save_event_bps)
+
+        # Preserve NaN for rows without authoritative BPS and preserve negative
+        # baselines: poor actions are real information for a ranking model.
+        total_bps = pd.to_numeric(
+            df.get('bps', pd.Series(np.nan, index=df.index)), errors='coerce')
+        return total_bps - major_event_bps
     
     def _estimate_baseline_bps(self, df: pd.DataFrame) -> pd.Series:
         """
-        Estimate baseline BPS from stats when actual BPS data is not available.
+        Estimate non-simulated BPS from actual match-event stats.
 
-        Uses official FPL BPS coefficients:
-        - Playing 60+ mins: 6, playing 1-59 mins: 3
-        - Key passes: 1 per
-        - Tackles won: 2 per
-        - Interceptions: 1 per
-        - Recoveries: 1 per
-        - Clearances: 1 per
-        - Blocks: 1 per
-        - Shots on target: 2 per (approximated as shots * 0.4)
+        The 2026/27 rules award one BPS per three combined clearances,
+        blocks and interceptions and per three recoveries. Ordinary save BPS
+        is deliberately excluded because the simulator adds it from its save
+        draws. Historical events are reconstructed using the current rules so
+        the target definition remains stationary for a 2026/27 forecast.
         """
-        mins = df['minutes'].fillna(0)
-        mins_per90 = mins / 90
+        def values(column, default=0.0):
+            return pd.to_numeric(
+                df.get(column, pd.Series(default, index=df.index)),
+                errors='coerce',
+            ).fillna(default).to_numpy(dtype=float)
 
-        # Base for playing: 6 if 60+ mins, 3 if 1-59 mins
+        mins = values('minutes')
         baseline = np.where(mins >= 60, 6.0, np.where(mins >= 1, 3.0, 0.0))
+        cbi = values('clearances') + values('blocks') + values('interceptions')
+        recoveries = values('recoveries')
+        baseline += np.floor(cbi / BPS_RULES['cbi_divisor'])
+        baseline += np.floor(recoveries / BPS_RULES['recovery_divisor'])
 
-        # Key passes (1 BPS each)
-        if 'key_passes_per90_roll5' in df.columns:
-            baseline += df['key_passes_per90_roll5'].fillna(0) * mins_per90 * 1
+        baseline += values('key_passes')
+        baseline += 3 * values('big_chances_created')
+        baseline += values('accurate_crosses')
+        baseline += 2 * values('tackles')
+        baseline += values('successful_dribbles')
+        baseline += 9 * values('clearance_off_the_line')
+        baseline += values('was_fouled')
+        baseline += 2 * values('shots_on_target')
+        baseline += 3 * values('game_winning_goal')
 
-        # Tackles won (2 BPS each)
-        if 'tackles_per90_roll5' in df.columns:
-            baseline += df['tackles_per90_roll5'].fillna(0) * mins_per90 * 2
+        attempted = values('passes_attempted')
+        completion = np.divide(values('accurate_passes'), attempted,
+                               out=np.zeros(len(df)), where=attempted > 0)
+        eligible_passes = attempted >= 30
+        baseline += np.where(eligible_passes & (completion >= .9), 6,
+                    np.where(eligible_passes & (completion >= .8), 4,
+                    np.where(eligible_passes & (completion >= .7), 2, 0)))
 
-        # Interceptions (1 BPS each)
-        if 'interceptions_per90_roll5' in df.columns:
-            baseline += df['interceptions_per90_roll5'].fillna(0) * mins_per90 * 1
+        # Rare goalkeeper events not represented by ordinary save draws.
+        baseline += BPS_RULES['penalty_save'] * values('saved_penalties')
 
-        # Recoveries (1 BPS each)
-        if 'recoveries_per90_roll5' in df.columns:
-            baseline += df['recoveries_per90_roll5'].fillna(0) * mins_per90 * 1
-
-        # Clearances (1 BPS each)
-        if 'clearances_per90_roll5' in df.columns:
-            baseline += df['clearances_per90_roll5'].fillna(0) * mins_per90 * 1
-
-        # Blocks (1 BPS each)
-        if 'blocks_per90_roll5' in df.columns:
-            baseline += df['blocks_per90_roll5'].fillna(0) * mins_per90 * 1
-
-        # Shots on target approximation (2 BPS each, ~40% of shots are on target)
-        if 'shots_per90_roll5' in df.columns:
-            baseline += df['shots_per90_roll5'].fillna(0) * mins_per90 * 0.4 * 2
+        baseline += -3 * values('conceded_penalty')
+        baseline += BPS_RULES['penalty_miss'] * values('missed_penalty')
+        baseline += BPS_RULES['own_goal'] * values('own_goal')
+        baseline += -3 * values('big_chances_missed')
+        baseline += -3 * values('error_led_to_goal')
+        baseline += -1 * values('error_led_to_attempt')
+        baseline += -1 * values('fouls_committed')
+        baseline += -1 * values('offsides')
+        baseline += -1 * values('shots_off_target')
 
         return pd.Series(baseline, index=df.index)
     
@@ -357,17 +423,23 @@ class BaselineBPSModel(ManagerFeatureMixin):
         # Cap per90 stats to prevent learning from inflated values
         df = cap_per90_stats(df)
         
-        # Compute target: baseline BPS
-        if 'bps' in df.columns:
-            df['baseline_bps'] = self._compute_baseline_bps(df)
-            self._has_bps_data = True
-            if verbose:
-                print("  Using actual BPS data for training")
-        else:
-            df['baseline_bps'] = self._estimate_baseline_bps(df)
-            self._has_bps_data = False
-            if verbose:
-                print("  Estimating baseline BPS from stats (no actual BPS data)")
+        # Prefer authoritative FPL BPS row by row. The live API only exposes
+        # the current season, so older seasons legitimately have a BPS column
+        # full of NaN after the merge and must retain the rules-based proxy.
+        proxy_target = self._estimate_baseline_bps(df)
+        actual_target = self._compute_baseline_bps(df)
+        # BPS definitions change between seasons. Only 2026/27 API scores are
+        # directly comparable with the target reconstructed under these rules.
+        current_rules = df.get(
+            'season', pd.Series('', index=df.index)).astype(str).eq('2026/2027')
+        actual_target = actual_target.where(current_rules)
+        actual_mask = actual_target.notna()
+        df['baseline_bps'] = actual_target.where(actual_mask, proxy_target)
+        self._has_bps_data = bool(actual_mask.any())
+        self._actual_bps_rows = int(actual_mask.sum())
+        if verbose:
+            print(f"  Baseline targets: {self._actual_bps_rows} actual BPS, "
+                  f"{int((~actual_mask).sum())} rules-based proxy")
         
         # Get available features
         available_features = [f for f in self.FEATURES if f in df.columns]
@@ -384,7 +456,11 @@ class BaselineBPSModel(ManagerFeatureMixin):
         X_scaled = self.scaler.fit_transform(X)
         
         # Sample weights by minutes
-        sample_weights = df['minutes'].values.copy()
+        sample_weights = df['minutes'].to_numpy(dtype=float, copy=True)
+        # Actual BPS is considerably better supervision than the incomplete
+        # FotMob reconstruction. Give it extra influence without discarding the
+        # longer proxy history that stabilizes a young season.
+        sample_weights *= np.where(actual_mask.to_numpy(), 5.0, 1.0)
         sample_weights = sample_weights / sample_weights.mean()
         
         if verbose:
@@ -417,7 +493,9 @@ class BaselineBPSModel(ManagerFeatureMixin):
         X_scaled = self.scaler.transform(X)
         preds = self.model.predict(X_scaled)
         
-        return np.maximum(preds, 0)
+        # Negative baseline BPS is valid (missed chances, fouls, errors, etc.)
+        # and matters when ranking players within a fixture.
+        return preds
     
     def feature_importance(self) -> pd.DataFrame:
         if not self.is_fitted:
@@ -556,6 +634,7 @@ class BonusModel:
         playing, sixty = minutes > 0, minutes >= 60
         scale = minutes / base_minutes[None, :]
         goals, assists = np.zeros((ns, n), dtype=int), np.zeros((ns, n), dtype=int)
+        penalty_goals = np.zeros((ns, n), dtype=int)
         against, team_goals = np.zeros((ns, n), dtype=int), np.zeros((ns, n), dtype=int)
         team = frame.get('team', pd.Series('team', index=frame.index)).map(normalize_team_name).to_numpy()
         opponent = frame.get('opponent', pd.Series('opponent', index=frame.index)).map(normalize_team_name).to_numpy()
@@ -571,6 +650,7 @@ class BonusModel:
             groups.setdefault(key, []).append(i)
         goal_mean = np.maximum(vector('pred_exp_goals'), 0)
         assist_mean = np.maximum(vector('pred_exp_assists'), 0)
+        penalty_share = np.clip(vector('penalty_goal_share_roll10'), 0, 1)
         team_mean = np.maximum(vector('pred_team_goals', 1.3), .001)
         ga_mean = np.maximum(vector('pred_goals_against', 1.3), .001)
 
@@ -595,7 +675,11 @@ class BonusModel:
                     cdf = scorer_weights[active].cumsum(axis=1)
                     scorer = (rng.random(len(active))[:, None] > cdf).sum(axis=1)
                     credited = scorer < len(attackers)
-                    goals[active[credited], attackers[scorer[credited]]] += 1
+                    credited_draws = active[credited]
+                    credited_players = attackers[scorer[credited]]
+                    goals[credited_draws, credited_players] += 1
+                    is_penalty = rng.random(len(credited_draws)) < penalty_share[credited_players]
+                    penalty_goals[credited_draws[is_penalty], credited_players[is_penalty]] += 1
                     weights = assist_weights[active].copy()
                     # An unmodeled scorer can still have a modeled assister.
                     weights[np.flatnonzero(credited), scorer[credited]] = 0
@@ -610,10 +694,16 @@ class BonusModel:
         yellows = rng.binomial(1, np.clip(vector('pred_yellow_prob')[None, :] * scale, 0, 1))
         reds = rng.binomial(1, np.clip(vector('pred_red_prob')[None, :] * scale, 0, 1))
         saves = rng.poisson(np.maximum(vector('pred_exp_saves')[None, :] * scale, 0))
+        inside_save_share = np.clip(vector('inside_box_save_share_roll5'), 0, 1)
+        saves_inside_box = rng.binomial(saves, inside_save_share[None, :])
+        save_bps = (BPS_RULES['save'] * saves +
+                    BPS_RULES['save_inside_box'] * saves_inside_box)
         mu = np.maximum(vector('pred_exp_defcon')[None, :] * scale, 0)
         defcon = (rng.negative_binomial(defcon_r, defcon_r / (defcon_r + mu))
                   if defcon_r is not None and defcon_r > 0 else rng.poisson(mu))
-        positions = frame.get('fpl_position', pd.Series('MID', index=frame.index)).to_numpy()
+        positions = frame.get(
+            'fpl_position', pd.Series('MID', index=frame.index, dtype='string')
+        ).astype('string').str.upper().fillna('MID').to_numpy()
         # minutes_roll5 is a MEAN, not cumulative exposure.
         games = np.minimum(vector('lifetime_appearances', 5), 5)
         reliability = np.clip(vector('minutes_roll5', 60) * games / 300., .3, 1.)
@@ -621,17 +711,23 @@ class BonusModel:
         goal_bps = np.array([BPS_RULES['goal'].get(p, 18) for p in positions])
         cs_bps = np.array([BPS_RULES['clean_sheet'].get(p, 0) for p in positions])
         gc_bps = np.array([BPS_RULES['goal_conceded'].get(p, 0) for p in positions])
+        non_penalty_goals = goals - penalty_goals
         bps = np.rint(baseline[None, :] * minutes / 90 +
-                      goals * goal_bps + assists * BPS_RULES['assist'] +
+                      non_penalty_goals * goal_bps +
+                      penalty_goals * BPS_RULES['penalty_goal'] +
+                      assists * BPS_RULES['assist'] +
                       cs * cs_bps + against * gc_bps * sixty +
-                      yellows * BPS_RULES['yellow_card'] + reds * BPS_RULES['red_card'])
+                      yellows * BPS_RULES['yellow_card'] +
+                      reds * BPS_RULES['red_card'] + save_bps)
         bonus = np.zeros((ns, n), dtype=int)
         for indices in groups.values():
             bonus[:, indices] = self.award_bonus(bps[:, indices], playing[:, indices])
         self._last_simulations = {
-            'minutes': minutes, 'goals': goals, 'assists': assists, 'cs': cs,
+            'minutes': minutes, 'goals': goals, 'penalty_goals': penalty_goals,
+            'assists': assists, 'cs': cs,
             'goals_against': against, 'team_goals': team_goals, 'yellows': yellows,
-            'reds': reds, 'saves': saves, 'defcon': defcon, 'bonus': bonus, 'bps': bps,
+            'reds': reds, 'saves': saves, 'saves_inside_box': saves_inside_box,
+            'save_bps': save_bps, 'defcon': defcon, 'bonus': bonus, 'bps': bps,
         }
         return self._last_simulations
 
