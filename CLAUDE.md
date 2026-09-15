@@ -18,9 +18,14 @@ from src.pipeline import FPLPipeline
 pipeline = FPLPipeline('data')
 pipeline.load_data()
 pipeline.compute_features()
-pipeline.tune(n_iter=100, use_subprocess=True)
+pipeline.tune(
+    n_iter=100,
+    use_subprocess=True,
+    test_last_n_gameweeks=10,
+    description='latest 10-GW cross-season holdout',
+)
 pipeline.train()
-predictions = pipeline.predict(gameweek=28, season='2025/2026')
+predictions = pipeline.predict(gameweek=5, season='2026/2027')
 ```
 
 CLI scripts: `python scripts/tune.py`, `python scripts/train.py`, `python scripts/predict.py`
@@ -38,7 +43,12 @@ Data scraping: `python scrape_update_data.py --gameweek 28` or `--auto`
 - **BaseModel subclasses**: GoalsModel (Poisson objective on raw match counts), AssistsModel (Poisson objective on raw match counts), DefconModel (Poisson objective on raw defensive contribution counts, uses `pred_minutes` as feature), SavesModel — all follow the same fit/predict pattern.
 - **CardsModel** (`cards.py`): XGBoost binary classifier (`binary:logistic`) on actual yellow card data from the FPL API. Requires `yellow_cards` column — `load_data()` merges this via `merge_fpl_card_data()` and will raise if the FPL API is unreachable. Red cards use fouls-based prediction (too rare for classification). Not part of the tuning loop.
 - **AppearClassifier** (`minutes.py`): XGBoost binary classifier for P(minutes >= 1) — the only model trained on non-appearances. Its training set is the calendar grid from `features.build_appearance_grid()`, not the per-match frame, because a frame of appearances contains no counterexamples. Isotonic-calibrated against the most recent season (raw XGB put P(blank) at .090 for likely starters whose actual rate was .050, which would double every bench weight). Exposed via `MinutesModel.predict_appear_proba()`; `predict()` is untouched and still returns E[minutes | appears], so no downstream model needs retuning. Not part of the tuning loop.
-- **Custom models** (don't inherit BaseModel): MinutesModel (custom capping logic), CleanSheetModel (Poisson regression for goals-against lambda, raw Poisson CS probs with prior_lambda anchor, home/away split season stats, team-level aggregates), BonusModel (Monte Carlo BPS simulation — simulates goals, assists, clean sheets, **and yellow cards** per match, then ranks BPS to award 3-2-1 bonus).
+- **Custom models** (don't inherit BaseModel): MinutesModel (custom capping logic), CleanSheetModel (Poisson regression for goals-against lambda with a shift-safe 30/90-match matchup prior used only as XGBoost's log base margin, league home/away xG context, and team-level aggregates), BonusModel (Monte Carlo BPS simulation — simulates goals, assists, clean sheets, **and yellow cards** per match, then ranks BPS to award 3-2-1 bonus).
+
+The clean-sheet prior is not also a selectable feature and is not blended into
+the booster output a second time. `team_xga_roll30` remains a model feature;
+the longer 90-match window stabilizes the base prior. Clean-sheet probability
+is `exp(-lambda)` from the final predicted mean goals conceded.
 
 ### Feature engineering (src/features.py)
 120+ features computed with rolling windows (3, 5, 10 games). **All rolling features use `shift(1)`** to prevent data leakage. Key groups: per-90 rolling rates, player share of team output, form trends, xG overperformance, team/opponent rolling stats, interaction features, lifetime profiles, current-season context.
@@ -53,13 +63,19 @@ Tuning follows the model dependency chain with OOF feature propagation:
 2. **Clean sheet** tunes next → generates OOF `pred_team_goals` on training set
 3. **Goals, Assists, Defcon, Saves** tune using OOF predictions as features (matches inference conditions)
 
-Feature rankings are pre-computed once per model using 5 methods (XGBoost gain, XGBoost cover, LightGBM, permutation importance, mutual information). Then Optuna jointly optimizes XGBoost hyperparams + feature selection (ranking method + number of features) via TimeSeriesSplit 5-fold CV.
+Feature ranking uses wrapper-based XGBoost gain fitted separately inside each
+expanding training fold. Optuna jointly selects the feature count and tree
+parameters via five-fold temporal CV; the final ranking is fit again on the
+full training window only.
 
 Protected features (`pred_minutes`, `pred_team_goals`) are always included and don't count toward the feature count. Min features: 15 for goals, 5 for others.
 
 Loss functions per model: Poisson deviance (goals, assists, defcon, clean sheet), MAE (saves), Huber (minutes). Goals, Assists, and Defcon use `count:poisson` objective + Poisson deviance eval metric on raw match counts (0, 1, 2, ...) — true Poisson count data. `pred_minutes` is a feature so the model learns the minutes-count relationship internally.
 
-Feature ranking module: `src/feature_selection.py` — `compute_feature_rankings()` pre-computes all rankings, `select_features()` picks top-N from a given method.
+For weekly evaluation, set `test_last_n_gameweeks=10`. It holds out the latest
+ten completed season/gameweek pairs in chronological order, crossing the season
+boundary when needed, then refits production models on all completed data after
+the untouched holdout has been scored.
 
 ### Prediction flow
 Goals, Assists, and Defcon models output expected match counts directly (no per-90 scaling needed). Goals/Assists are mapped to FPL points using position-specific multipliers. Defcon counts are converted to threshold probability via Negative Binomial CDF: P(defcon >= threshold) — NB is used instead of Poisson because defcon counts are heavily overdispersed (var/mean ≈ 2.5–3.3x); the dispersion parameter `r` is estimated from Pearson residuals during `fit()`. BonusModel uses Monte Carlo simulation of match outcomes.
@@ -78,7 +94,8 @@ Goals, Assists, and Defcon models output expected match counts directly (no per-
 
 ## Testing
 
-Minimal: `test_fixtures.py` and `test_bonus_fix.py` for spot checks. No pytest framework. Validation is primarily through notebook analysis and holdout test set metrics printed during tuning.
+Run the full pytest suite. Temporal leakage, clean-sheet prior/base-margin, match
+simulation, and distribution-report contracts have targeted regression tests.
 
 ## Experiment Logging
 
@@ -152,22 +169,28 @@ Prices exist **only in the FPL API** (`bootstrap-static` → `now_cost`, in tent
 ## Visualization (src/viz.py)
 
 `generate_distribution_html()` produces a standalone HTML file (`distributions.html`) with:
-- Optimal-squad pitch (`squad=` arg), laid out in the shape of the formation it selected — a colored dot per player with name and price below, bench in autosub order. Desktop `body` is `display:flex`, so the side column sits to the right of the ridge plot with the squad above the metrics tables; the mobile template stacks it first on the page.
 - D3.js ridge plot showing Monte Carlo points distributions for top outfield players
-- Sub-model metrics table, overall FPL points metrics, and a calibration plot (predicted vs actual by bucket)
+- Exact evaluation-vs-final-training sample descriptions
+- Sub-model metrics with train/test counts, overall FPL points metrics, and calibration using the same holdout sample
+- Previous-GW top 10 predicted-vs-actual table with minutes and deltas
+- Upcoming fixture mean-score table with both teams' clean-sheet odds
 - Responsive layout — desktop ridge plot and mobile card layout are both embedded; the correct one is selected at load time based on viewport width
 
-The viz is fed by `pipeline.get_viz_metrics()` (formats `last_test_metrics` into sections + calibration buckets) and `pipeline.last_simulations` (Monte Carlo simulation arrays from BonusModel).
+The support panels are fed by `pipeline.get_viz_metrics()`,
+`pipeline.get_last_gw_review(...)`, and
+`pipeline.last_predictions_per_fixture`; never hard-code their values in HTML.
+For GW2 or later, a missing previous-GW review or per-fixture frame is a deploy
+failure, not a reason to silently omit a panel.
 
 ## Weekly Deploy Workflow
 
-Use the `/deploy-predictions` skill (Claude Code slash command) to run the full weekly pipeline. It automates:
-1. **Detect next gameweek** — queries FPL API for latest finished GW, compares against scraped data
+Use the `$deploy-predictions` skill to run the full weekly pipeline. It automates:
+1. **Detect season and next gameweek** — derives the current season, queries FPL API for latest finished GW, compares against scraped data, and fails closed on a season mismatch
 2. **Scrape** — `python scrape_update_data.py --auto` (Playwright + Cloudflare bypass on FotMob)
-3. **Tune** (optional, ~30-60 min) — asks whether to retune or reuse cached params from latest run
-4. **Train + predict + viz** — loads tuned params, trains on all data, predicts next GW, generates `distributions.html`
+3. **Tune** (optional, ~30-60 min) — evaluates on the latest 10 completed GWs across seasons
+4. **Train + predict + viz** — loads tuned params, trains on all data, predicts next GW, and generates the complete report described above
 5. **Save run** — `pipeline.save_run()` persists predictions, simulations, tuned params, and metrics to `data/runs/gw{N}_{timestamp}/`
-6. **Deploy** — copies `distributions.html` to `C:/Users/dpfin/repos/danielfindley.com/projects/`, commits, pushes (asks before push)
+6. **Deploy** — verifies desktop/mobile report content, copies pages to the website repo, and commits/pushes intentional FPL code and website changes to `main`
 
 When tuning is split from training (steps 3a/3b in the skill), tuned params are serialized to `data/_latest_tuned_params.json` so a crash in the training step doesn't lose the tuning work.
 

@@ -18,7 +18,12 @@ from src.pipeline import FPLPipeline
 pipeline = FPLPipeline('data')
 pipeline.load_data()
 pipeline.compute_features()
-pipeline.tune(n_iter=100, use_subprocess=True)  # Optuna tuning with integrated feature selection
+pipeline.tune(
+    n_iter=100,
+    use_subprocess=True,
+    test_last_n_gameweeks=10,
+    description='latest 10-GW cross-season holdout',
+)
 pipeline.train()
 
 pipeline.load_lineups(gameweek=1, season='2026/2027')   # optional: RotoWire predicted XIs
@@ -74,7 +79,7 @@ projecting_fpl_v2/
 | **Appears** | P(minutes >= 1) | XGBoost binary classifier, isotonic-calibrated | Calendar-grid minutes features. The **only** model trained on non-appearances — see below |
 | **Goals** | Goals per match (raw counts) | XGBoost Poisson regression | xG rolling, shots, player share of team output, opponent weakness, xG overperformance, form trends |
 | **Assists** | Assists per match (raw counts) | XGBoost Poisson regression | xA rolling, key passes, player centrality, opponent weakness, xA overperformance, form trends |
-| **Clean Sheet** | Team goals against (lambda) | XGBoost Poisson regression | Team conceded/xGA rolling (5 windows), opponent xG, prior lambda anchor |
+| **Clean Sheet** | Team goals against (lambda) | XGBoost Poisson regression with a matchup base margin | Team conceded/xGA rolling (including 30-match form), opponent xG, league home/away scoring context |
 | **Defcon** | Defensive contributions per match (raw counts) | XGBoost Poisson regression | Raw/per-90 defcon rolling, tackles, interceptions, clearances, blocks, recoveries, opponent context, pred_minutes |
 | **Saves** | GK saves per 90 | XGBoost regression (GK only) | Saves rolling, xGoT faced, team defensive context, opponent attacking strength |
 | **Cards** | Yellow/red card probability | XGBoost binary classifier (`binary:logistic`) | Yellow card rolling history, fouls per 90 rolling, defensive activity, yellow-per-foul rate. Trained on actual FPL API yellow card data (required) |
@@ -103,6 +108,19 @@ Rolling statistics use only completed results before the forecast deadline; this
 | **Fouls** | `fouls_committed_per90_roll{3,5,10}`, `lifetime_fouls_committed_per90` | Cards |
 | **Yellow cards** | `yellow_cards_roll{3,5,10}`, `yellow_per_foul_roll10`, `lifetime_yellow_cards_per90` (from FPL API merge) | Cards |
 | **Manager embeddings** | `manager_emb_0..7` — 8-dim PCA over rolling-20-prior manager stats (minutes distribution, GF/GA, formation) | All models |
+
+### Clean-sheet matchup prior
+
+The clean-sheet model uses a shift-safe matchup prior as XGBoost's log-scale
+`base_margin`. The prior combines each defense's last-30 and last-90 xGA,
+the opponent's last-30 and last-90 goals/xG, and rolling league-wide home/away
+xG. This supplies the model's starting goal-against rate while preserving
+league-average home advantage.
+
+`prior_lambda` and its derived naive clean-sheet probability are deliberately
+not selectable tree features, and there is no second fixed post-model blend.
+The booster learns residual corrections around the base margin. Clean-sheet
+probability remains `exp(-lambda)` from the predicted mean goals conceded.
 
 ### Appearance model (the only model that sees non-appearances)
 
@@ -138,7 +156,7 @@ basis is reused at prediction time. There is no full-dataset or per-forecast PCA
 Minutes and clean sheet tune first; goals, assists and defcon consume causal,
 cross-fitted upstream predictions. Training, validation and holdout evaluation
 use the actual model wrappers, including minute weights, target caps, and the
-clean-sheet log-prior offset and geometric blend. Early OOF rows use prior
+clean-sheet log-prior base margin. Early OOF rows use prior
 rolling minutes / the matchup prior, never their own observed outcome.
 
 Five expanding folds contain whole forecast deadlines. Rows whose results were
@@ -160,6 +178,13 @@ sheet) and MAE (saves). Upstream parameters already selected in the training
 partition are held fixed during downstream CV; these CV scores are not a fully
 nested estimate of the entire selection process. The untouched chronological
 holdout is the final check.
+
+For weekly evaluation, pass `test_last_n_gameweeks=10`. This holds out the
+latest ten chronological completed season/gameweek pairs, crossing into the
+previous season when necessary. The evaluation fit is purged at the first
+holdout forecast deadline. After metrics are computed, production predictions
+are refit separately on every completed appearance through the latest finished
+gameweek.
 
 `use_subprocess=True` runs the **same implementation** in a fresh spawned process
 per model. Existing parameter files remain accepted, but **retuning is strongly
@@ -333,7 +358,10 @@ Predictions saved to `data/predictions/gw{N}_{season}.csv` with columns:
 `src/viz.py` generates a standalone HTML file (`distributions.html`) with:
 
 - **D3.js ridge plot** showing Monte Carlo points distributions for top outfield players
-- **Metrics dashboard** — sub-model holdout metrics, overall FPL points MAE/Poisson deviance/Spearman, and a calibration plot (predicted vs actual by bucket)
+- **Evaluation and training description** — exact evaluation train/test samples and the separate all-history production refit
+- **Metrics dashboard** — sub-model holdout metrics with train/test sample counts, overall FPL points metrics, and a calibration plot tied to the same held-out sample
+- **Previous-GW top 10** — last forecast's highest projected players with minutes, predicted points, actual points, and deltas
+- **Fixture forecasts** — one row per upcoming fixture with mean predicted score and both teams' clean-sheet odds
 - **Responsive layout** — desktop ridge plot and mobile card layout embedded in a single file, selected at load time based on viewport width
 
 Generated via:
@@ -341,13 +369,20 @@ Generated via:
 from src.viz import generate_distribution_html
 
 viz_metrics = pipeline.get_viz_metrics()
+last_gw_review = pipeline.get_last_gw_review(
+    gameweek=5,
+    season='2026/2027',
+    top_n=10,
+)
 generate_distribution_html(
     predictions,
     pipeline.last_simulations,
     output_path='distributions.html',
     top_n=100,
-    gameweek=32,
+    gameweek=5,
     metrics=viz_metrics,
+    predictions_per_fixture=pipeline.last_predictions_per_fixture,
+    last_gw_review=last_gw_review,
 )
 ```
 
@@ -357,12 +392,12 @@ The full weekly workflow (scrape, train, predict, generate viz, deploy to [danie
 
 1. **Detect next gameweek** — queries the FPL API for the latest finished GW and compares against scraped data
 2. **Scrape** — `python scrape_update_data.py --auto` (Playwright + Cloudflare bypass on FotMob)
-3. **Tune** (optional, ~30-60 min) — asks whether to retune hyperparameters or reuse cached params from the latest saved run
+3. **Tune** (optional, ~30-60 min) — uses the latest 10 completed GWs as a cross-season temporal holdout
 4. **Train**
 5. **Scrape predicted lineups** — `pipeline.load_lineups()`, before `predict()`. Wrapped in try/except so a scrape failure warns and falls through to the model rather than killing the deploy
-6. **Predict + optimize squad + viz** — predicts next GW, picks the £100m squad (fetching and snapshotting live prices), generates `distributions.html`
+6. **Predict + optimize squad + viz** — predicts next GW, picks the £100m squad, and generates the full report with sample descriptions, previous-GW top 10, and fixture forecasts
 7. **Save run** — `pipeline.save_run()` persists predictions, simulations, squad, tuned params, and metrics to `data/runs/gw{N}_{timestamp}/`
-8. **Deploy** — copies `distributions.html` to the website repo, commits, and pushes
+8. **Deploy** — verifies the report at desktop/mobile widths, copies it to the website repo, then commits and pushes both model code and site changes to `main`
 
 Both the price and lineup snapshots are append-only histories that **cannot be backfilled**, so running the deploy weekly is what builds the data needed to later calibrate `lineup_weight` and model price changes.
 

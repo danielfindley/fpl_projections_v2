@@ -277,8 +277,11 @@ class FPLPipeline:
         if name == 'clean_sheet':
             model.fit_prepared(frame, verbose=False)
         elif name == 'minutes':
-            model.fit(frame, verbose=False,
-                      appearance_grid=build_appearance_grid(frame, verbose=False))
+            appearance_grid = build_appearance_grid(frame, verbose=False)
+            model.fit(frame, verbose=False, appearance_grid=appearance_grid)
+            model.appearance_training_rows = len(appearance_grid)
+            model.appearance_training_nonappearances = int(
+                appearance_grid['appeared'].eq(0).sum())
         else:
             model.fit(frame, verbose=False)
         return model
@@ -366,6 +369,7 @@ class FPLPipeline:
 
     def tune(self, models: list = None, n_iter: int = 100, test_size: float = 0.2,
              test_season: str = '2025/2026', test_start_gw: int = None,
+             test_last_n_gameweeks: int = None,
              verbose: bool = True, use_subprocess: bool = False,
              description: str = '') -> 'FPLPipeline':
         """Tune model hyperparameters using Optuna with holdout test set evaluation.
@@ -386,6 +390,9 @@ class FPLPipeline:
                          Set to None to fall back to percentage-based temporal split.
             test_start_gw: If set, only gameweeks >= this value in test_season are held out.
                            Earlier gameweeks from test_season are included in training data.
+            test_last_n_gameweeks: If set, hold out the latest N chronological
+                                  season/gameweek pairs, crossing season boundaries.
+                                  Takes precedence over test_season/test_start_gw.
             verbose: Print progress
             use_subprocess: If True, run each model's tuning in a separate subprocess to save RAM
         """
@@ -410,7 +417,37 @@ class FPLPipeline:
         df_sorted = self.df[self.df['minutes'] >= 1].copy()
         df_sorted = chronological_frame(df_sorted).sort_values('match_date')
 
-        if test_season is not None:
+        if test_last_n_gameweeks is not None:
+            if test_last_n_gameweeks < 1:
+                raise ValueError("test_last_n_gameweeks must be at least 1")
+            gameweeks = (
+                df_sorted.groupby(['season', 'gameweek'], as_index=False)
+                ['forecast_time'].min()
+                .sort_values('forecast_time', kind='stable')
+            )
+            if len(gameweeks) <= test_last_n_gameweeks:
+                raise ValueError(
+                    f"Need more than {test_last_n_gameweeks} completed gameweeks "
+                    "to create a training set"
+                )
+            held_out = gameweeks.tail(test_last_n_gameweeks)
+            held_out_keys = pd.MultiIndex.from_frame(
+                held_out[['season', 'gameweek']]
+            )
+            row_keys = pd.MultiIndex.from_frame(
+                df_sorted[['season', 'gameweek']]
+            )
+            test_mask = row_keys.isin(held_out_keys)
+            df_test = df_sorted[test_mask].copy()
+            df_train = df_sorted[~test_mask].copy()
+            first_held = held_out.iloc[0]
+            last_held = held_out.iloc[-1]
+            split_label = (
+                f"last {test_last_n_gameweeks} gameweeks "
+                f"({first_held['season']} GW{int(first_held['gameweek'])} through "
+                f"{last_held['season']} GW{int(last_held['gameweek'])})"
+            )
+        elif test_season is not None:
             # Split by season (optionally filtered by gameweek)
             season_mask = df_sorted['season'] == test_season
             if test_start_gw is not None:
@@ -426,6 +463,7 @@ class FPLPipeline:
             if len(df_test) == 0:
                 raise ValueError(f"No data found for test season '{test_season}'" +
                                  (f" GW>={test_start_gw}" if test_start_gw else ""))
+            split_label = f"season={test_season}"
         else:
             # Fall back to percentage-based temporal split
             if not 0 < test_size < 1:
@@ -435,6 +473,7 @@ class FPLPipeline:
                                         int(len(deadlines) * (1 - test_size))))]
             df_train = df_sorted[df_sorted['forecast_time'] < cutoff].copy()
             df_test = df_sorted[df_sorted['forecast_time'] >= cutoff].copy()
+            split_label = f"temporal {test_size:.0%}"
 
         # A rescheduled older-GW result may not yet exist at the holdout origin.
         df_train = df_train[df_train['result_time'] < df_test['forecast_time'].min()].copy()
@@ -442,7 +481,6 @@ class FPLPipeline:
             raise ValueError("Temporal split must contain training and holdout rows")
 
         if verbose:
-            split_label = f"season={test_season}" if test_season else f"temporal {test_size:.0%}"
             print(f"\nData split ({split_label}):")
             print(f"  Train: {len(df_train):,} samples ({sorted(df_train['season'].unique())})")
             print(f"  Test:  {len(df_test):,} samples ({sorted(df_test['season'].unique())})")
@@ -475,6 +513,7 @@ class FPLPipeline:
         # Log experiment to SQLite
         try:
             fpl_mae_dict = test_metrics.pop('_fpl_points_mae', None)
+            test_metrics.pop('_sample_info', None)
             fpl_ex = fpl_mae_dict['mae_ex_bonus'] if isinstance(fpl_mae_dict, dict) else fpl_mae_dict
             fpl_inc = fpl_mae_dict['mae_inc_bonus'] if isinstance(fpl_mae_dict, dict) else None
             fpl_top25 = None  # deprecated; column kept for schema compat
@@ -779,8 +818,8 @@ class FPLPipeline:
         features are hyperparameters alongside XGBoost params.
         """
         import optuna
-        from sklearn.model_selection import cross_val_score, TimeSeriesSplit
-        from sklearn.metrics import make_scorer, mean_poisson_deviance
+        from sklearn.model_selection import TimeSeriesSplit
+        from sklearn.metrics import mean_poisson_deviance
         import xgboost as xgb
         from .feature_selection import compute_feature_rankings, select_features
 
@@ -790,8 +829,6 @@ class FPLPipeline:
             y_pred = np.clip(y_pred, 1e-8, None)
             y_true = np.clip(y_true, 0, None)
             return mean_poisson_deviance(y_true, y_pred)
-        poisson_scorer = make_scorer(safe_poisson_deviance, greater_is_better=False)
-
         tscv = TimeSeriesSplit(n_splits=5)
 
         # Prepare team-level data (already sorted temporally by prepare_team_features)
@@ -803,6 +840,7 @@ class FPLPipeline:
         n_total_features = len(all_features)
         X_full = team_df[all_features].fillna(0).values
         y = team_df['goals_conceded'].fillna(0).values
+        base_margin = cs_model._get_base_margin(team_df)
 
         if verbose:
             print(f"\nTuning GOALS_AGAINST ({n_iter} trials, TimeSeriesSplit CV, Poisson Deviance)...")
@@ -840,9 +878,21 @@ class FPLPipeline:
             feat_idx = [all_features.index(f) for f in selected]
             X_sel = X_full[:, feat_idx]
 
-            model = xgb.XGBRegressor(**params)
-            scores = cross_val_score(model, X_sel, y, cv=tscv, scoring=poisson_scorer, n_jobs=1)
-            return -scores.mean()
+            # Tune the same offset-Poisson architecture used in production.
+            # sklearn's generic cross_val_score does not pass base_margin, which
+            # previously made CV optimize a different model from final fit/predict.
+            scores = []
+            for train_idx, valid_idx in tscv.split(X_sel):
+                model = xgb.XGBRegressor(**params)
+                model.fit(
+                    X_sel[train_idx], y[train_idx],
+                    base_margin=base_margin[train_idx],
+                )
+                valid = xgb.DMatrix(X_sel[valid_idx])
+                valid.set_base_margin(base_margin[valid_idx])
+                prediction = model.get_booster().predict(valid)
+                scores.append(safe_poisson_deviance(y[valid_idx], prediction))
+            return float(np.mean(scores))
 
         study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=42))
         study.optimize(objective, n_trials=n_iter, show_progress_bar=verbose)
@@ -1519,7 +1569,7 @@ with open(r"{temp_result_path}", 'w') as f:
         test['pred_goals_against'] = self._map_team_prediction(test, teams, against)
         test['pred_team_goals'] = self._map_team_prediction(test, teams, against, opponent=True)
         test['pred_cs_prob'] = np.exp(-test['pred_goals_against'])
-        metrics, pred_store = {}, {}
+        metrics, pred_store, model_samples = {}, {}, {}
         for name in ('minutes', 'goals', 'assists', 'defcon', 'saves'):
             if name != 'minutes':
                 fitted[name] = self._fit_model(name, train, self.tuned_params.get(name, {}))
@@ -1536,6 +1586,35 @@ with open(r"{temp_result_path}", 'w') as f:
             actual = target_rows[fitted[name].TARGET].fillna(0).to_numpy()
             predicted = self._model_predict(name, fitted[name], target_rows)
             pred_store[name] = {'index': target_rows.index, 'y_pred': predicted, 'y_test': actual}
+            if name == 'saves':
+                train_rows = int(train['is_gk'].eq(1).sum())
+                unit = 'goalkeeper apps'
+            elif name == 'defcon':
+                train_rows = int((
+                    train['defcon_position'].isin(['DEF', 'MID'])
+                    & train['defcon'].notna()
+                ).sum())
+                unit = 'DEF/MID apps'
+            elif name == 'minutes':
+                train_rows = len(train)
+                unit = 'played apps'
+            else:
+                train_rows = len(train)
+                unit = 'player apps'
+            model_samples[name] = {
+                'train': train_rows,
+                'test': len(target_rows),
+                'unit': unit,
+            }
+            if name == 'minutes':
+                grid_rows = getattr(fitted[name], 'appearance_training_rows', None)
+                grid_dnps = getattr(
+                    fitted[name], 'appearance_training_nonappearances', None)
+                if grid_rows is not None:
+                    detail = f'appearance grid: {grid_rows:,}'
+                    if grid_dnps is not None:
+                        detail += f' ({grid_dnps:,} DNP)'
+                    model_samples[name]['detail'] = detail
             if name == 'defcon':
                 pred_store[name]['dispersion_r'] = fitted[name].dispersion_r
             if name in models:
@@ -1546,6 +1625,12 @@ with open(r"{temp_result_path}", 'w') as f:
         if 'clean_sheet' in models:
             mask = teams['match_id'].isin(test['match_id'])
             actual, predicted = teams.loc[mask, 'goals_conceded'].to_numpy(), against[mask]
+            clean_train = teams['match_id'].isin(train['match_id']) & teams['goals_conceded'].notna()
+            model_samples['clean_sheet'] = {
+                'train': int(clean_train.sum()),
+                'test': int(mask.sum()),
+                'unit': 'team-sides',
+            }
             metrics['clean_sheet'] = {
                 'metric_name': 'Poisson Dev', 'primary': self._loss('clean_sheet', actual, predicted),
                 'MAE': float(mean_absolute_error(actual, predicted))}
@@ -1568,6 +1653,54 @@ with open(r"{temp_result_path}", 'w') as f:
                 print(f"  {name}: {result['metric_name']}={result['primary']:.4f}, MAE={result['MAE']:.4f}")
             print(f"  Reconstructed played-only FPL MAE (ex bonus): {fpl['mae_ex_bonus']:.4f}")
         metrics['_fpl_points_mae'] = fpl
+        model_samples['bonus'] = {
+            'train': len(train),
+            'test': len(test),
+            'unit': 'player apps',
+        }
+
+        def _span(frame):
+            seasons = sorted(frame['season'].dropna().astype(str).unique())
+            if not seasons:
+                return 'unknown period'
+            last = seasons[-1]
+            latest = frame[frame['season'].astype(str).eq(last)]
+            last_gw = int(pd.to_numeric(latest['gameweek'], errors='coerce').max())
+            if len(seasons) == 1:
+                first_gw = int(pd.to_numeric(latest['gameweek'], errors='coerce').min())
+                return f'{last} GW{first_gw}' if first_gw == last_gw else f'{last} GW{first_gw}-GW{last_gw}'
+            first = seasons[0]
+            earliest = frame[frame['season'].astype(str).eq(first)]
+            first_gw = int(pd.to_numeric(earliest['gameweek'], errors='coerce').min())
+            return f'{first} GW{first_gw} through {last} GW{last_gw}'
+
+        final_frame = self.df[self.df['minutes'] >= 1].copy()
+        full_appearance_grid = getattr(self, 'appearance_grid', None)
+        final_training = {
+            'player_rows': len(final_frame),
+            'team_sides': int(
+                final_frame[['match_id', 'team']].drop_duplicates().shape[0]),
+            'span': _span(final_frame),
+        }
+        if full_appearance_grid is not None:
+            final_training['appearance_grid_rows'] = len(full_appearance_grid)
+            final_training['appearance_grid_nonappearances'] = int(
+                full_appearance_grid['appeared'].eq(0).sum())
+
+        metrics['_sample_info'] = {
+            'evaluation': {
+                'train_player_rows': len(train),
+                'train_team_sides': int(
+                    train[['match_id', 'team']].drop_duplicates().shape[0]),
+                'train_span': _span(train),
+                'test_player_rows': len(test),
+                'test_team_sides': int(
+                    test[['match_id', 'team']].drop_duplicates().shape[0]),
+                'test_span': _span(test),
+            },
+            'models': model_samples,
+            'final_training': final_training,
+        }
         return metrics
 
     def _compute_fpl_points_mae(self, df_test: pd.DataFrame, pred_store: dict) -> dict:
@@ -2346,10 +2479,12 @@ with open(r"{temp_result_path}", 'w') as f:
                 parts = n.split()
                 if len(parts) > 1:
                     hit = lookup.get(parts[-1])
-            try:
-                pos = pos_names.get(int(float(p.get('position'))), '')
-            except (TypeError, ValueError):
-                pos = ''
+            pos = str(p.get('fpl_position', '')).upper()
+            if pos not in ('GK', 'DEF', 'MID', 'FWD'):
+                try:
+                    pos = pos_names.get(int(float(p.get('position'))), '')
+                except (TypeError, ValueError):
+                    pos = ''
             rows.append({
                 'player_name': p['player_name'],
                 'team': p.get('team', ''),
@@ -2409,14 +2544,31 @@ with open(r"{temp_result_path}", 'w') as f:
             calibration = fpl.get('calibration_inc_bonus') or None
 
         sections = []
+        sample_info = self.last_test_metrics.get('_sample_info')
         if sub_rows:
             sections.append({'title': 'Sub-Models (Holdout Test Set)', 'rows': sub_rows})
         if overall_rows:
-            sections.append({'title': 'Overall FPL Points (Holdout Test Set)', 'rows': overall_rows})
+            note = None
+            if sample_info:
+                evaluation = sample_info.get('evaluation') or {}
+                if evaluation.get('test_player_rows') is not None:
+                    note = (
+                        f"Same {int(evaluation['test_player_rows']):,} played-player rows "
+                        f"from {evaluation.get('test_span', 'the holdout')}"
+                    )
+            sections.append({
+                'title': 'Overall FPL Points (Holdout Test Set)',
+                'rows': overall_rows,
+                'note': note,
+            })
 
         if not sections and not calibration:
             return None
-        return {'sections': sections, 'calibration': calibration}
+        return {
+            'sections': sections,
+            'calibration': calibration,
+            'sample_info': sample_info,
+        }
 
     def load_lineups(self, gameweek: int = None, season: str = '2026/2027',
                      snapshot: bool = True, html: str = None,

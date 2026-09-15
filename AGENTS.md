@@ -24,7 +24,7 @@ pipeline.compute_features()
 pipeline.tune(
     n_iter=100,              # Optuna trials per model
     use_subprocess=True,     # Memory isolation (recommended)
-    test_size=0.2,           # Holdout fraction
+    test_last_n_gameweeks=10, # Latest 10 chronological GWs, across seasons
     description='describe what you changed and why',
 )
 ```
@@ -86,7 +86,12 @@ Change ONE thing at a time so you can attribute improvement. Options:
 
 ### 5. Run and compare
 ```python
-pipeline.tune(n_iter=100, use_subprocess=True, description='<what you changed>')
+pipeline.tune(
+    n_iter=100,
+    use_subprocess=True,
+    test_last_n_gameweeks=10,
+    description='<what you changed>',
+)
 # Then compare:
 history = pipeline.experiment_history()
 ```
@@ -120,6 +125,10 @@ If the change improved the target metric, keep it. If not, revert the code chang
 ### Clean Sheet (Poisson Deviance)
 - Team-level model predicting goals conceded (not player-level)
 - Uses `count:poisson` objective in XGBoost
+- Uses a shift-safe 30/90-match matchup prior as XGBoost's log base margin,
+  including rolling league home/away xG context
+- `prior_lambda`/`naive_cs_prob` are not selectable features and there is no
+  second fixed post-model blend; the booster learns corrections around the prior
 - Clean sheet probability = P(goals_conceded = 0) from Poisson distribution
 
 ### Saves (MAE, GK only)
@@ -144,3 +153,6 @@ If the change improved the target metric, keep it. If not, revert the code chang
 6. **Check for data leakage** — any new features must use `shift(1)` on rolling calculations
 7. **Don't tune bonus/cards** — BonusModel (Monte Carlo) and CardsModel aren't part of the tuning loop
 8. **Report results** — after each experiment, summarize what changed, what improved, what didn't
+9. **Use the weekly holdout contract** — deployment evaluation uses the latest
+   10 chronological completed gameweeks and may cross the season boundary; final
+   predictions are then refit separately on all completed data

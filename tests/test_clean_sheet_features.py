@@ -196,6 +196,46 @@ class CleanSheetFeatureTests(unittest.TestCase):
             alpha['prior_lambda'], CleanSheetModel.PRIOR_LAMBDA_MIN
         )
 
+    def test_prior_blends_thirty_and_ninety_matches_with_league_home_advantage(self):
+        rows = []
+        for gw in range(1, 36):
+            alpha_home = gw % 2
+            beta_xg = 3.0 if gw > 25 else 1.0
+            rows += [
+                _team_row('Alpha', 'Beta', '2024/2025', gw, alpha_home,
+                          2, 2.0),
+                _team_row('Beta', 'Alpha', '2024/2025', gw, 1 - alpha_home,
+                          1, beta_xg),
+            ]
+        fixtures = pd.DataFrame([
+            {'team': 'Alpha', 'opponent': 'Beta', 'season': '2024/2025',
+             'gameweek': 36, 'is_home': 1},
+            {'team': 'Beta', 'opponent': 'Alpha', 'season': '2024/2025',
+             'gameweek': 36, 'is_home': 0},
+        ])
+
+        features = CleanSheetModel().prepare_team_features(
+            pd.DataFrame(rows), prediction_fixtures=fixtures)
+        alpha = features[
+            features['_is_prediction'] & features['team'].eq('Alpha')
+        ].iloc[0]
+
+        # Alpha faced 20 matches of 1.0 xGA followed by 10 of 3.0 xGA.
+        self.assertAlmostEqual(alpha['team_xga_roll30'], 5 / 3)
+        self.assertAlmostEqual(alpha['team_xga_roll90'], 11 / 7)
+        self.assertAlmostEqual(
+            alpha['venue_attack_baseline'], alpha['league_away_xg'])
+        attack = (
+            CleanSheetModel.GOALS_ATTACK_WEIGHT * alpha['prior_opp_goals']
+            + (1 - CleanSheetModel.GOALS_ATTACK_WEIGHT) * alpha['prior_opp_xg']
+        )
+        expected = (
+            alpha['venue_attack_baseline']
+            * alpha['prior_team_xga'] / alpha['league_avg_xg']
+            * attack / alpha['league_avg_xg']
+        )
+        self.assertAlmostEqual(alpha['prior_lambda'], expected)
+
 
 if __name__ == '__main__':
     unittest.main()
@@ -380,19 +420,33 @@ def test_manager_basis_is_fitted_on_training_only_and_reused():
 
 
 def test_shared_clean_sheet_fit_matches_production_wrapper(tmp_path):
+    import xgboost as xgb
     from src.features import compute_rolling_features
     from src.pipeline import FPLPipeline
     raw = _dated_history()
     raw.attrs['data_dir'] = str(tmp_path)
     frame = compute_rolling_features(raw, verbose=False)
     params = {'n_estimators': 4, 'max_depth': 2, 'n_jobs': 1,
-              'selected_features': ['prior_lambda', 'is_home']}
+              'selected_features': ['team_xga_roll30', 'is_home']}
     teams = CleanSheetModel().prepare_team_features(frame)
     production = CleanSheetModel(**params).fit(frame, verbose=False)
     evaluation = FPLPipeline._fit_model('clean_sheet', teams, params)
     np.testing.assert_allclose(production.predict_goals_against(teams),
                                evaluation.predict_goals_against(teams))
     assert evaluation.selected_features == params['selected_features']
+
+    # The matchup prior has one role only: XGBoost's base margin. It must not
+    # also be a selectable feature or receive a second post-model blend.
+    assert 'prior_lambda' not in CleanSheetModel.FEATURES
+    assert 'naive_cs_prob' not in CleanSheetModel.FEATURES
+    X = production._prepare_X(teams)
+    matrix = xgb.DMatrix(X.values, feature_names=list(X.columns))
+    matrix.set_base_margin(production._get_base_margin(teams))
+    raw_booster_prediction = production.model.get_booster().predict(matrix)
+    np.testing.assert_allclose(
+        production.predict_goals_against(teams),
+        np.clip(raw_booster_prediction, 1e-6, 10.0),
+    )
 
 
 def test_oof_cold_start_never_uses_actual_minutes_and_fold_fits_are_past(monkeypatch):
@@ -472,6 +526,56 @@ def test_fast_tuning_keeps_oof_dependencies_causal(tmp_path, monkeypatch):
     assert max(training_deadlines) < frame['forecast_time'].max()
     assert np.isfinite(scores['clean_sheet'])
     assert params['clean_sheet']['selected_features']
+
+
+def test_tuning_holdout_uses_last_ten_gameweeks_across_seasons(tmp_path, monkeypatch):
+    from src.pipeline import FPLPipeline
+    import src.pipeline as pipeline_module
+
+    rows = []
+    sequence = (
+        [('2025/2026', gw) for gw in range(31, 39)]
+        + [('2026/2027', gw) for gw in range(1, 5)]
+    )
+    for i, (season, gameweek) in enumerate(sequence):
+        deadline = pd.Timestamp('2026-03-01', tz='UTC') + pd.Timedelta(days=7 * i)
+        rows.append({
+            'season': season,
+            'gameweek': gameweek,
+            'minutes': 90,
+            'forecast_time': deadline,
+            'result_time': deadline + pd.Timedelta(days=1),
+            'match_date': deadline + pd.Timedelta(hours=3),
+        })
+
+    pipeline = FPLPipeline(str(tmp_path))
+    pipeline.df = pd.DataFrame(rows)
+    captured = {}
+
+    monkeypatch.setattr(
+        pipeline, '_tune_in_process', lambda *args: ({}, {}))
+
+    def evaluate(_models, train, test, _verbose):
+        captured['train'] = train[['season', 'gameweek']].copy()
+        captured['test'] = test[['season', 'gameweek']].copy()
+        return {'_fpl_points_mae': {'mae_ex_bonus': 0.0}}
+
+    monkeypatch.setattr(pipeline, '_evaluate_on_test_set', evaluate)
+    monkeypatch.setattr(pipeline_module, 'log_experiment', lambda **kwargs: 'test-run')
+
+    pipeline.tune(
+        models=[], n_iter=1, test_last_n_gameweeks=10,
+        use_subprocess=False, verbose=False, description='split test',
+    )
+
+    held_out = list(captured['test'].itertuples(index=False, name=None))
+    assert held_out == (
+        [('2025/2026', gw) for gw in range(33, 39)]
+        + [('2026/2027', gw) for gw in range(1, 5)]
+    )
+    assert list(captured['train'].itertuples(index=False, name=None)) == [
+        ('2025/2026', 31), ('2025/2026', 32)
+    ]
 
 
 def test_spawned_tuning_matches_in_process(tmp_path):

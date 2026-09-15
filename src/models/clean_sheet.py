@@ -22,11 +22,6 @@ class CleanSheetModel(ManagerFeatureMixin):
     """
 
     FEATURES = [
-        # Prior lambda (strong anchor: team xGA × blended opp goals/xG / league avg)
-        'prior_lambda',
-        # Naive CS probability = exp(-prior_lambda) — direct anchor for the model
-        'naive_cs_prob',
-
         # Interaction features
         'xga_x_opp_xg_roll1', 'xga_x_opp_xg_roll2', 'xga_x_opp_xg_roll3',
         'xga_x_opp_xg_roll5', 'xga_x_opp_xg_roll7', 'xga_x_opp_xg_roll10',
@@ -89,6 +84,12 @@ class CleanSheetModel(ManagerFeatureMixin):
     # after three matches without yet being a stable team identity.
     PROMOTED_PRIOR_GAMES = 5
     GOALS_ATTACK_WEIGHT = 0.5
+    PRIOR_MATCH_WINDOW = 30
+    LONG_TERM_PRIOR_WINDOW = 90
+    RECENT_PRIOR_WEIGHT = 0.5
+    LEAGUE_VENUE_WINDOW = 380
+    LEAGUE_HOME_XG_FALLBACK = 1.50
+    LEAGUE_AWAY_XG_FALLBACK = 1.15
     PRIOR_LAMBDA_MIN = 0.3
     PRIOR_LAMBDA_MAX = 4.0
 
@@ -262,11 +263,16 @@ class CleanSheetModel(ManagerFeatureMixin):
         # Team defensive
         _roll('goals_conceded', 'team_conceded', _TEAM_WINDOWS)
         _roll('xga', 'team_xga', _TEAM_WINDOWS)
+        _roll('xga', 'team_xga', [self.LONG_TERM_PRIOR_WINDOW])
         _roll('clean_sheet', 'team_cs', _TEAM_WINDOWS)
 
         # Team offensive (needed for opponent lookup at prediction time)
         _roll('goals', 'team_scored', _PLAYER_WINDOWS)
         _roll('xg', 'team_xg_scored', _PLAYER_WINDOWS)
+        _roll('goals', 'team_scored', [
+            self.PRIOR_MATCH_WINDOW, self.LONG_TERM_PRIOR_WINDOW])
+        _roll('xg', 'team_xg_scored', [
+            self.PRIOR_MATCH_WINDOW, self.LONG_TERM_PRIOR_WINDOW])
 
         # EWMA for xGA (reacts faster to form changes than rolling mean)
         team_match['team_xga_ewm'] = prior_stat(team_match, 'team_norm', 'xga', span=5)
@@ -302,7 +308,11 @@ class CleanSheetModel(ManagerFeatureMixin):
                                    'goals', 'xg', 'key_passes', 'shots_on_target', 'match_date', 'forecast_time', 'result_time']].copy()
         for col, pfx in [('goals', 'opp_scored'), ('xg', 'opp_xg'),
                           ('key_passes', 'opp_key_passes'), ('shots_on_target', 'opp_shots_ot')]:
-            for w in _PLAYER_WINDOWS:
+            windows = list(_PLAYER_WINDOWS)
+            if col in ('goals', 'xg'):
+                windows.extend([
+                    self.PRIOR_MATCH_WINDOW, self.LONG_TERM_PRIOR_WINDOW])
+            for w in windows:
                 opp_offense[f'{pfx}_roll{w}'] = prior_stat(opp_offense, 'team_norm', col, w, min_periods=min(TEAM_ROLL_MIN_PERIODS, w))
 
         # Opponent scoring identity, rolling across seasons. This is the term that
@@ -601,24 +611,75 @@ class CleanSheetModel(ManagerFeatureMixin):
             'away_season_xg_opp', 'home_season_xg_opp',
         ], errors='ignore')
 
-        # --- Prior lambda (strong direct anchor) ---
-        # Estimate: team xGA times the opponent's blended goals/xG attack rate,
-        # normalized by the league-average goals rate.
-        league_avg_goals = 1.3  # fixed normalization; learned priors use prior seasons only
-        if league_avg_goals < 0.5:
-            league_avg_goals = 1.3  # safety fallback
+        # --- Prior lambda (30/90 strength + league-wide home advantage) ---
+        # Team-specific venue splits contain only a small sample and can overwhelm
+        # established overall strength. Blend recent 30-match form with a stable
+        # 90-match identity, then apply one causal league-wide home/away xG baseline.
+        def _league_venue_xg(venue_value, fallback):
+            history = team_match[
+                team_match['is_home'].eq(venue_value) & team_match['xg'].notna()
+            ].sort_values('result_time', kind='stable')
+            result = pd.Series(fallback, index=team_match.index, dtype=float)
+            if history.empty:
+                return result
+            state = pd.to_numeric(history['xg'], errors='coerce').rolling(
+                self.LEAGUE_VENUE_WINDOW,
+                min_periods=TEAM_ROLL_MIN_PERIODS,
+            ).mean()
+            times = history['result_time'].astype('int64').to_numpy()
+            cutoffs = team_match['forecast_time'].astype('int64').to_numpy()
+            previous = np.searchsorted(times, cutoffs, side='left') - 1
+            available = previous >= 0
+            result.loc[available] = state.iloc[previous[available]].to_numpy()
+            return result.fillna(fallback)
 
-        team_xga = team_match['ha_season_xga'].fillna(team_match['season_xga_per_game']).fillna(league_avg_goals)
-        opp_goals = team_match['opp_ha_season_goals'].fillna(
-            team_match['opp_season_goals_per_game']).fillna(league_avg_goals)
-        opp_xg = team_match['opp_ha_season_xg'].fillna(
-            team_match['opp_season_xg_per_game']).fillna(league_avg_goals)
+        team_match['league_home_xg'] = _league_venue_xg(
+            1, self.LEAGUE_HOME_XG_FALLBACK)
+        team_match['league_away_xg'] = _league_venue_xg(
+            0, self.LEAGUE_AWAY_XG_FALLBACK)
+        team_match['league_avg_xg'] = (
+            team_match['league_home_xg'] + team_match['league_away_xg']) / 2.0
+        league_avg_goals = team_match['league_avg_xg'].clip(lower=0.5)
+
+        # A defending home team faces the league's away scoring environment;
+        # a defending away team faces the league's home environment.
+        venue_attack_baseline = pd.Series(np.where(
+            team_match['is_home'].eq(1),
+            team_match['league_away_xg'],
+            team_match['league_home_xg'],
+        ), index=team_match.index)
+        team_match['venue_attack_baseline'] = venue_attack_baseline
+
+        def _multi_horizon(short_col, long_col, fallback):
+            short = pd.to_numeric(
+                team_match[short_col], errors='coerce').fillna(fallback)
+            long = pd.to_numeric(
+                team_match[long_col], errors='coerce').fillna(short)
+            return (self.RECENT_PRIOR_WEIGHT * short
+                    + (1.0 - self.RECENT_PRIOR_WEIGHT) * long)
+
+        team_xga = _multi_horizon(
+            'team_xga_roll30', 'team_xga_roll90',
+            team_match['season_xga_per_game'].fillna(league_avg_goals))
+        opp_goals = _multi_horizon(
+            'opp_scored_roll30', 'opp_scored_roll90',
+            team_match['opp_season_goals_per_game'].fillna(league_avg_goals))
+        opp_xg = _multi_horizon(
+            'opp_xg_roll30', 'opp_xg_roll90',
+            team_match['opp_season_xg_per_game'].fillna(league_avg_goals))
+        team_match['prior_team_xga'] = team_xga
+        team_match['prior_opp_goals'] = opp_goals
+        team_match['prior_opp_xg'] = opp_xg
         # Goals and xG contribute equally, so a short finishing drought cannot
         # imply a zero-strength attack while chance quality remains non-zero.
         opp_attack = (self.GOALS_ATTACK_WEIGHT * opp_goals
                       + (1.0 - self.GOALS_ATTACK_WEIGHT) * opp_xg)
 
-        raw_prior_lambda = team_xga * (opp_attack / league_avg_goals)
+        raw_prior_lambda = (
+            venue_attack_baseline
+            * (team_xga / league_avg_goals)
+            * (opp_attack / league_avg_goals)
+        )
         team_match['prior_lambda'] = raw_prior_lambda.clip(
             self.PRIOR_LAMBDA_MIN, self.PRIOR_LAMBDA_MAX)
 
@@ -712,15 +773,12 @@ class CleanSheetModel(ManagerFeatureMixin):
 
         return self
 
-    # Weight for blending prior_lambda with model prediction (0=pure model, 1=pure prior)
-    PRIOR_WEIGHT = 0.5
-
     def predict_goals_against(self, df: pd.DataFrame) -> np.ndarray:
         """Predict expected goals against (lambda for Poisson).
 
-        Uses base_margin = log(prior_lambda) so model predictions are
-        adjustments on top of the naive matchup estimate, then blends
-        the result with the prior to prevent over-correction.
+        ``prior_lambda`` is used only as XGBoost's base margin. The booster
+        prediction already includes that starting margin, so no second blend
+        with the prior is applied here.
         """
         if not self.is_fitted:
             raise ValueError("Model not fitted")
@@ -731,13 +789,7 @@ class CleanSheetModel(ManagerFeatureMixin):
         if base_margin is not None:
             dmat = xgb.DMatrix(X_vals, feature_names=list(X.columns) if hasattr(X, 'columns') else None)
             dmat.set_base_margin(base_margin)
-            model_pred = self.model.get_booster().predict(dmat)
-
-            # Blend in log-space: geometric mean of prior and model
-            prior_lambda = np.exp(base_margin)
-            w = self.PRIOR_WEIGHT
-            log_blended = w * np.log(prior_lambda) + (1 - w) * np.log(np.clip(model_pred, 1e-6, 10.0))
-            raw_pred = np.exp(log_blended)
+            raw_pred = self.model.get_booster().predict(dmat)
         else:
             raw_pred = self.model.predict(X_vals)
 

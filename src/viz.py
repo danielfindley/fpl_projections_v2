@@ -6,12 +6,88 @@ Monte Carlo points distributions for top outfield players.
 
 import json
 import re
+from copy import deepcopy
+from html import escape
 import numpy as np
+import pandas as pd
 from scipy.stats import gaussian_kde
 from pathlib import Path
 
 
-def _build_metrics_html(metrics):
+def _sample_count(value):
+    """Format a sample count without turning a missing value into zero."""
+    return f'{int(value):,}' if value is not None else '&mdash;'
+
+
+def _build_sample_html(sample_info, predictions=None,
+                       predictions_per_fixture=None, gameweek=None):
+    """Explain the temporal holdout and the separate final-production fit."""
+    if not sample_info:
+        return ''
+
+    evaluation = sample_info.get('evaluation') or {}
+    final = sample_info.get('final_training') or {}
+
+    prediction_players = len(predictions) if predictions is not None else final.get('prediction_players')
+    if predictions_per_fixture is not None and len(predictions_per_fixture):
+        if 'match_id' in predictions_per_fixture:
+            prediction_fixtures = predictions_per_fixture['match_id'].nunique()
+        else:
+            prediction_fixtures = final.get('prediction_fixtures')
+    else:
+        prediction_fixtures = final.get('prediction_fixtures')
+
+    season = None
+    if predictions is not None and 'season' in predictions:
+        seasons = predictions['season'].dropna().astype(str)
+        if len(seasons):
+            season = seasons.iloc[0]
+    target = final.get('target') or (
+        f'{season} GW{gameweek}' if season and gameweek else f'GW{gameweek}' if gameweek else 'the forecast gameweek'
+    )
+
+    evaluation_text = (
+        f'<strong>Held-out evaluation:</strong> fit on '
+        f'{_sample_count(evaluation.get("train_player_rows"))} player-match appearances '
+        f'({_sample_count(evaluation.get("train_team_sides"))} team-sides), '
+        f'{escape(str(evaluation.get("train_span", "historical data")))}. '
+        f'Scored on {_sample_count(evaluation.get("test_player_rows"))} players who appeared in '
+        f'{escape(str(evaluation.get("test_span", "the holdout")))} '
+        f'({_sample_count(evaluation.get("test_team_sides"))} team-sides). '
+        f'The holdout outcomes were never available to the evaluation fit.'
+    )
+    final_text = (
+        f'<strong>Final {escape(str(target))} forecast:</strong> refit on all '
+        f'{_sample_count(final.get("player_rows"))} appearances '
+        f'({_sample_count(final.get("team_sides"))} team-sides), '
+        f'{escape(str(final.get("span", "including the completed holdout")))}.'
+    )
+    if final.get('appearance_grid_rows') is not None:
+        final_text += (
+            f' The appearance classifier uses '
+            f'{_sample_count(final.get("appearance_grid_rows"))} eligible player-fixture rows'
+        )
+        if final.get('appearance_grid_nonappearances') is not None:
+            final_text += (
+                f' ({_sample_count(final.get("appearance_grid_nonappearances"))} non-appearances)'
+            )
+        final_text += '.'
+    if prediction_players is not None:
+        final_text += f' Predictions cover {_sample_count(prediction_players)} current players'
+        if prediction_fixtures is not None:
+            final_text += f' across {_sample_count(prediction_fixtures)} fixtures'
+        final_text += '.'
+
+    return f'''
+<div style="margin:18px 0 0;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 14px">
+  <h3 style="color:#e0e0e0;text-align:center;margin:0 0 8px;font-size:14px;font-weight:600">Evaluation &amp; Training Samples</h3>
+  <p style="font-size:11px;line-height:1.55;color:#8b949e;margin:0 0 7px">{evaluation_text}</p>
+  <p style="font-size:11px;line-height:1.55;color:#8b949e;margin:0">{final_text}</p>
+</div>'''
+
+
+def _build_metrics_html(metrics, predictions=None, predictions_per_fixture=None,
+                        gameweek=None):
     """Build HTML for sub-model + overall-points metrics + calibration plot.
 
     Accepts either the legacy list-of-rows format (single section, no
@@ -23,51 +99,107 @@ def _build_metrics_html(metrics):
     if isinstance(metrics, list):
         sections = [{'title': 'Model Accuracy (Holdout Test Set)', 'rows': metrics}]
         calibration = None
+        sample_info = None
     else:
         sections = metrics.get('sections') or []
         calibration = metrics.get('calibration')
+        sample_info = metrics.get('sample_info')
 
     parts = ['<div style="max-width:620px;margin:32px auto 16px;padding:0 16px">']
+    if sample_info:
+        parts.append(_build_sample_html(
+            sample_info, predictions, predictions_per_fixture, gameweek))
+    model_samples = (sample_info or {}).get('models') or {}
     for section in sections:
         rows = section.get('rows') or []
         if not rows:
             continue
         show_model = any(r.get('model') for r in rows)
+        show_sample = show_model and bool(model_samples)
         body = ''
         for r in rows:
             if show_model:
-                body += (
-                    f'<tr><td style="padding:6px 12px">{r.get("model","")}</td>'
-                    f'<td style="padding:6px 12px">{r["metric"]}</td>'
-                    f'<td style="padding:6px 12px;text-align:right;font-variant-numeric:tabular-nums">{r["score"]}</td></tr>\n'
-                )
+                if show_sample:
+                    sample = model_samples.get(str(r.get('model', '')).lower(), {})
+                    unit = escape(str(sample.get('unit', 'rows')))
+                    detail = sample.get('detail')
+                    detail_html = (
+                        f'<br><span style="color:#666;font-size:10px">'
+                        f'{escape(str(detail))}</span>' if detail else ''
+                    )
+                    body += (
+                        f'<tr><td style="padding:6px 8px">{r.get("model","")}</td>'
+                        f'<td style="padding:6px 8px">{r["metric"]}'
+                        f'<br><span style="color:#e6edf3;font-weight:600;font-variant-numeric:tabular-nums">{r["score"]}</span></td>'
+                        f'<td style="padding:6px 8px;text-align:right;'
+                        f'font-variant-numeric:tabular-nums">'
+                        f'<span style="white-space:nowrap">{_sample_count(sample.get("train"))} '
+                        f'&rarr; {_sample_count(sample.get("test"))}</span>'
+                        f'<br><span style="color:#666;font-size:10px">{unit}</span>'
+                        f'{detail_html}'
+                        f'</td>'
+                        f'</tr>\n'
+                    )
+                else:
+                    body += (
+                        f'<tr><td style="padding:6px 12px">{r.get("model","")}</td>'
+                        f'<td style="padding:6px 12px">{r["metric"]}</td>'
+                        f'<td style="padding:6px 12px;text-align:right;font-variant-numeric:tabular-nums">{r["score"]}</td></tr>\n'
+                    )
             else:
                 body += (
                     f'<tr><td style="padding:6px 12px">{r["metric"]}</td>'
                     f'<td style="padding:6px 12px;text-align:right;font-variant-numeric:tabular-nums">{r["score"]}</td></tr>\n'
                 )
         if show_model:
+            if show_sample:
+                columns = '<colgroup><col style="width:24%"><col style="width:38%"><col style="width:38%"></colgroup>'
+                head = (
+                    '<th style="padding:8px;text-align:left">Model</th>'
+                    '<th style="padding:8px;text-align:left">Test metric</th>'
+                    '<th style="padding:8px;text-align:right;white-space:nowrap">Train &rarr; test</th>'
+                )
+            else:
+                columns = '<colgroup><col style="width:34%"><col style="width:38%"><col style="width:28%"></colgroup>'
+                head = (
+                    '<th style="padding:8px 12px;text-align:left">Model</th>'
+                    '<th style="padding:8px 12px;text-align:left">Metric</th>'
+                    '<th style="padding:8px 12px;text-align:right">Test</th>'
+                )
+        else:
+            columns = '<colgroup><col style="width:72%"><col style="width:28%"></colgroup>'
             head = (
-                '<th style="padding:8px 12px;text-align:left">Model</th>'
                 '<th style="padding:8px 12px;text-align:left">Metric</th>'
                 '<th style="padding:8px 12px;text-align:right">Test</th>'
             )
-        else:
-            head = (
-                '<th style="padding:8px 12px;text-align:left">Metric</th>'
-                '<th style="padding:8px 12px;text-align:right">Test</th>'
+        section_note = ''
+        if section.get('note'):
+            section_note = (
+                f'<p style="color:#777;text-align:center;margin:-4px 0 9px;'
+                f'font-size:11px;line-height:1.4">'
+                f'{escape(str(section["note"]))}</p>'
             )
         parts.append(f'''
 <div style="margin:18px 0 0">
   <h3 style="color:#e0e0e0;text-align:center;margin-bottom:10px;font-size:14px;font-weight:600">{section["title"]}</h3>
-  <table style="width:100%;border-collapse:collapse;font-size:13px;color:#ccc;background:#1a1a2e;border-radius:8px;overflow:hidden">
+{section_note}
+  <table style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:13px;color:#ccc;background:#1a1a2e;border-radius:8px;overflow:hidden">
+    {columns}
     <thead><tr style="background:#16213e;color:#7fdbca">{head}</tr></thead>
     <tbody>{body}</tbody>
   </table>
 </div>''')
 
     if calibration:
-        parts.append(_build_calibration_svg(calibration))
+        calibration_note = None
+        if sample_info:
+            evaluation = sample_info.get('evaluation') or {}
+            calibration_note = (
+                f'{_sample_count(evaluation.get("test_player_rows"))} played-player rows from '
+                f'{escape(str(evaluation.get("test_span", "the holdout")))}; '
+                'the same sample used for overall FPL-points evaluation.'
+            )
+        parts.append(_build_calibration_svg(calibration, calibration_note))
 
     parts.append('</div>')
     return '\n'.join(parts)
@@ -85,13 +217,14 @@ def _build_last_gw_html(last_gw):
         pred = r['predicted']
         if actual is None:
             actual_cell = '<span style="color:#666">&mdash;</span>'
-            diff_cell = ''
         else:
             # Green when the player beat the projection, red when he missed it.
             delta = actual - pred
             color = '#3fb950' if delta >= 0 else '#f85149'
-            actual_cell = f'<span style="color:{color};font-weight:600">{actual:.0f}</span>'
-            diff_cell = f'<span style="color:{color}">{delta:+.1f}</span>'
+            actual_cell = (
+                f'<span style="color:{color};font-weight:600">{actual:.0f}</span>'
+                f'<br><span style="color:{color};font-size:10px">{delta:+.1f}</span>'
+            )
         mins = r.get('minutes')
         mins_cell = '&mdash;' if mins is None else f'{mins:.0f}'
         pos = r.get('position') or ''
@@ -100,12 +233,10 @@ def _build_last_gw_html(last_gw):
             f'<tr>'
             f'<td style="padding:6px 12px">'
             f'<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:{dot};margin-right:7px"></span>'
-            f'{r["player_name"]}</td>'
-            f'<td style="padding:6px 12px;color:#888;font-size:12px">{r.get("team","")}</td>'
-            f'<td style="padding:6px 12px;text-align:right;font-variant-numeric:tabular-nums">{mins_cell}</td>'
-            f'<td style="padding:6px 12px;text-align:right;font-variant-numeric:tabular-nums;color:#999">{pred:.1f}</td>'
-            f'<td style="padding:6px 12px;text-align:right;font-variant-numeric:tabular-nums">{actual_cell}</td>'
-            f'<td style="padding:6px 12px;text-align:right;font-variant-numeric:tabular-nums;font-size:12px">{diff_cell}</td>'
+            f'{r["player_name"]}<br><span style="color:#777;font-size:10px;margin-left:14px">{r.get("team","")}</span></td>'
+            f'<td style="padding:6px 8px;text-align:right;font-variant-numeric:tabular-nums">{mins_cell}</td>'
+            f'<td style="padding:6px 8px;text-align:right;font-variant-numeric:tabular-nums;color:#999">{pred:.1f}</td>'
+            f'<td style="padding:6px 8px;text-align:right;font-variant-numeric:tabular-nums">{actual_cell}</td>'
             f'</tr>' + chr(10)
         )
 
@@ -113,11 +244,9 @@ def _build_last_gw_html(last_gw):
     if last_gw.get('mean_actual') is not None:
         foot = (
             f'<tfoot><tr style="background:#16213e;color:#7fdbca;font-weight:600">'
-            f'<td style="padding:7px 12px" colspan="3">Mean</td>'
-            f'<td style="padding:7px 12px;text-align:right;font-variant-numeric:tabular-nums">{last_gw["mean_predicted"]:.1f}</td>'
-            f'<td style="padding:7px 12px;text-align:right;font-variant-numeric:tabular-nums">{last_gw["mean_actual"]:.1f}</td>'
-            f'<td style="padding:7px 12px;text-align:right;font-variant-numeric:tabular-nums;font-size:12px">'
-            f'{last_gw["mean_actual"] - last_gw["mean_predicted"]:+.1f}</td>'
+            f'<td style="padding:7px 12px" colspan="2">Mean</td>'
+            f'<td style="padding:7px 8px;text-align:right;font-variant-numeric:tabular-nums">{last_gw["mean_predicted"]:.1f}</td>'
+            f'<td style="padding:7px 8px;text-align:right;font-variant-numeric:tabular-nums">{last_gw["mean_actual"]:.1f}</td>'
             f'</tr></tfoot>'
         )
 
@@ -127,14 +256,13 @@ def _build_last_gw_html(last_gw):
     GW{last_gw["gameweek"]} Top 10 &mdash; Predicted vs Actual</h3>
   <p style="color:#777;text-align:center;margin:0 0 10px;font-size:11px">
     Last week&rsquo;s highest projected players and what they returned</p>
-  <table style="width:100%;border-collapse:collapse;font-size:13px;color:#ccc;background:#1a1a2e;border-radius:8px;overflow:hidden">
+  <table style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:13px;color:#ccc;background:#1a1a2e;border-radius:8px;overflow:hidden">
+    <colgroup><col style="width:50%"><col style="width:13%"><col style="width:15%"><col style="width:22%"></colgroup>
     <thead><tr style="background:#16213e;color:#7fdbca">
       <th style="padding:8px 12px;text-align:left">Player</th>
-      <th style="padding:8px 12px;text-align:left">Team</th>
-      <th style="padding:8px 12px;text-align:right">Min</th>
-      <th style="padding:8px 12px;text-align:right">Pred</th>
-      <th style="padding:8px 12px;text-align:right">Actual</th>
-      <th style="padding:8px 12px;text-align:right">+/-</th>
+      <th style="padding:8px;text-align:right">Min</th>
+      <th style="padding:8px;text-align:right">Pred</th>
+      <th style="padding:8px;text-align:right">Actual<br><span style="font-size:9px;font-weight:400">(+/-)</span></th>
     </tr></thead>
     <tbody>{body}</tbody>
     {foot}
@@ -142,11 +270,77 @@ def _build_last_gw_html(last_gw):
 </div>'''
 
 
+def _build_fixture_forecasts_html(predictions_per_fixture, gameweek=None):
+    """Build expected-score and team clean-sheet forecasts for each fixture."""
+    if predictions_per_fixture is None or not len(predictions_per_fixture):
+        return ''
+
+    required = {'team', 'opponent', 'is_home', 'pred_team_goals', 'pred_cs_prob'}
+    if not required.issubset(predictions_per_fixture.columns):
+        return ''
+
+    frame = predictions_per_fixture.copy()
+    frame['_home_flag'] = pd.to_numeric(frame['is_home'], errors='coerce')
+    if 'match_id' in frame:
+        grouped = frame.groupby('match_id', sort=False, dropna=False)
+    else:
+        frame['_fixture_key'] = frame.apply(
+            lambda r: '||'.join(sorted([str(r['team']), str(r['opponent'])])), axis=1)
+        grouped = frame.groupby('_fixture_key', sort=False, dropna=False)
+
+    fixtures = []
+    for _, group in grouped:
+        home = group[group['_home_flag'].eq(1)]
+        away = group[group['_home_flag'].eq(0)]
+        if home.empty or away.empty:
+            continue
+
+        def _summary(rows):
+            team = str(rows['team'].dropna().iloc[0])
+            goals = pd.to_numeric(rows['pred_team_goals'], errors='coerce').dropna()
+            cs = pd.to_numeric(rows['pred_cs_prob'], errors='coerce').dropna()
+            return {
+                'team': team,
+                'goals': float(goals.median()) if len(goals) else None,
+                'cs': float(cs.median()) if len(cs) else None,
+            }
+
+        kickoff = pd.to_datetime(group.get('match_date'), errors='coerce', utc=True).min() \
+            if 'match_date' in group else pd.NaT
+        fixtures.append({'home': _summary(home), 'away': _summary(away), 'kickoff': kickoff})
+
+    if not fixtures:
+        return ''
+    fixtures.sort(key=lambda f: f['kickoff'] if pd.notna(f['kickoff']) else pd.Timestamp.max.tz_localize('UTC'))
+
+    rows = []
+    for fixture in fixtures:
+        home, away = fixture['home'], fixture['away']
+        home_goals = '&mdash;' if home['goals'] is None else f'{home["goals"]:.2f}'
+        away_goals = '&mdash;' if away['goals'] is None else f'{away["goals"]:.2f}'
+        home_cs = '&mdash;' if home['cs'] is None else f'{100 * home["cs"]:.0f}%'
+        away_cs = '&mdash;' if away['cs'] is None else f'{100 * away["cs"]:.0f}%'
+        rows.append(f'''
+<div style="display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);gap:8px;align-items:center;padding:9px 10px;border-top:1px solid #21262d">
+  <div style="min-width:0;text-align:right"><div style="font-size:12px;color:#c9d1d9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{escape(home['team'])}</div><div style="font-size:10px;color:#8b949e">CS {home_cs}</div></div>
+  <div style="font-size:15px;font-weight:700;color:#7fdbca;font-variant-numeric:tabular-nums;white-space:nowrap">{home_goals} &ndash; {away_goals}</div>
+  <div style="min-width:0"><div style="font-size:12px;color:#c9d1d9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{escape(away['team'])}</div><div style="font-size:10px;color:#8b949e">CS {away_cs}</div></div>
+</div>''')
+
+    label = f'GW{gameweek} ' if gameweek else ''
+    return f'''
+<div style="max-width:620px;margin:32px auto 16px;padding:0 16px">
+  <h3 style="color:#e0e0e0;text-align:center;margin-bottom:4px;font-size:14px;font-weight:600">{label}Fixture Forecasts</h3>
+  <p style="color:#777;text-align:center;margin:0 0 10px;font-size:11px;line-height:1.4">Expected score uses each team&rsquo;s mean model goals. CS is the team probability before player-minute risk.</p>
+  <div style="background:#1a1a2e;border-radius:8px;overflow:hidden">{''.join(rows)}</div>
+</div>'''
+
+
 # Dot colours: DEF/MID/FWD match the ridge-plot legend so the two views agree.
 _POS_COLOR = {'GK': '#a371f7', 'DEF': '#3fb950', 'MID': '#58a6ff', 'FWD': '#d29922'}
 
 
-def _build_calibration_svg(calibration):
+def _build_calibration_svg(calibration, sample_note=None):
     """Render predicted-vs-actual calibration as overlaid line plots.
 
     One line per series (predicted mean, actual mean) across pred-points
@@ -224,6 +418,10 @@ def _build_calibration_svg(calibration):
         f'<text x="{W/2 + 48}" y="15" font-size="11" fill="#c9d1d9">Actual (mean)</text>'
     )
 
+    footnote = sample_note or (
+        'Each bucket aggregates test-set rows whose predicted FPL points (inc-bonus) '
+        'fall in that range. Well-calibrated &rArr; the two lines overlap.'
+    )
     return f'''
 <div style="margin:24px 0 0">
   <h3 style="color:#e0e0e0;text-align:center;margin-bottom:8px;font-size:14px;font-weight:600">Points Calibration: Predicted vs Actual by Bucket</h3>
@@ -237,7 +435,7 @@ def _build_calibration_svg(calibration):
       <text x="{W/2}" y="{H-4}" text-anchor="middle" font-size="11" fill="#8b949e">Predicted points bucket</text>
       <text x="14" y="{pad_t + plot_h/2}" text-anchor="middle" font-size="11" fill="#8b949e" transform="rotate(-90 14 {pad_t + plot_h/2})">Mean points</text>
     </svg>
-    <p style="font-size:11px;color:#8b949e;text-align:center;margin-top:6px">Each bucket aggregates test-set rows whose predicted FPL points (inc-bonus) fall in that range. Well-calibrated &rArr; the two lines overlap.</p>
+    <p style="font-size:11px;color:#8b949e;text-align:center;margin-top:6px">{footnote}</p>
   </div>
 </div>'''
 
@@ -508,6 +706,7 @@ def generate_distribution_html(
     d_style, d_body, d_script = _extract_for_template(_HTML_TEMPLATE)
     m_style, m_body, m_script = _extract_for_template(_MOBILE_TEMPLATE)
 
+    metrics = deepcopy(metrics)
     html = _RESPONSIVE_TEMPLATE
     html = html.replace('__DESKTOP_STYLE__', d_style)
     html = html.replace('__DESKTOP_BODY__', d_body)
@@ -518,7 +717,10 @@ def generate_distribution_html(
     html = html.replace('/*__DATA__*/null', json.dumps(data))
     html = html.replace('__N_SIMS__', f'{len(all_totals_flat[0]):,}')
     html = html.replace('<!--__LASTGW__-->', _build_last_gw_html(last_gw_review))
-    html = html.replace('<!--__METRICS__-->', _build_metrics_html(metrics))
+    html = html.replace('<!--__METRICS__-->', _build_metrics_html(
+        metrics, predictions, predictions_per_fixture, gameweek))
+    html = html.replace('<!--__FIXTURES__-->', _build_fixture_forecasts_html(
+        predictions_per_fixture, gameweek))
 
     Path(output_path).write_text(html, encoding='utf-8')
     print(f"Distribution visualization saved to: {output_path}")
@@ -894,8 +1096,9 @@ if (document.readyState === 'loading') {
 window.addEventListener('resize', render);
 </script>
 <div class="side-col">
-  <!--__LASTGW__-->
-  <!--__METRICS__-->
+<!--__LASTGW__-->
+<!--__METRICS__-->
+<!--__FIXTURES__-->
 </div>
 </body>
 </html>
@@ -921,7 +1124,9 @@ body{
   display:flex;justify-content:center;
 }
 .page{width:100%;max-width:560px;min-width:0}
-.page > div[style]{overflow-x:auto}
+.page > div[style]{width:100% !important;max-width:100% !important;overflow:hidden}
+.page table{table-layout:fixed}
+.page th,.page td{min-width:0;overflow-wrap:anywhere}
 .header{text-align:center;margin-bottom:14px}
 .header h1{font-size:18px;font-weight:700;color:#e6edf3}
 .header p{font-size:12px;color:#8b949e;margin-top:2px}
@@ -1031,6 +1236,7 @@ body{
   </select>
 </div>
 <div class="cards" id="cards"></div>
+<!--__FIXTURES__-->
 </div>
 
 <script src="https://d3js.org/d3.v7.min.js"></script>

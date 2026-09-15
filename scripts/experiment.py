@@ -38,6 +38,7 @@ def run_experiment(args):
         models=args.models,
         n_iter=args.trials,
         test_size=args.test_size,
+        test_last_n_gameweeks=args.test_last_gameweeks,
         use_subprocess=args.subprocess,
         description=args.desc,
     )
@@ -135,6 +136,8 @@ def main():
     parser.add_argument('--trials', '-t', type=int, default=100, help='Optuna trials per model')
     parser.add_argument('--models', '-m', nargs='+', default=None, help='Models to tune')
     parser.add_argument('--test-size', type=float, default=0.2, help='Test set fraction')
+    parser.add_argument('--test-last-gameweeks', type=int, default=10,
+                        help='Hold out the latest N gameweeks across seasons (default: 10)')
     parser.add_argument('--desc', '-d', type=str, default='', help='Experiment description')
     parser.add_argument('--subprocess', action='store_true', help='Use subprocess for tuning')
     parser.add_argument('--history', action='store_true', help='Show experiment history')
