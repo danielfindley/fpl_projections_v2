@@ -1617,23 +1617,25 @@ with open(r"{temp_result_path}", 'w') as f:
                     model_samples[name]['detail'] = detail
             if name == 'defcon':
                 pred_store[name]['dispersion_r'] = fitted[name].dispersion_r
-            if name in models:
-                metrics[name] = {
-                    'metric_name': 'Huber Loss' if name == 'minutes' else 'MAE' if name == 'saves' else 'Poisson Dev',
-                    'primary': self._loss(name, actual, predicted),
-                    'MAE': float(mean_absolute_error(actual, predicted))}
-        if 'clean_sheet' in models:
-            mask = teams['match_id'].isin(test['match_id'])
-            actual, predicted = teams.loc[mask, 'goals_conceded'].to_numpy(), against[mask]
-            clean_train = teams['match_id'].isin(train['match_id']) & teams['goals_conceded'].notna()
-            model_samples['clean_sheet'] = {
-                'train': int(clean_train.sum()),
-                'test': int(mask.sum()),
-                'unit': 'team-sides',
-            }
-            metrics['clean_sheet'] = {
-                'metric_name': 'Poisson Dev', 'primary': self._loss('clean_sheet', actual, predicted),
+            # ``models`` selects what gets retuned, not what gets evaluated.  A
+            # targeted retune still fits every dependency above and produces a
+            # complete set of holdout predictions, so retain every component
+            # metric for experiment history and the deployment report.
+            metrics[name] = {
+                'metric_name': 'Huber Loss' if name == 'minutes' else 'MAE' if name == 'saves' else 'Poisson Dev',
+                'primary': self._loss(name, actual, predicted),
                 'MAE': float(mean_absolute_error(actual, predicted))}
+        mask = teams['match_id'].isin(test['match_id'])
+        actual, predicted = teams.loc[mask, 'goals_conceded'].to_numpy(), against[mask]
+        clean_train = teams['match_id'].isin(train['match_id']) & teams['goals_conceded'].notna()
+        model_samples['clean_sheet'] = {
+            'train': int(clean_train.sum()),
+            'test': int(mask.sum()),
+            'unit': 'team-sides',
+        }
+        metrics['clean_sheet'] = {
+            'metric_name': 'Poisson Dev', 'primary': self._loss('clean_sheet', actual, predicted),
+            'MAE': float(mean_absolute_error(actual, predicted))}
         fitted['cards'] = CardsModel(**self.tuned_params.get('cards', {})).fit(train, verbose=False)
         fitted['bonus'] = BonusModel(n_simulations=self.n_sims).fit(train, verbose=False)
         test = self._predict_player_components(test, fitted)
@@ -2514,12 +2516,16 @@ with open(r"{temp_result_path}", 'w') as f:
             return None
 
         sub_rows = []
+        display_names = {
+            'clean_sheet': 'Clean Sheet',
+            'defcon': 'DefCon',
+        }
         for model_name, m in self.last_test_metrics.items():
             if model_name.startswith('_'):
                 continue
             if isinstance(m, dict) and 'metric_name' in m and 'primary' in m:
                 sub_rows.append({
-                    'model': model_name.capitalize(),
+                    'model': display_names.get(model_name, model_name.capitalize()),
                     'metric': m['metric_name'],
                     'score': f"{m['primary']:.4f}",
                 })
