@@ -242,19 +242,35 @@ class FotMobBrowser:
 
     def __enter__(self):
         print("Launching browser to solve Cloudflare challenge...")
-        self._driver = uc.Chrome(headless=False, version_main=_chrome_major_version())
-        self._driver.get("https://www.fotmob.com/")
-        time.sleep(5)  # let Turnstile auto-solve
+        cookies = []
+        try:
+            self._driver = uc.Chrome(headless=False, version_main=_chrome_major_version())
+            self._driver.get("https://www.fotmob.com/")
+            time.sleep(5)  # let Turnstile auto-solve
 
-        # Extract cookies for use with requests
-        cookies = self._driver.get_cookies()
-        user_agent = self._driver.execute_script('return navigator.userAgent')
+            # Extract cookies for use with requests
+            cookies = self._driver.get_cookies()
+            user_agent = self._driver.execute_script('return navigator.userAgent')
+            session_headers = {
+                'User-Agent': user_agent,
+                'Referer': 'https://www.fotmob.com/',
+            }
+        except Exception as exc:
+            print(
+                f"Browser session unavailable ({type(exc).__name__}); "
+                "trying direct FotMob API access..."
+            )
+            session_headers = {**HEADERS, 'Referer': 'https://www.fotmob.com/'}
+        finally:
+            if self._driver:
+                try:
+                    self._driver.quit()
+                except Exception:
+                    pass
+                self._driver = None
 
         self._session = requests.Session()
-        self._session.headers.update({
-            'User-Agent': user_agent,
-            'Referer': 'https://www.fotmob.com/',
-        })
+        self._session.headers.update(session_headers)
         for c in cookies:
             self._session.cookies.set(c['name'], c['value'], domain=c.get('domain', '.fotmob.com'))
 
@@ -263,11 +279,7 @@ class FotMobBrowser:
         if test.status_code == 200:
             print(f"Session established! ({len(cookies)} cookies)")
         else:
-            print(f"Warning: Cookie test returned {test.status_code}, scraping may fail")
-
-        # Close browser - we only needed it for cookies
-        self._driver.quit()
-        self._driver = None
+            test.raise_for_status()
 
         return self
 

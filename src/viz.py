@@ -120,7 +120,8 @@ def _build_metrics_html(metrics, predictions=None, predictions_per_fixture=None,
         for r in rows:
             if show_model:
                 if show_sample:
-                    sample = model_samples.get(str(r.get('model', '')).lower(), {})
+                    sample_key = str(r.get('model', '')).lower().replace(' ', '_')
+                    sample = model_samples.get(sample_key, {})
                     unit = escape(str(sample.get('unit', 'rows')))
                     detail = sample.get('detail')
                     detail_html = (
