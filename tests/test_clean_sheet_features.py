@@ -623,3 +623,26 @@ def test_explicit_registration_includes_predebut_and_excludes_departure():
     assert set(grid['gameweek']) == {1, 2, 3, 4}
     assert grid.loc[grid['gameweek'].eq(1), 'appeared'].eq(0).all()
     assert not grid['gameweek'].eq(5).any()
+
+
+def test_returning_player_spell_starts_at_club_first_fixture():
+    """An unused backup must carry this season's DNPs, not last season's minutes."""
+    from src.features import _compute_calendar_minutes_features
+    last = _dated_history(3)
+    this = _dated_history(5)
+    this['season'] = '2025/2026'
+    this['match_id'] += 100
+    this['match_date'] += pd.Timedelta(days=365)
+    # Player 1 (Alpha) sits out GW1-4, then appears in GW5. Player 3 (Beta) is new
+    # this season, so nothing places him at the club before his debut.
+    this = this[~(this['player_id'].eq(1) & this['gameweek'].le(4))]
+    last = last[~last['player_id'].eq(3)]
+    grid = _compute_calendar_minutes_features(pd.concat([last, this], ignore_index=True),
+                                              include_appeared=True, per_fixture=True)
+    returning = grid[grid['player_id'].eq(1) & grid['season'].eq('2025/2026')]
+    assert set(returning['gameweek']) == {1, 2, 3, 4, 5}
+    assert returning.loc[returning['gameweek'].le(4), 'appeared'].eq(0).all()
+    debut = returning[returning['gameweek'].eq(5)].iloc[0]
+    assert debut['last_minutes'] == 0 and debut['minutes_roll3'] == 0
+    newcomer = grid[grid['player_id'].eq(3) & grid['season'].eq('2025/2026')]
+    assert set(newcomer['gameweek']) == {1, 2, 3, 4, 5}  # appeared from GW1, unaffected

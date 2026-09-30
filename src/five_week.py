@@ -22,7 +22,7 @@ from .pipeline import FPL_POINTS
 
 
 ROLE_NAMES = ("Absent", "Sub appearance", "60-79 minutes", "80+ minutes")
-ROLE_COLORS = ("#64748b", "#f59e0b", "#38bdf8", "#34d399")
+ROLE_COLORS = ("#6e7681", "#f0883e", "#58a6ff", "#3fb950")
 DURABILITY_FEATURES = (
     "appear_rate_roll20",
     "starter_rate_roll20",
@@ -414,24 +414,7 @@ class FiveWeekForecaster:
             live_position.isin(["GK", "DEF", "MID", "FWD"]), cached_position
         )
         future = resolve_defcon_positions(future)
-        future["pred_exp_goals"] = p.models["goals"].predict(future)
-        future["pred_exp_assists"] = p.models["assists"].predict(future)
-        future["pred_defcon_prob"] = p.models["defcon"].predict_threshold_prob(
-            future, future["pred_minutes"]
-        )
-        future["pred_yellow_prob"] = p.models["cards"].predict_yellow_prob(
-            future, future["pred_minutes"].to_numpy()
-        )
-        future["pred_red_prob"] = p.models["cards"].predict_red_prob(
-            future, future["pred_minutes"].to_numpy()
-        )
-        future["pred_exp_saves"] = 0.0
-        gk = future["is_gk"] == 1
-        if gk.any():
-            future.loc[gk, "pred_exp_saves"] = p.models["saves"].predict_expected_saves(
-                future.loc[gk], future.loc[gk, "pred_minutes"].to_numpy()
-            )
-        future["pred_exp_defcon"] = p.models["defcon"].predict(future)
+        future = p._predict_player_components(future, p.models)
         future, draws = p._simulate_points(
             future, probability, self.role_model.state_minutes,
             n_simulations=self.n_sims, seed=self.seed + int(gameweek) * 1009)

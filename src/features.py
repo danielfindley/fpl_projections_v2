@@ -324,6 +324,21 @@ def _compute_calendar_minutes_features(df: pd.DataFrame,
                     records.append(dict(player_id=player, season=season, team=row['team'],
                                         start_date=row['match_date'], end_date=end_date))
             spells = pd.DataFrame(records)
+            # A player still at the club he ended last season with was there from its
+            # first fixture, not from his first appearance. Starting the spell at that
+            # appearance hides every early-season DNP, so an unused backup keeps last
+            # season's rolling minutes (Kepa, GW6 2026/27: roll5=90 after five benchings).
+            if not spells.empty:
+                spells = spells.sort_values(['player_id', 'start_date'], kind='stable').reset_index(drop=True)
+                year = spells['season'].str[:4].astype(int)
+                prev_season = (year - 1).astype(str) + '/' + year.astype(str)
+                last_team = spells.groupby(['player_id', 'season'])['team'].last()
+                prev_team = last_team.reindex(pd.MultiIndex.from_arrays([spells['player_id'], prev_season]))
+                opening = schedule.groupby(['team', 'season'])['match_date'].min()
+                season_start = opening.reindex(pd.MultiIndex.from_frame(spells[['team', 'season']]))
+                carried = (prev_team.to_numpy() == spells['team'].to_numpy()) \
+                    & ~spells.duplicated(['player_id', 'season']).to_numpy()
+                spells.loc[carried, 'start_date'] = season_start.to_numpy()[carried]
         spells = pd.DataFrame(spells)
         grids = []
         for _, spell in spells.iterrows():
