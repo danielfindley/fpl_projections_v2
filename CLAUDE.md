@@ -137,7 +137,7 @@ For agent-driven experimentation workflow, see `AGENTS.md`.
 **How it injects.** Three points, all at predict time:
 1. **`p_start` override** in `MinutesModel._blend` — the feed replaces the classifier's guess (0.95 in the XI, 0.10 benched). The two minute regressors are untouched; only the weight between them changes.
 2. **Cold-start cap bypass** for confirmed starters. `_apply_caps` pins GW1 players to `minutes_roll5 * 1.2` and binds on 168/419 rows; a published XI is better evidence than the heuristic it substitutes for.
-3. **`pred_appear_prob` scaling** from the status column — `OUT`/`SUS` → 0, `QUES` → `DOUBT_MULTIPLIER` (0.75).
+3. **`pred_appear_prob` zeroing** from the status column — `OUT`/`SUS` → 0. `QUES` is deliberately not applied: every QUES-flagged player appeared over GW1-5 2026/27.
 
 **Hedging is applied to minutes, not to `p_start`** (`lineup_weight=0.7`). `_sharpen(temp=0.3)` is nearly a step function, so blending probabilities collapses back to the feed's answer and gives no hedge — the whole range `p_in` 0.75–0.99 moves blended minutes by 1.6 min, while `lineup_weight` moves it by 23.5. **Tune the weight, not the probabilities.**
 
@@ -147,7 +147,7 @@ The surname test separates them. A club is safe to bench only if every unmatched
 
 **Names** come from the anchor `title` attribute (full name) plus a stable RotoWire id, never the abbreviated display text. `_fold()` extends `normalize_player_name` for letters NFD cannot decompose (ø, ß, æ, å, đ, ł) — without it Odegaard never matches Ødegaard.
 
-**Validation runs automatically.** `evaluate_snapshots()` fires inside `load_lineups()`, joins past snapshots to real FotMob minutes, and reports `P(started | predicted starter)`, `P(started | listed non-starter)` and `P(appeared | QUES)` — the three quantities `p_in`/`p_out`/`DOUBT_MULTIPLIER` are guessing at. Quiet until a gameweek completes.
+**Validation runs automatically.** `evaluate_snapshots()` fires inside `load_lineups()`, joins past snapshots to real FotMob minutes, and reports `P(started | predicted starter)`, `P(started | listed non-starter)` and `P(appeared | QUES)` — the first two are what `p_in`/`p_out` guess at; the third checks that ignoring QUES stays justified. Quiet until a gameweek completes.
 
 Snapshots go to `data/lineups/gw{N}_{timestamp}.csv`. RotoWire serves only the current slate, so **this history cannot be recovered later** — same constraint as prices. Scrape as late as possible before the deadline; late-kickoff fixtures are guesswork at deadline time.
 

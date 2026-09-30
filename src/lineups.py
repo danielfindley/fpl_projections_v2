@@ -27,12 +27,9 @@ _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 # Statuses that mean the player cannot feature at all, whatever the XI says.
 UNAVAILABLE = {'OUT', 'SUS'}
-# QUES is a doubt, not a ruling out: several players appear in an XI while flagged.
-# It scales P(appears) rather than P(starts) — the question is whether they feature,
-# not how long they last — and P(appears) is not put through _sharpen, so unlike
-# p_start the value here actually survives into the output. 0.75 mirrors FPL's own
-# "75% chance" convention and is a placeholder until evaluate_snapshots measures it.
-DOUBT_MULTIPLIER = 0.75
+# QUES is not applied: over GW1-5 2026/27 every QUES-flagged player appeared, so a
+# discount only removed points from players who then played. evaluate_snapshots
+# still reports P(appeared | QUES) in case that changes.
 
 def _fold(name) -> str:
     """Normalised name. Letter folding and hyphen splitting now live in
@@ -190,8 +187,7 @@ def evaluate_snapshots(actuals: pd.DataFrame, data_dir: str = 'data',
                   f"  (p_out currently 0.10)")
         q = ev[ev['status'] == 'QUES']
         if len(q):
-            print(f"    QUES -> appeared {q['appeared'].mean():.3f} "
-                  f"(DOUBT_MULTIPLIER currently {DOUBT_MULTIPLIER})")
+            print(f"    QUES -> appeared {q['appeared'].mean():.3f} (not applied)")
     return ev
 
 
@@ -307,8 +303,6 @@ def build_overrides(matched: pd.DataFrame, predictions: pd.DataFrame,
     unavailable = set(listed.loc[listed['status'].isin(UNAVAILABLE), 'matched_name'])
     unavailable |= set(xi.loc[xi['status'].isin(UNAVAILABLE), 'matched_name'])
 
-    doubtful = set(ok.loc[ok['status'] == 'QUES', 'matched_name'])
-
     p_start = np.full(len(predictions), np.nan)
     available = np.full(len(predictions), np.nan)
     teams = predictions['team'].map(normalize_team_name)
@@ -322,15 +316,12 @@ def build_overrides(matched: pd.DataFrame, predictions: pd.DataFrame,
             p_start[i] = p_in
         elif team in complete:
             p_start[i] = p_out
-        if name in doubtful:
-            available[i] = DOUBT_MULTIPLIER
 
     if verbose:
         n_partial = len(set(all_xi['team'].map(normalize_team_name)) - complete)
         print(f"  Lineup overrides: {int(np.sum(p_start == p_in))} starters, "
               f"{int(np.sum((p_start == p_out) & (available != 0.0)))} benched, "
               f"{int(np.nansum(available == 0.0))} unavailable, "
-              f"{int(np.sum(available == DOUBT_MULTIPLIER))} doubtful, "
               f"{int(np.sum(np.isnan(p_start)))} left to the model")
         if n_partial:
             print(f"    {n_partial} club(s) had an incomplete XI match — "
