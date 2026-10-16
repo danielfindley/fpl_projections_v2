@@ -8,9 +8,9 @@ class AssistsModel(BaseModel):
 
     FEATURES = [
         # Player xA/creativity
-        'xa_per90_roll1', 'xa_per90_roll2', 'xa_per90_roll3', 'xa_per90_roll5', 'xa_per90_roll7', 'xa_per90_roll10',
-        'key_passes_per90_roll1', 'key_passes_per90_roll2', 'key_passes_per90_roll3', 'key_passes_per90_roll5', 'key_passes_per90_roll7', 'key_passes_per90_roll10',
-        'assists_per90_roll1', 'assists_per90_roll2', 'assists_per90_roll3', 'assists_per90_roll5', 'assists_per90_roll7', 'assists_per90_roll10',
+        'xa_per90_roll1', 'xa_per90_roll2', 'xa_per90_roll3', 'xa_per90_roll5', 'xa_per90_roll7', 'xa_per90_roll10', 'xa_per90_roll30',
+        'key_passes_per90_roll1', 'key_passes_per90_roll2', 'key_passes_per90_roll3', 'key_passes_per90_roll5', 'key_passes_per90_roll7', 'key_passes_per90_roll10', 'key_passes_per90_roll30',
+        'assists_per90_roll1', 'assists_per90_roll2', 'assists_per90_roll3', 'assists_per90_roll5', 'assists_per90_roll7', 'assists_per90_roll10', 'assists_per90_roll30',
 
         # Recent form (raw count sums over window)
         'assists_last1', 'assists_roll1', 'assists_roll2', 'assists_roll3', 'assists_roll5', 'assists_roll7', 'assists_roll10',
@@ -19,8 +19,9 @@ class AssistsModel(BaseModel):
         'lifetime_assists_per90', 'lifetime_xa_per90',
 
         # Player centrality (share of team output)
-        'xg_share_roll1', 'xg_share_roll2', 'xg_share_roll3', 'xg_share_roll5', 'xg_share_roll7', 'xg_share_roll10',
-        'shot_share_roll1', 'shot_share_roll2', 'shot_share_roll3', 'shot_share_roll5', 'shot_share_roll7', 'shot_share_roll10',
+        'xg_share_roll1', 'xg_share_roll2', 'xg_share_roll3', 'xg_share_roll5', 'xg_share_roll7', 'xg_share_roll10', 'xg_share_roll30',
+        'npxg_share_roll1', 'npxg_share_roll2', 'npxg_share_roll3', 'npxg_share_roll5', 'npxg_share_roll7', 'npxg_share_roll10', 'npxg_share_roll30',
+        'shot_share_roll1', 'shot_share_roll2', 'shot_share_roll3', 'shot_share_roll5', 'shot_share_roll7', 'shot_share_roll10', 'shot_share_roll30',
 
         # Team context
         'team_goals_roll1', 'team_goals_roll2', 'team_goals_roll3', 'team_goals_roll5', 'team_goals_roll7', 'team_goals_roll10',

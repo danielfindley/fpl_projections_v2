@@ -11,6 +11,11 @@ from pathlib import Path
 # Standard rolling windows for player-level features
 ROLLING_WINDOWS = [1, 2, 3, 5, 7, 10]
 
+# Per-90 rates and output shares also get a 30-match window: a middle ground
+# between roll10 and the career profile, which still carries a player's
+# previous clubs and roles (e.g. penalty duty he no longer has).
+PLAYER_RATE_WINDOWS = ROLLING_WINDOWS + [30]
+
 # Manager embedding config
 MANAGER_EMB_DIM = 8
 MANAGER_EMB_WINDOW = 20
@@ -220,6 +225,8 @@ PER90_CAPS = {
     'goals_per90': 3.0,
     'assists_per90': 3.0,
     'xg_per90': 2.0,
+    'npxg_per90': 2.0,
+    'np_goals_per90': 3.0,
     'xa_per90': 1.5,
     'shots_per90': 8.0,
     'key_passes_per90': 6.0,
@@ -652,6 +659,13 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     df['minutes'] = pd.to_numeric(df['minutes'], errors='coerce').fillna(0)
     mins_90 = np.maximum(df['minutes'] / 90, 0.01)
 
+    # Non-penalty twins of xG and goals
+    if 'npxg' not in df.columns:
+        df['npxg'] = df['xg']
+    if 'penalty_goals' not in df.columns:
+        df['penalty_goals'] = 0
+    df['np_goals'] = (df['goals'] - df['penalty_goals'].fillna(0)).clip(lower=0)
+
     # Mask for games with enough minutes to compute meaningful per90
     sufficient_minutes = df['minutes'] >= MIN_MINUTES_FOR_PER90
 
@@ -661,7 +675,7 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
 
     # Per-90 rates for current game (targets)
     # Only compute for games with sufficient minutes, otherwise NaN (will be skipped in rolling)
-    for col in ['goals', 'assists', 'xg', 'xa', 'shots', 'key_passes']:
+    for col in ['goals', 'np_goals', 'assists', 'xg', 'npxg', 'xa', 'shots', 'key_passes']:
         if col in df.columns:
             per90_col = f'{col}_per90'
             # Compute raw per90
@@ -672,7 +686,7 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
                 df[per90_col] = df[per90_col].clip(upper=cap)
 
     # Rolling per-90 rates (shifted to avoid leakage)
-    for col in ['goals', 'assists', 'xg', 'xa', 'shots', 'key_passes']:
+    for col in ['goals', 'np_goals', 'assists', 'xg', 'npxg', 'xa', 'shots', 'key_passes']:
         if col not in df.columns:
             df[col] = 0
         per90_col = f'{col}_per90'
@@ -683,7 +697,7 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
                 cap = PER90_CAPS[f'{col}_per90']
                 df[per90_col] = df[per90_col].clip(upper=cap)
 
-        for window in ROLLING_WINDOWS:
+        for window in PLAYER_RATE_WINDOWS:
             df[f'{col}_per90_roll{window}'] = prior_exposure_rate(
                 df, 'player_id', col, window, PER90_CAPS.get(per90_col))
 
@@ -915,7 +929,7 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     df = df.sort_values(['player_id', 'match_date'], kind='stable').reset_index(drop=True)
 
     # Offensive stats
-    for stat in ['goals', 'assists', 'xg', 'xa', 'minutes', 'shots']:
+    for stat in ['goals', 'np_goals', 'assists', 'xg', 'npxg', 'xa', 'minutes', 'shots']:
         if stat in df.columns:
             df[f'lifetime_{stat}'] = prior_stat(df, 'player_id', stat, aggregation='sum')
 
@@ -936,7 +950,7 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     lifetime_mins_90 = np.maximum(df['lifetime_minutes'] / 90, 0.01)
 
     # Per-90 rates for lifetime stats (with caps)
-    for stat in ['goals', 'assists', 'xg', 'xa', 'shots']:
+    for stat in ['goals', 'np_goals', 'assists', 'xg', 'npxg', 'xa', 'shots']:
         if f'lifetime_{stat}' in df.columns:
             per90_col = f'lifetime_{stat}_per90'
             df[per90_col] = np.where(
@@ -996,7 +1010,7 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
         df['own_goal'] = 0
 
     team_stats = df.groupby(['team', 'season', 'gameweek', 'match_id']).agg({
-        'goals': 'sum', 'xg': 'sum', 'shots': 'sum', 'own_goal': 'sum'
+        'goals': 'sum', 'xg': 'sum', 'npxg': 'sum', 'shots': 'sum', 'own_goal': 'sum'
     }).reset_index()
 
     # Add opponent own goals to team goals (own goals by opponent count as goals for this team)
@@ -1009,7 +1023,7 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     else:
         team_stats['team_goals'] = team_stats['goals']
 
-    team_stats = team_stats.rename(columns={'xg': 'team_xg', 'shots': 'team_shots'})
+    team_stats = team_stats.rename(columns={'xg': 'team_xg', 'npxg': 'team_npxg', 'shots': 'team_shots'})
     team_stats = team_stats.drop(columns=['goals', 'own_goal'], errors='ignore')
     timing = df[['match_id', 'match_date', 'forecast_time', 'result_time']].drop_duplicates('match_id')
     team_stats = team_stats.merge(timing, on='match_id', validate='many_to_one')
@@ -1032,13 +1046,14 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
 
     # Merge raw per-match team totals for share computation
     df = df.merge(
-        team_stats[['team', 'season', 'gameweek', 'match_id', 'team_goals', 'team_xg', 'team_shots']],
+        team_stats[['team', 'season', 'gameweek', 'match_id', 'team_goals', 'team_xg', 'team_npxg', 'team_shots']],
         on=['team', 'season', 'gameweek', 'match_id'], how='left'
     )
 
     # Per-match share ratios (only for games with sufficient minutes and non-zero team totals)
     for player_col, team_col, share_name in [
         ('xg', 'team_xg', 'xg_share'),
+        ('npxg', 'team_npxg', 'npxg_share'),
         ('shots', 'team_shots', 'shot_share'),
         ('goals', 'team_goals', 'goal_share'),
     ]:
@@ -1049,13 +1064,13 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
         )
 
     # Rolling share features (shifted to prevent leakage)
-    for share_col in ['xg_share', 'shot_share', 'goal_share']:
-        for window in ROLLING_WINDOWS:
+    for share_col in ['xg_share', 'npxg_share', 'shot_share', 'goal_share']:
+        for window in PLAYER_RATE_WINDOWS:
             df[f'{share_col}_roll{window}'] = prior_stat(df, 'player_id', share_col, window, 'mean', 1)
 
     # Drop intermediate columns
-    df = df.drop(columns=['team_goals', 'team_xg', 'team_shots',
-                          'xg_share', 'shot_share', 'goal_share'], errors='ignore')
+    df = df.drop(columns=['team_goals', 'team_xg', 'team_npxg', 'team_shots',
+                          'xg_share', 'npxg_share', 'shot_share', 'goal_share'], errors='ignore')
 
     # =========================================================================
     # TEAM DEFENSIVE STATS (Goals Conceded, xGA)
@@ -1254,6 +1269,7 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     # =========================================================================
 
     df['xg_trend'] = df['xg_per90_roll3'] - df['xg_per90_roll10']
+    df['npxg_trend'] = df['npxg_per90_roll3'] - df['npxg_per90_roll10']
     df['goals_trend'] = df['goals_per90_roll3'] - df['goals_per90_roll10']
     df['xa_trend'] = df['xa_per90_roll3'] - df['xa_per90_roll10']
     df['assists_trend'] = df['assists_per90_roll3'] - df['assists_per90_roll10']
@@ -1265,14 +1281,17 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     # =========================================================================
 
     df['xg_overperformance_roll10'] = df['goals_per90_roll10'] - df['xg_per90_roll10']
-    df['xa_overperformance_roll10'] = df['assists_per90_roll10'] - df['xa_per90_roll10']
+    df['npxg_overperformance_roll10'] = df['np_goals_per90_roll10'] - df['npxg_per90_roll10']
     df['lifetime_xg_overperformance'] = df['lifetime_goals_per90'] - df['lifetime_xg_per90']
+    df['lifetime_npxg_overperformance'] = df['lifetime_np_goals_per90'] - df['lifetime_npxg_per90']
+    df['xa_overperformance_roll10'] = df['assists_per90_roll10'] - df['xa_per90_roll10']
 
     # =========================================================================
     # INTERACTION FEATURES (player ability x opponent weakness)
     # =========================================================================
 
     df['xg_x_opp_conceded'] = df['xg_per90_roll5'] * df['opp_conceded_roll5']
+    df['npxg_x_opp_conceded'] = df['npxg_per90_roll5'] * df['opp_conceded_roll5']
     df['xa_x_opp_conceded'] = df['xa_per90_roll5'] * df['opp_conceded_roll5']
     df['team_goals_x_opp_conceded'] = df['team_goals_roll5'] * df['opp_conceded_roll5']
     df['defcon_x_opp_xg'] = df['defcon_per90_roll5'] * df['opp_xg_roll5']

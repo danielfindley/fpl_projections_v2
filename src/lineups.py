@@ -229,9 +229,11 @@ def match_lineups(lineups: pd.DataFrame, predictions: pd.DataFrame,
             hits = [v for k, v in pool.items() if tokens <= set(k.split())]
             if len(hits) == 1:
                 return hits[0]
-            # surname alone, but only when unique within this club
+            # surname alone, but only when unique within this club. Compared
+            # against our surname only: any-token matching paired an OUT
+            # 'Conor Bradley' with starter 'Bradley Barcola' and zeroed him.
             last = key.split()[-1]
-            hits = [v for k, v in pool.items() if last in k.split()]
+            hits = [v for k, v in pool.items() if k.split()[-1:] == [last]]
             if len(hits) == 1:
                 return hits[0]
         else:

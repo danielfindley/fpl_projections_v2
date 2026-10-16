@@ -393,3 +393,22 @@ def test_bonus_simulation_scores_penalties_and_goalkeeper_saves_in_bps():
     np.testing.assert_array_equal(draws['penalty_goals'][:, 0], draws['goals'][:, 0])
     np.testing.assert_array_equal(draws['saves_inside_box'][:, 1], draws['saves'][:, 1])
     np.testing.assert_array_equal(draws['save_bps'][:, 1], 3 * draws['saves'][:, 1])
+
+
+def test_lineup_surname_fallback_matches_our_surname_only():
+    from src.lineups import match_lineups, build_overrides
+    predictions = pd.DataFrame({
+        'player_name': ['Bradley Barcola', 'Virgil van Dijk'],
+        'team': ['Liverpool', 'Liverpool'],
+    })
+    lineups = pd.DataFrame({
+        'team': ['Liverpool', 'Liverpool', 'Liverpool'],
+        'player_name': ['Bradley Barcola', 'Conor Bradley', 'Virgil van Dijk'],
+        'status': [np.nan, 'OUT', np.nan],
+        'is_predicted_starter': [True, False, True],
+    })
+    matched = match_lineups(lineups, predictions, verbose=False)
+    assert matched['matched_name'].tolist() == ['Bradley Barcola', None, 'Virgil van Dijk']
+    overrides = build_overrides(matched, predictions, verbose=False)
+    assert overrides['lineup_available'].isna().all()
+    assert overrides['lineup_p_start'].tolist() == [0.95, 0.95]

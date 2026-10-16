@@ -8,20 +8,24 @@ class GoalsModel(BaseModel):
 
     FEATURES = [
         # Player xG/shooting
-        'xg_per90_roll1', 'xg_per90_roll2', 'xg_per90_roll3', 'xg_per90_roll5', 'xg_per90_roll7', 'xg_per90_roll10',
-        'shots_per90_roll1', 'shots_per90_roll2', 'shots_per90_roll3', 'shots_per90_roll5', 'shots_per90_roll7', 'shots_per90_roll10',
-        'goals_per90_roll1', 'goals_per90_roll2', 'goals_per90_roll3', 'goals_per90_roll5', 'goals_per90_roll7', 'goals_per90_roll10',
+        'xg_per90_roll1', 'xg_per90_roll2', 'xg_per90_roll3', 'xg_per90_roll5', 'xg_per90_roll7', 'xg_per90_roll10', 'xg_per90_roll30',
+        'npxg_per90_roll1', 'npxg_per90_roll2', 'npxg_per90_roll3', 'npxg_per90_roll5', 'npxg_per90_roll7', 'npxg_per90_roll10', 'npxg_per90_roll30',
+        'shots_per90_roll1', 'shots_per90_roll2', 'shots_per90_roll3', 'shots_per90_roll5', 'shots_per90_roll7', 'shots_per90_roll10', 'shots_per90_roll30',
+        'goals_per90_roll1', 'goals_per90_roll2', 'goals_per90_roll3', 'goals_per90_roll5', 'goals_per90_roll7', 'goals_per90_roll10', 'goals_per90_roll30',
+        'np_goals_per90_roll1', 'np_goals_per90_roll2', 'np_goals_per90_roll3', 'np_goals_per90_roll5', 'np_goals_per90_roll7', 'np_goals_per90_roll10', 'np_goals_per90_roll30',
 
         # Recent form (raw count sums over window)
         'goals_last1', 'goals_roll1', 'goals_roll2', 'goals_roll3', 'goals_roll5', 'goals_roll7', 'goals_roll10',
 
         # Lifetime profile
         'lifetime_goals_per90', 'lifetime_xg_per90', 'lifetime_shots_per90',
+        'lifetime_np_goals_per90', 'lifetime_npxg_per90',
 
         # Player centrality (share of team output)
-        'xg_share_roll1', 'xg_share_roll2', 'xg_share_roll3', 'xg_share_roll5', 'xg_share_roll7', 'xg_share_roll10',
-        'shot_share_roll1', 'shot_share_roll2', 'shot_share_roll3', 'shot_share_roll5', 'shot_share_roll7', 'shot_share_roll10',
-        'goal_share_roll1', 'goal_share_roll2', 'goal_share_roll3', 'goal_share_roll5', 'goal_share_roll7', 'goal_share_roll10',
+        'xg_share_roll1', 'xg_share_roll2', 'xg_share_roll3', 'xg_share_roll5', 'xg_share_roll7', 'xg_share_roll10', 'xg_share_roll30',
+        'npxg_share_roll1', 'npxg_share_roll2', 'npxg_share_roll3', 'npxg_share_roll5', 'npxg_share_roll7', 'npxg_share_roll10', 'npxg_share_roll30',
+        'shot_share_roll1', 'shot_share_roll2', 'shot_share_roll3', 'shot_share_roll5', 'shot_share_roll7', 'shot_share_roll10', 'shot_share_roll30',
+        'goal_share_roll1', 'goal_share_roll2', 'goal_share_roll3', 'goal_share_roll5', 'goal_share_roll7', 'goal_share_roll10', 'goal_share_roll30',
 
         # Team context
         'team_goals_roll1', 'team_goals_roll2', 'team_goals_roll3', 'team_goals_roll5', 'team_goals_roll7', 'team_goals_roll10',
@@ -39,13 +43,14 @@ class GoalsModel(BaseModel):
         'opp_cs_rate_roll1', 'opp_cs_rate_roll2', 'opp_cs_rate_roll3', 'opp_cs_rate_roll5', 'opp_cs_rate_roll7', 'opp_cs_rate_roll10',
 
         # Interaction features (player ability x opponent weakness)
-        'xg_x_opp_conceded', 'team_goals_x_opp_conceded',
+        'xg_x_opp_conceded', 'npxg_x_opp_conceded', 'team_goals_x_opp_conceded',
 
         # Form trends (short-term vs medium-term momentum)
-        'xg_trend', 'goals_trend',
+        'xg_trend', 'npxg_trend', 'goals_trend',
 
         # xG over/underperformance (finishing quality / regression signal)
         'xg_overperformance_roll10', 'lifetime_xg_overperformance',
+        'npxg_overperformance_roll10', 'lifetime_npxg_overperformance',
 
         # Match-specific predicted team goals (from CleanSheetModel, leak-free OOF)
         'pred_team_goals',

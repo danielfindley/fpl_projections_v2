@@ -280,6 +280,25 @@ def test_rolling_per90_pools_minutes_exposure_and_remains_deadline_safe():
     assert changed_result.iloc[2] == result.iloc[2]
 
 
+def test_npxg_and_roll30_features_exclude_penalties(tmp_path):
+    from src.features import compute_rolling_features
+    raw = _dated_history(5)
+    raw['npxg'] = raw['xg'] - 0.1
+    raw['penalty_goals'] = raw['goals'].clip(upper=1)
+    raw.attrs['data_dir'] = str(tmp_path)
+    features = compute_rolling_features(raw, verbose=False)
+    row = features[features['player_id'].eq(1) & features['gameweek'].eq(5)].iloc[0]
+    prior = raw[raw['player_id'].eq(1) & raw['gameweek'].lt(5)]
+    minutes = prior['minutes'].sum()
+
+    assert row['xg_per90_roll30'] == pytest.approx(90 * prior['xg'].sum() / minutes)
+    assert row['npxg_per90_roll30'] == pytest.approx(90 * prior['npxg'].sum() / minutes)
+    np_goals = (prior['goals'] - prior['penalty_goals']).sum()
+    assert row['lifetime_np_goals_per90'] == pytest.approx(90 * np_goals / minutes)
+    assert row['lifetime_npxg_overperformance'] == pytest.approx(
+        row['lifetime_np_goals_per90'] - row['lifetime_npxg_per90'])
+
+
 def test_defcon_prefers_fpl_position_then_falls_back_to_fotmob(tmp_path):
     from src.features import compute_rolling_features
     raw = _dated_history(3)

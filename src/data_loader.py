@@ -110,6 +110,27 @@ def load_player_stats(data_dir: Path, verbose: bool = True) -> pd.DataFrame:
             # Old/minimal datasets may not carry the full shot-map schema.
             pass
     
+    # FotMob leaves xg_non-penalty NaN when a player's only shots were penalties
+    # (and when they had no shots). Rebuild it as xG minus shot-map penalty xG,
+    # which agrees with FotMob's own npxG on all but 3 of ~32k populated rows.
+    pen_xg = np.zeros(len(df))
+    if shotmap_file.exists() and {'match_id', 'player_id'} <= set(df.columns):
+        try:
+            pens = pd.read_csv(shotmap_file, usecols=['match_id', 'player_id', 'xG', 'situation'],
+                               on_bad_lines='skip')
+            pens = pens[pens['situation'].astype(str).str.casefold().eq('penalty')]
+            totals = pens.groupby([pd.to_numeric(pens['match_id'], errors='coerce'),
+                                   pd.to_numeric(pens['player_id'], errors='coerce')])['xG'].sum()
+            keys = pd.MultiIndex.from_arrays([
+                pd.to_numeric(df['match_id'], errors='coerce'),
+                pd.to_numeric(df['player_id'], errors='coerce'),
+            ])
+            pen_xg = totals.reindex(keys, fill_value=0).to_numpy()
+        except (OSError, ValueError, KeyError):
+            pass
+    npxg = pd.to_numeric(df['npxg'], errors='coerce') if 'npxg' in df.columns else pd.Series(np.nan, index=df.index)
+    df['npxg'] = npxg.fillna(pd.Series((df['xg'] - pen_xg).clip(lower=0), index=df.index))
+    
     n_dupes = n_before - len(df)
     
     if verbose:

@@ -3185,6 +3185,7 @@ with open(r"{temp_result_path}", 'w') as f:
         """
         df = df.copy()
         df['xg_x_opp_conceded'] = df['xg_per90_roll5'].fillna(0) * df['opp_conceded_roll5'].fillna(0)
+        df['npxg_x_opp_conceded'] = df['npxg_per90_roll5'].fillna(0) * df['opp_conceded_roll5'].fillna(0)
         df['xa_x_opp_conceded'] = df['xa_per90_roll5'].fillna(0) * df['opp_conceded_roll5'].fillna(0)
         df['team_goals_x_opp_conceded'] = df['team_goals_roll5'].fillna(0) * df['opp_conceded_roll5'].fillna(0)
         df['defcon_x_opp_xg'] = df['defcon_per90_roll5'].fillna(0) * df['opp_xg_roll5'].fillna(0)
