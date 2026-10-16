@@ -181,6 +181,15 @@ def main() -> int:
     pipeline.tuned_params = tuned_params
     pipeline.train(verbose=verbose)
 
+    # GW+1 uses the weekly minutes model, so give it the same RotoWire XI the
+    # weekly deploy saved. Reading the snapshot keeps this run read-only.
+    snapshots = sorted((ROOT / "data" / "lineups").glob(f"gw{gameweeks[0]}_*.csv"))
+    if snapshots:
+        pipeline.last_lineups = pd.read_csv(snapshots[-1])
+        print(f"GW{gameweeks[0]} lineups: {snapshots[-1].name}")
+    else:
+        print(f"GW{gameweeks[0]} lineups: no snapshot saved; minutes model only")
+
     live_availability = data_loader.get_fpl_availability()
     inclusive_availability = _inclusive_availability(live_availability)
     # `_build_test_set` normally drops 0%-chance players. The experiment retains

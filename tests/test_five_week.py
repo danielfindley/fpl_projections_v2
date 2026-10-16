@@ -412,3 +412,14 @@ def test_lineup_surname_fallback_matches_our_surname_only():
     overrides = build_overrides(matched, predictions, verbose=False)
     assert overrides['lineup_available'].isna().all()
     assert overrides['lineup_p_start'].tolist() == [0.95, 0.95]
+
+
+def test_gw1_display_roles_keep_weekly_mass_and_split_sixty_plus_by_horizon():
+    from src.five_week import weekly_display_roles
+    weekly = np.array([[.1, .2, .7], [1., 0., 0.]])
+    horizon = np.array([[.3, .1, .15, .45], [.5, .2, 0., 0.3]])
+    roles = weekly_display_roles(weekly, horizon)
+    np.testing.assert_allclose(roles.sum(axis=1), 1.)
+    np.testing.assert_allclose(roles[:, :2], weekly[:, :2])
+    np.testing.assert_allclose(roles[0, 2:], [.7 * .25, .7 * .75])
+    np.testing.assert_allclose(roles[1, 2:], [0., 0.])

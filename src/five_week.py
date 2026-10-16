@@ -305,6 +305,22 @@ def apply_live_availability(
     return out / out.sum(axis=1, keepdims=True)
 
 
+def weekly_display_roles(weekly_probability: np.ndarray,
+                         horizon_probability: np.ndarray) -> np.ndarray:
+    """Map the weekly model's absent / sub / 60+ onto the report's four roles.
+
+    The weekly model does not split 60+ into 60-79 and 80+, so that split (display
+    only) borrows the horizon model's own conditional P(80+ | 60+).
+    """
+    weekly = np.asarray(weekly_probability, dtype=float)
+    horizon = np.asarray(horizon_probability, dtype=float)
+    sixty_plus = horizon[:, 2] + horizon[:, 3]
+    share_80 = np.divide(horizon[:, 3], sixty_plus, out=np.full(len(horizon), .5),
+                         where=sixty_plus > 1e-12)
+    return np.column_stack([weekly[:, 0], weekly[:, 1],
+                            weekly[:, 2] * (1 - share_80), weekly[:, 2] * share_80])
+
+
 @dataclass
 class WeekForecast:
     predictions: pd.DataFrame
@@ -383,17 +399,30 @@ class FiveWeekForecaster:
             future.get("fpl_chance_of_playing", pd.Series(100, index=future.index)),
             horizon,
         )
+        state_minutes = self.role_model.state_minutes
+        seed = self.seed + int(gameweek) * 1009
+        if horizon == 1:
+            # Next fixture: identical to the weekly page (classifier + RotoWire
+            # lineups + live availability). The horizon model has no lineup input.
+            horizon_probability = probability
+            probability, state_minutes = p._weekly_minutes_distribution(future, verbose)
+            seed = self.seed
+            display = weekly_display_roles(probability, horizon_probability)
+        else:
+            display = probability
         for idx, name in enumerate(ROLE_NAMES):
-            future[f"role_prob_{idx}"] = probability[:, idx]
+            future[f"role_prob_{idx}"] = display[:, idx]
         future["pred_appear_prob"] = 1.0 - probability[:, 0]
-        unconditional_minutes = probability @ self.role_model.state_minutes
+        unconditional_minutes = (probability * np.broadcast_to(state_minutes, probability.shape)).sum(axis=1)
         future["pred_minutes_uncond"] = unconditional_minutes
         future["pred_minutes"] = np.divide(
             unconditional_minutes,
             future["pred_appear_prob"].to_numpy(),
             out=np.zeros(len(future), dtype=float),
             where=future["pred_appear_prob"].to_numpy() > 1e-8,
-        ).clip(1, 90)
+        )
+        if horizon > 1:
+            future["pred_minutes"] = future["pred_minutes"].clip(1, 90)
 
         cs, two_plus, against = p._predict_clean_sheet(future, gameweek, season, verbose)
         future["pred_cs_prob"] = cs
@@ -416,8 +445,7 @@ class FiveWeekForecaster:
         future = resolve_defcon_positions(future)
         future = p._predict_player_components(future, p.models)
         future, draws = p._simulate_points(
-            future, probability, self.role_model.state_minutes,
-            n_simulations=self.n_sims, seed=self.seed + int(gameweek) * 1009)
+            future, probability, state_minutes, n_simulations=self.n_sims, seed=seed)
         future = future.reset_index(drop=True)
         simulations = {i: draws["total_points"][:, i] for i in range(len(future))}
         return WeekForecast(future, simulations)

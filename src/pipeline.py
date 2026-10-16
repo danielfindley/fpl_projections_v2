@@ -2249,28 +2249,7 @@ with open(r"{temp_result_path}", 'w') as f:
             print("WARNING: No players found for prediction")
             return pd.DataFrame()
         
-        # Predicted lineups, when supplied, answer the one question the model is
-        # worst at: who actually starts. Everything downstream consumes pred_minutes
-        # as a feature, so correcting it here propagates through goals, assists,
-        # defcon, saves and bonus without any of them changing.
-        lineup_p_start, lineup_available = None, None
-        if getattr(self, 'last_lineups', None) is not None:
-            from .lineups import match_lineups, build_overrides
-            matched = match_lineups(self.last_lineups, test_df, verbose=verbose)
-            ov = build_overrides(matched, test_df, verbose=verbose)
-            lineup_p_start = ov['lineup_p_start'].values
-            lineup_available = ov['lineup_available'].values
-
-        # Combine history and lineup priors as joint role probabilities.
-        # Live availability is applied once, after lineup evidence.
-        appear = (self.models['minutes'].predict_appear_proba(test_df)
-                  if self.models['minutes'].appear_is_fitted else np.ones(len(test_df)))
-        available = pd.to_numeric(test_df.get('fpl_chance_of_playing',
-            pd.Series(100, index=test_df.index)), errors='coerce').fillna(100).to_numpy() / 100.
-        if lineup_available is not None:
-            available *= np.where(np.isfinite(lineup_available), lineup_available, 1.)
-        probability, state_minutes = self.models['minutes'].predict_distribution(
-            test_df, lineup_p_start=lineup_p_start, appear_prob=appear, availability=available)
+        probability, state_minutes = self._weekly_minutes_distribution(test_df, verbose)
         test_df['pred_appear_prob'] = 1 - probability[:, 0]
         test_df['pred_minutes'] = np.divide(
             (probability * state_minutes).sum(axis=1), test_df['pred_appear_prob'],
@@ -2575,6 +2554,31 @@ with open(r"{temp_result_path}", 'w') as f:
             'calibration': calibration,
             'sample_info': sample_info,
         }
+
+    def _weekly_minutes_distribution(self, test_df: pd.DataFrame, verbose: bool = True):
+        """Next-fixture role probabilities and state minutes, as used by predict()."""
+        # Predicted lineups, when supplied, answer the one question the model is
+        # worst at: who actually starts. Everything downstream consumes pred_minutes
+        # as a feature, so correcting it here propagates through goals, assists,
+        # defcon, saves and bonus without any of them changing.
+        lineup_p_start, lineup_available = None, None
+        if getattr(self, 'last_lineups', None) is not None:
+            from .lineups import match_lineups, build_overrides
+            matched = match_lineups(self.last_lineups, test_df, verbose=verbose)
+            ov = build_overrides(matched, test_df, verbose=verbose)
+            lineup_p_start = ov['lineup_p_start'].values
+            lineup_available = ov['lineup_available'].values
+
+        # Combine history and lineup priors as joint role probabilities.
+        # Live availability is applied once, after lineup evidence.
+        appear = (self.models['minutes'].predict_appear_proba(test_df)
+                  if self.models['minutes'].appear_is_fitted else np.ones(len(test_df)))
+        available = pd.to_numeric(test_df.get('fpl_chance_of_playing',
+            pd.Series(100, index=test_df.index)), errors='coerce').fillna(100).to_numpy() / 100.
+        if lineup_available is not None:
+            available *= np.where(np.isfinite(lineup_available), lineup_available, 1.)
+        return self.models['minutes'].predict_distribution(
+            test_df, lineup_p_start=lineup_p_start, appear_prob=appear, availability=available)
 
     def load_lineups(self, gameweek: int = None, season: str = '2026/2027',
                      snapshot: bool = True, html: str = None,
