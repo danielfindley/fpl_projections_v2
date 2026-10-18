@@ -62,6 +62,7 @@ class AssistsModel(BaseModel):
     ]
 
     TARGET = 'assists'
+    EXPOSURE_OFFSET = True
 
     def __init__(self, **xgb_params):
         xgb_params.setdefault('objective', 'count:poisson')

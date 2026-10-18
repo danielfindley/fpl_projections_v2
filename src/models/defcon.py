@@ -59,6 +59,7 @@ class DefconModel(BaseModel):
     ]
 
     TARGET = 'defcon'
+    EXPOSURE_OFFSET = True
 
     def __init__(self, **xgb_params):
         # Existing tuned-parameter files remain loadable, but their position

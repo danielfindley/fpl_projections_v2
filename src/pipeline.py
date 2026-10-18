@@ -69,6 +69,12 @@ def _tune_worker(data_dir, name, n_iter, verbose, frame, params):
     return pipeline._tune_in_process([name], n_iter, verbose, frame)
 
 
+# Neural share of each event model's expectation, blended with XGBoost
+# (src/models/sequence.py EventBlend). 0 keeps the XGBoost model alone and skips
+# the neural fit. Off since the per-90 offset rate models (see CLAUDE.md).
+NEURAL_EVENT_WEIGHTS = {'goals': 0., 'assists': 0., 'defcon': 0., 'saves': 0.}
+
+
 class FPLPipeline:
     """Complete FPL prediction pipeline."""
     
@@ -83,6 +89,7 @@ class FPLPipeline:
         self.fpl_positions = {}
         self.current_season_players = set()  # Track players in current season
         self.n_sims = n_sims
+        self.neural_event_weights = dict(NEURAL_EVENT_WEIGHTS)
     
     def load_data(self, verbose: bool = True) -> 'FPLPipeline':
         """Load and merge all data."""
@@ -262,7 +269,20 @@ class FPLPipeline:
         self.models['saves'] = SavesModel(**saves_params)
         self.models['saves'].fit(self.df, verbose)
 
+        self.models = self._with_neural_events(self.models, self.df, verbose)
         return self
+
+    def _with_neural_events(self, fitted, train, verbose=False):
+        """Blend neural per-90 event rates into the fitted XGBoost event models."""
+        weights = {name: w for name, w in self.neural_event_weights.items() if w > 0}
+        if not weights:
+            return fitted
+        from .models.sequence import EventBlend, NeuralPlayerModel
+        # History tokens are cut at each row's own deadline, so the full pool is leak-free.
+        pool = chronological_frame(self.df[self.df['minutes'] >= 1].copy())
+        player = NeuralPlayerModel(verbose=verbose).fit(pool, train)
+        return {**fitted, **{name: EventBlend(player, fitted[name], name, w, train)
+                             for name, w in weights.items()}}
     
     @staticmethod
     def _model_class(name):
@@ -557,6 +577,7 @@ class FPLPipeline:
         from sklearn.metrics import make_scorer, mean_poisson_deviance
         import xgboost as xgb
         from .feature_selection import compute_feature_rankings, select_features
+        from .models.base import ExposureXGBRegressor, log_exposure
 
         optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -740,6 +761,10 @@ class FPLPipeline:
 
             X_full = tune_df[all_features].fillna(0).values
             y = tune_df[target].fillna(0).values
+            # Rate models tune with their offset: fit on actual, score on predicted minutes.
+            exposure = (np.column_stack([log_exposure(tune_df['minutes']),
+                                         log_exposure(tune_df['pred_minutes'])])
+                        if getattr(model_class, 'EXPOSURE_OFFSET', False) else None)
 
             if verbose:
                 print(f"\nTuning {model_name.upper()} ({n_iter} trials, TimeSeriesSplit CV, {score_name})...")
@@ -754,7 +779,8 @@ class FPLPipeline:
 
             # Optuna tunes hyperparams + feature selection jointly
             def objective(trial, _rankings=rankings, _all_features=all_features,
-                          _protected=protected, _min_feats=min_feats, _n_total=n_total_features):
+                          _protected=protected, _min_feats=min_feats, _n_total=n_total_features,
+                          _exposure=exposure):
                 params = {
                     'n_estimators': trial.suggest_int('n_estimators', space['n_estimators'][0], space['n_estimators'][1]),
                     'max_depth': trial.suggest_int('max_depth', space['max_depth'][0], space['max_depth'][1]),
@@ -781,7 +807,11 @@ class FPLPipeline:
                 feat_idx = [_all_features.index(f) for f in selected]
                 X_sel = X_full[:, feat_idx]
 
-                model = xgb.XGBRegressor(**params)
+                if _exposure is not None:
+                    model = ExposureXGBRegressor(**params)
+                    X_sel = np.column_stack([X_sel, _exposure])
+                else:
+                    model = xgb.XGBRegressor(**params)
                 scores = cross_val_score(model, X_sel, y, cv=tscv, scoring=scorer, n_jobs=1)
                 return -scores.mean()
 
@@ -1322,6 +1352,7 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 sys.path.insert(0, r"{self.data_dir.parent}")
 from src.models import GoalsModel, AssistsModel, MinutesModel, DefconModel, SavesModel
+from src.models.base import ExposureXGBRegressor, log_exposure
 from src.feature_selection import compute_feature_rankings, select_features
 
 def huber_loss(y_true, y_pred, delta=10.0):
@@ -1447,6 +1478,9 @@ elif model_name == 'defcon':
 
 X_full = df_train[all_features].fillna(0).values
 y = df_train[target].fillna(0).values
+# Rate models tune with their offset: fit on actual, score on predicted minutes.
+exposure = (np.column_stack([log_exposure(df_train['minutes']), log_exposure(df_train['pred_minutes'])])
+            if getattr(model_class, 'EXPOSURE_OFFSET', False) else None)
 
 tscv = TimeSeriesSplit(n_splits=5)
 
@@ -1483,7 +1517,11 @@ def objective(trial):
     feat_idx = [all_features.index(f) for f in selected]
     X_sel = X_full[:, feat_idx]
 
-    model = xgb.XGBRegressor(**params)
+    if exposure is not None:
+        model = ExposureXGBRegressor(**params)
+        X_sel = np.column_stack([X_sel, exposure])
+    else:
+        model = xgb.XGBRegressor(**params)
     scores = cross_val_score(model, X_sel, y, cv=tscv, scoring=scorer, n_jobs=1)
     return -scores.mean()
 
@@ -1570,9 +1608,10 @@ with open(r"{temp_result_path}", 'w') as f:
         test['pred_team_goals'] = self._map_team_prediction(test, teams, against, opponent=True)
         test['pred_cs_prob'] = np.exp(-test['pred_goals_against'])
         metrics, pred_store, model_samples = {}, {}, {}
+        for name in ('goals', 'assists', 'defcon', 'saves'):
+            fitted[name] = self._fit_model(name, train, self.tuned_params.get(name, {}))
+        fitted = self._with_neural_events(fitted, train)
         for name in ('minutes', 'goals', 'assists', 'defcon', 'saves'):
-            if name != 'minutes':
-                fitted[name] = self._fit_model(name, train, self.tuned_params.get(name, {}))
             if name == 'saves':
                 target_rows = test[test['is_gk'] == 1]
             elif name == 'defcon':

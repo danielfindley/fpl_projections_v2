@@ -52,6 +52,9 @@ class GoalsModel(BaseModel):
         'xg_overperformance_roll10', 'lifetime_xg_overperformance',
         'npxg_overperformance_roll10', 'lifetime_npxg_overperformance',
 
+        # Penalty duty (goals include penalties; the npxG rates above do not)
+        'pen_xg_per90_roll10', 'pen_xg_per90_roll30', 'lifetime_pen_xg_per90', 'pen_share_roll30',
+
         # Match-specific predicted team goals (from CleanSheetModel, leak-free OOF)
         'pred_team_goals',
 
@@ -67,6 +70,7 @@ class GoalsModel(BaseModel):
     ]
 
     TARGET = 'goals'
+    EXPOSURE_OFFSET = True
 
     def __init__(self, **xgb_params):
         xgb_params.setdefault('objective', 'count:poisson')

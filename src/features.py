@@ -665,6 +665,9 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     if 'penalty_goals' not in df.columns:
         df['penalty_goals'] = 0
     df['np_goals'] = (df['goals'] - df['penalty_goals'].fillna(0)).clip(lower=0)
+    # Penalty xG marks penalty duty, a team role the non-penalty rates cannot see:
+    # goals track xG including penalties, so takers were under-predicted.
+    df['pen_xg'] = (df['xg'] - df['npxg']).clip(lower=0)
 
     # Mask for games with enough minutes to compute meaningful per90
     sufficient_minutes = df['minutes'] >= MIN_MINUTES_FOR_PER90
@@ -929,7 +932,7 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     df = df.sort_values(['player_id', 'match_date'], kind='stable').reset_index(drop=True)
 
     # Offensive stats
-    for stat in ['goals', 'np_goals', 'assists', 'xg', 'npxg', 'xa', 'minutes', 'shots']:
+    for stat in ['goals', 'np_goals', 'assists', 'xg', 'npxg', 'pen_xg', 'xa', 'minutes', 'shots']:
         if stat in df.columns:
             df[f'lifetime_{stat}'] = prior_stat(df, 'player_id', stat, aggregation='sum')
 
@@ -950,7 +953,7 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     lifetime_mins_90 = np.maximum(df['lifetime_minutes'] / 90, 0.01)
 
     # Per-90 rates for lifetime stats (with caps)
-    for stat in ['goals', 'np_goals', 'assists', 'xg', 'npxg', 'xa', 'shots']:
+    for stat in ['goals', 'np_goals', 'assists', 'xg', 'npxg', 'pen_xg', 'xa', 'shots']:
         if f'lifetime_{stat}' in df.columns:
             per90_col = f'lifetime_{stat}_per90'
             df[per90_col] = np.where(
@@ -1284,6 +1287,16 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     df['npxg_overperformance_roll10'] = df['np_goals_per90_roll10'] - df['npxg_per90_roll10']
     df['lifetime_xg_overperformance'] = df['lifetime_goals_per90'] - df['lifetime_xg_per90']
     df['lifetime_npxg_overperformance'] = df['lifetime_np_goals_per90'] - df['lifetime_npxg_per90']
+
+    # Penalty duty: recent penalty xG per 90, and the player's share of his
+    # team's penalty xG over his last 30 appearances (a taker sits near 1).
+    for window in (10, 30):
+        df[f'pen_xg_per90_roll{window}'] = prior_exposure_rate(df, 'player_id', 'pen_xg', window)
+    df['_team_pen_xg'] = df.groupby(['match_id', 'team'])['pen_xg'].transform('sum')
+    team_pen = prior_stat(df, 'player_id', '_team_pen_xg', 30, 'sum')
+    df['pen_share_roll30'] = (prior_stat(df, 'player_id', 'pen_xg', 30, 'sum')
+                              / team_pen.where(team_pen > 0))
+    df = df.drop(columns=['_team_pen_xg'])
     df['xa_overperformance_roll10'] = df['assists_per90_roll10'] - df['xa_per90_roll10']
 
     # =========================================================================

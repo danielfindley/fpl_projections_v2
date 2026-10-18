@@ -665,3 +665,32 @@ def test_returning_player_spell_starts_at_club_first_fixture():
     assert debut['last_minutes'] == 0 and debut['minutes_roll3'] == 0
     newcomer = grid[grid['player_id'].eq(3) & grid['season'].eq('2025/2026')]
     assert set(newcomer['gameweek']) == {1, 2, 3, 4, 5}  # appeared from GW1, unaffected
+
+
+def test_rate_models_scale_with_predicted_minutes_and_tune_with_the_same_offset():
+    from src.models import GoalsModel
+    from src.models.base import ExposureXGBRegressor, log_exposure
+    rng = np.random.default_rng(0)
+    n = 4000
+    minutes = rng.choice([15, 30, 60, 90], n)
+    skill = rng.uniform(.1, .8, n)
+    frame = pd.DataFrame({'minutes': minutes, 'pred_minutes': minutes, 'xg_per90_roll10': skill,
+                          'goals': rng.poisson(skill * minutes / 90)})
+    model = GoalsModel(selected_features=['xg_per90_roll10'], n_estimators=60, max_depth=2,
+                       n_jobs=1).fit(frame, verbose=False)
+
+    probe = pd.DataFrame({'xg_per90_roll10': [.5] * 3, 'pred_minutes': [90., 45., 15.]})
+    expected = model.predict(probe)
+    # A rate: halving predicted minutes halves expected goals.
+    np.testing.assert_allclose(expected[1] / expected[0], .5, rtol=1e-6)
+    np.testing.assert_allclose(expected[2] / expected[0], 1 / 6, rtol=1e-6)
+    np.testing.assert_allclose(expected[0], .5, atol=.08)
+
+    # The tuning twin fits on actual minutes and predicts on pred_minutes.
+    X = np.column_stack([frame[['xg_per90_roll10']].to_numpy(), log_exposure(frame['minutes']),
+                         log_exposure(frame['pred_minutes'])])
+    twin = ExposureXGBRegressor(objective='count:poisson', n_estimators=60, max_depth=2,
+                                learning_rate=.08, min_child_weight=3, random_state=42,
+                                n_jobs=1).fit(X, frame['goals'])
+    probe_X = np.column_stack([[.5] * 3, log_exposure([90] * 3), log_exposure([90, 45, 15])])
+    np.testing.assert_allclose(twin.predict(probe_X), expected, rtol=1e-5)
