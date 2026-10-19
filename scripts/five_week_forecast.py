@@ -66,7 +66,12 @@ def _season_and_gameweeks(count: int = 5) -> tuple[str, list[int]]:
         "https://fantasy.premierleague.com/api/fixtures/", timeout=20
     ).json()
     fixture_gws = sorted({int(f["event"]) for f in fixtures if f.get("event") is not None})
-    unfinished = [int(event["id"]) for event in bootstrap_events if not event.get("finished")]
+    # FPL flags a gameweek finished only after bonus is confirmed, often a day
+    # after the last match; a gameweek whose fixtures have all been played is done.
+    played = {gw for gw in fixture_gws
+              if all(f.get("finished_provisional") for f in fixtures if f.get("event") == gw)}
+    unfinished = [int(event["id"]) for event in bootstrap_events
+                  if not event.get("finished") and int(event["id"]) not in played]
     if not unfinished:
         raise RuntimeError("No unfinished FPL gameweeks remain")
     start = min(unfinished)
