@@ -251,6 +251,21 @@ def _build_last_gw_html(last_gw):
             f'</tr></tfoot>'
         )
 
+    mae_note = ''
+    if last_gw.get('played_mae') is not None:
+        gws = last_gw['season_gameweeks']
+        span = f'GW{gws[0]}' if len(gws) == 1 else f'GW{gws[0]}&ndash;{gws[-1]}'
+        mae_note = (
+            f'<p style="color:#ccc;text-align:center;margin:10px 0 0;font-size:12px">'
+            f'MAE, all predicted players with 1+ min: '
+            f'<span style="color:#7fdbca;font-weight:600">GW{last_gw["gameweek"]} {last_gw["played_mae"]:.2f}</span>'
+            f' &middot; <span style="color:#7fdbca;font-weight:600">season avg {last_gw["season_played_mae"]:.2f}</span>'
+            f' <span style="color:#777">({span})</span></p>'
+            f'<p style="color:#777;text-align:center;margin:2px 0 0;font-size:10px">'
+            f'Graded on the projections published before each deadline, bonus included '
+            f'({last_gw["played_n"]} players)</p>'
+        )
+
     return f'''
 <div style="max-width:620px;margin:32px auto 16px;padding:0 16px">
   <h3 style="color:#e0e0e0;text-align:center;margin-bottom:4px;font-size:14px;font-weight:600">
@@ -268,6 +283,7 @@ def _build_last_gw_html(last_gw):
     <tbody>{body}</tbody>
     {foot}
   </table>
+  {mae_note}
 </div>'''
 
 

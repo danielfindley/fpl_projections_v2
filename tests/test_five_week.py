@@ -423,3 +423,29 @@ def test_gw1_display_roles_keep_weekly_mass_and_split_sixty_plus_by_horizon():
     np.testing.assert_allclose(roles[:, :2], weekly[:, :2])
     np.testing.assert_allclose(roles[0, 2:], [.7 * .25, .7 * .75])
     np.testing.assert_allclose(roles[1, 2:], [0., 0.])
+
+
+def test_review_grades_the_last_pre_deadline_run_and_matches_names_unambiguously(tmp_path):
+    import json
+    from datetime import datetime, timezone
+    from src.pipeline import FPLPipeline
+
+    pipeline = FPLPipeline(str(tmp_path))
+    deadline = datetime(2026, 10, 17, 10, 0, tzinfo=timezone.utc)
+    for name, saved in (('gw7_a', deadline.replace(day=15)), ('gw7_b', deadline.replace(day=16)),
+                        ('gw7_c', deadline.replace(day=18))):
+        run = tmp_path / 'runs' / name
+        run.mkdir(parents=True)
+        (run / 'predictions.csv').write_text('player_name\n')
+        local = saved.astimezone().replace(tzinfo=None).isoformat()
+        (run / 'meta.json').write_text(json.dumps({'season': '2026/2027', 'timestamp': local}))
+    assert pipeline._pre_deadline_run(7, '2026/2027', deadline).name == 'gw7_b'
+    assert pipeline._pre_deadline_run(7, '2025/2026', deadline) is None
+
+    act = pd.DataFrame({
+        'player_name': ['Gabriel Martinelli Silva',
+                        'António João Pereira de Albuquerque Tavares da Silva', 'Bruno Borges Fernandes'],
+        'web_name': ['Martinelli', 'Silva', 'B.Fernandes'],
+    })
+    hits = FPLPipeline._match_fpl_actuals(['António Silva', 'Bruno Fernandes', 'Silva Junior'], act)
+    assert hits == [1, 2, None]

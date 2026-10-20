@@ -178,7 +178,7 @@ Prices exist **only in the FPL API** (`bootstrap-static` → `now_cost`, in tent
 - D3.js ridge plot showing Monte Carlo points distributions for top outfield players
 - Exact evaluation-vs-final-training sample descriptions
 - Sub-model metrics with train/test counts, overall FPL points metrics, and calibration using the same holdout sample
-- Previous-GW top 10 predicted-vs-actual table with minutes and deltas
+- Previous-GW top 10 predicted-vs-actual table with minutes and deltas, plus played-only MAE (all predicted players with 1+ min, bonus included) for that GW and the season average of per-GW MAEs. Every GW is graded on its last run saved before the FPL deadline (`_pre_deadline_run`), never a post-deadline rerun, which can see published lineups; names are matched to FPL actuals unambiguously only (`_match_fpl_actuals`)
 - Upcoming fixture mean-score table with both teams' clean-sheet odds
 - Responsive layout — desktop ridge plot and mobile card layout are both embedded; the correct one is selected at load time based on viewport width
 

@@ -2439,66 +2439,105 @@ with open(r"{temp_result_path}", 'w') as f:
 
         return result
 
-    def get_last_gw_review(self, gameweek: int, season: str, top_n: int = 10):
-        """Top-N predicted players from the previous gameweek, with what they actually scored.
+    def _pre_deadline_run(self, gameweek: int, season: str, deadline):
+        """Latest saved run for ``gameweek`` written before its FPL deadline, or None.
 
-        Reads the most recent saved run for ``gameweek - 1`` and joins the FPL
-        actuals cache. Returns None when there is no prior run or no actuals yet
-        (e.g. a season opener, or before the gameweek has been scored).
+        Reruns after the deadline can see published lineups, so only the run that
+        was actually live at the deadline is graded.
         """
-        import unicodedata
+        import json
+        from datetime import datetime, timezone
+
+        runs_dir = self.data_dir / 'runs'
+        best, best_time = None, None
+        for run in runs_dir.glob(f'gw{int(gameweek)}_*') if runs_dir.exists() else []:
+            meta_file = run / 'meta.json'
+            if not (meta_file.exists() and (run / 'predictions.csv').exists()):
+                continue
+            meta = json.loads(meta_file.read_text(encoding='utf-8'))
+            if meta.get('season') != season:
+                continue
+            # meta timestamps are naive local time
+            saved = datetime.fromisoformat(meta['timestamp']).astimezone(timezone.utc)
+            if saved < deadline and (best_time is None or saved > best_time):
+                best, best_time = run, saved
+        return best
+
+    @staticmethod
+    def _match_fpl_actuals(names, act):
+        """Map player names to rows of one gameweek's FPL actuals.
+
+        Full name, then web_name, then a token-subset match for FPL's middle names;
+        a key that resolves to more than one player is left unmatched.
+        """
+        full, web = {}, {}
+        for i, r in act.iterrows():
+            full.setdefault(normalize_player_name(r['player_name']), []).append(i)
+            web.setdefault(normalize_player_name(r.get('web_name')), []).append(i)
+
+        def lookup(name):
+            key = normalize_player_name(name)
+            if not key:
+                return None
+            for table in (full, web):
+                if len(table.get(key, [])) == 1:
+                    return table[key][0]
+            tokens = set(key.split())
+            if len(tokens) >= 2:
+                hits = [v[0] for k, v in full.items() if tokens <= set(k.split()) and len(v) == 1]
+                if len(hits) == 1:
+                    return hits[0]
+            return None
+
+        return [lookup(n) for n in names]
+
+    def get_last_gw_review(self, gameweek: int, season: str, top_n: int = 10):
+        """Previous gameweek's top-N predicted players vs what they scored, plus
+        played-only MAE for that gameweek and the season so far.
+
+        Every gameweek is graded on the last run saved before its FPL deadline.
+        MAE covers all predicted players who played 1+ minutes (bonus included).
+        Returns None when there is no pre-deadline run or no actuals yet.
+        """
+        import requests
+        from datetime import datetime
 
         prev_gw = int(gameweek) - 1
         if prev_gw < 1:
             return None
-
-        runs = sorted((self.data_dir / 'runs').glob(f'gw{prev_gw}_*')) if (self.data_dir / 'runs').exists() else []
-        if not runs:
-            return None
-        preds_file = runs[-1] / 'predictions.csv'
-        if not preds_file.exists():
-            return None
-
-        preds = pd.read_csv(preds_file)
-        if 'exp_total_pts' not in preds.columns or not len(preds):
-            return None
-        top = preds.nlargest(top_n, 'exp_total_pts')
-
         actuals_file = self.data_dir / 'fpl_actual_points.csv'
         if not actuals_file.exists():
             return None
-        act = pd.read_csv(actuals_file)
-        act = act[(act['season'] == season) & (pd.to_numeric(act['gameweek'], errors='coerce') == prev_gw)]
-        if not len(act):
+        act_all = pd.read_csv(actuals_file)
+        act_all = act_all[act_all['season'] == season]
+        act_all = act_all.assign(gameweek=pd.to_numeric(act_all['gameweek'], errors='coerce'))
+
+        events = requests.get('https://fantasy.premierleague.com/api/bootstrap-static/',
+                              timeout=20).json()['events']
+        deadlines = {int(e['id']): datetime.fromisoformat(e['deadline_time'].replace('Z', '+00:00'))
+                     for e in events}
+
+        def graded(gw):
+            run = self._pre_deadline_run(gw, season, deadlines[gw]) if gw in deadlines else None
+            act = act_all[act_all['gameweek'] == gw].reset_index(drop=True)
+            if run is None or not len(act):
+                return None
+            preds = pd.read_csv(run / 'predictions.csv')
+            if 'exp_total_pts' not in preds.columns or not len(preds):
+                return None
+            hits = self._match_fpl_actuals(preds['player_name'], act)
+            preds['actual'] = [np.nan if h is None else act.at[h, 'actual_total_points'] for h in hits]
+            preds['actual_minutes'] = [np.nan if h is None else act.at[h, 'minutes'] for h in hits]
+            return run, preds
+
+        prev = graded(prev_gw)
+        if prev is None:
             return None
-
-        def _norm(name):
-            if pd.isna(name):
-                return ''
-            return ''.join(
-                c for c in unicodedata.normalize('NFD', str(name))
-                if unicodedata.category(c) != 'Mn'
-            ).lower().strip()
-
-        # name -> row, with web_name and surname as progressively looser keys
-        lookup = {}
-        for _, r in act.iterrows():
-            for key in (_norm(r['player_name']), _norm(r.get('web_name'))):
-                if key:
-                    lookup.setdefault(key, r)
-            parts = _norm(r['player_name']).split()
-            if len(parts) > 1:
-                lookup.setdefault(parts[-1], r)
+        run, preds = prev
 
         pos_names = {0: 'GK', 1: 'DEF', 2: 'MID', 3: 'FWD'}
         rows = []
-        for _, p in top.iterrows():
-            n = _norm(p['player_name'])
-            hit = lookup.get(n)
-            if hit is None:
-                parts = n.split()
-                if len(parts) > 1:
-                    hit = lookup.get(parts[-1])
+        for _, p in preds.nlargest(top_n, 'exp_total_pts').iterrows():
             pos = str(p.get('fpl_position', '')).upper()
             if pos not in ('GK', 'DEF', 'MID', 'FWD'):
                 try:
@@ -2510,18 +2549,35 @@ with open(r"{temp_result_path}", 'w') as f:
                 'team': p.get('team', ''),
                 'position': pos,
                 'predicted': float(p['exp_total_pts']),
-                'actual': None if hit is None else float(hit['actual_total_points']),
-                'minutes': None if hit is None else float(hit['minutes']),
+                'actual': None if pd.isna(p['actual']) else float(p['actual']),
+                'minutes': None if pd.isna(p['actual_minutes']) else float(p['actual_minutes']),
             })
 
         matched = [r for r in rows if r['actual'] is not None]
         if not matched:
             return None
+
+        def played_mae(frame):
+            played = frame[frame['actual_minutes'] >= 1]
+            return float((played['exp_total_pts'] - played['actual']).abs().mean()), len(played)
+
+        gw_mae, gw_n = played_mae(preds)
+        season_maes = {}
+        for gw in range(1, prev_gw + 1):
+            result = prev if gw == prev_gw else graded(gw)
+            if result is not None:
+                season_maes[gw] = played_mae(result[1])[0]
         return {
             'gameweek': prev_gw,
+            'run': run.name,
             'rows': rows,
             'mean_predicted': sum(r['predicted'] for r in matched) / len(matched),
             'mean_actual': sum(r['actual'] for r in matched) / len(matched),
+            'played_mae': gw_mae,
+            'played_n': gw_n,
+            # mean of per-gameweek MAEs, the way public accuracy tables average
+            'season_played_mae': sum(season_maes.values()) / len(season_maes),
+            'season_gameweeks': sorted(season_maes),
         }
 
     def get_viz_metrics(self):
