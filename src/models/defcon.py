@@ -94,7 +94,10 @@ class DefconModel(BaseModel):
         For NB: φ = 1 + mean(μ)/r, so r = mean(μ) / (φ - 1).
         """
         y = df[self.TARGET].fillna(0).values
-        mu = np.maximum(self.predict(df), 0.01)
+        # Score at the minutes actually played: with the exposure offset,
+        # predict() uses pred_minutes, and minutes-model misses would read as
+        # count overdispersion (r fell from ~7 to 0.67, capping P(hit) near .35).
+        mu = np.maximum(self.predict(df.assign(pred_minutes=df['minutes'])), 0.01)
 
         pearson_chi2 = np.sum((y - mu) ** 2 / mu) / (len(y) - 1)
 

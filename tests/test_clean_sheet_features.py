@@ -340,6 +340,20 @@ def test_defcon_probability_uses_fpl_position_and_excludes_other_roles():
     np.testing.assert_array_equal(probability[2:], [0.0, 0.0])
 
 
+def test_defcon_dispersion_is_scored_at_minutes_played_not_predicted():
+    from src.models.defcon import DefconModel
+    model = DefconModel(n_estimators=1)
+    # Offset model: expected count is a 10-per-90 rate times the exposure.
+    model.predict = lambda frame: 10.0 * frame['pred_minutes'].to_numpy() / 90
+    rng = np.random.default_rng(0)
+    minutes = rng.choice([15, 45, 90], size=4000)
+    frame = pd.DataFrame({'minutes': minutes, 'pred_minutes': 80.0,
+                          'defcon': rng.poisson(10.0 * minutes / 90)})
+    model._estimate_dispersion(frame)
+    # Pure Poisson counts given minutes played; minutes misses are not dispersion.
+    assert model.dispersion_r is None or model.dispersion_r > 20
+
+
 def test_shared_scoring_handles_missing_fpl_positions_and_uses_defcon_fallback():
     from src.models.bonus import score_simulations
     from src.pipeline import FPL_POINTS
