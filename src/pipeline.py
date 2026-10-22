@@ -3629,6 +3629,16 @@ with open(r"{temp_result_path}", 'w') as f:
         simulations = models['bonus'].simulate(
             frame, probability, state_minutes, n_simulations=n_simulations,
             seed=seed, defcon_r=models['defcon'].dispersion_r)
+        # P(defcon hit | appears) from the same draws, so it mixes over minutes
+        # states; the analytic NB at E[minutes] is overconfident once r is
+        # fitted on 60+ minute rows.
+        position = frame.get('defcon_position', pd.Series('', index=frame.index)).astype('string').str.upper()
+        threshold = np.where(position.eq('DEF').fillna(False), 10, 12)
+        played = simulations['minutes'] > 0
+        hits = ((simulations['defcon'] >= threshold) & played).sum(axis=0)
+        frame['pred_defcon_prob'] = np.where(
+            position.isin(['DEF', 'MID']).fillna(False).to_numpy(),
+            np.divide(hits, played.sum(axis=0), out=np.zeros(len(frame)), where=played.any(axis=0)), 0.)
         return self._calculate_expected_points(frame, simulations), simulations
 
     def _calculate_expected_points(self, df, simulations=None):

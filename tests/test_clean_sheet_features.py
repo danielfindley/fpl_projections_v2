@@ -346,10 +346,13 @@ def test_defcon_dispersion_is_scored_at_minutes_played_not_predicted():
     # Offset model: expected count is a 10-per-90 rate times the exposure.
     model.predict = lambda frame: 10.0 * frame['pred_minutes'].to_numpy() / 90
     rng = np.random.default_rng(0)
-    minutes = rng.choice([15, 45, 90], size=4000)
-    frame = pd.DataFrame({'minutes': minutes, 'pred_minutes': 80.0,
+    minutes = rng.choice([60, 75, 90], size=4000)
+    frame = pd.DataFrame({'minutes': minutes, 'pred_minutes': 30.0,
                           'defcon': rng.poisson(10.0 * minutes / 90)})
-    model._estimate_dispersion(frame)
+    # Cameos whose counts don't scale with minutes must not widen the fit.
+    cameos = pd.DataFrame({'minutes': 10, 'pred_minutes': 30.0,
+                           'defcon': rng.choice([0, 8], size=2000)})
+    model._estimate_dispersion(pd.concat([frame, cameos], ignore_index=True))
     # Pure Poisson counts given minutes played; minutes misses are not dispersion.
     assert model.dispersion_r is None or model.dispersion_r > 20
 

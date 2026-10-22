@@ -93,10 +93,14 @@ class DefconModel(BaseModel):
         Uses Pearson chi-squared method: φ = Σ(y-μ)²/μ / (n-1).
         For NB: φ = 1 + mean(μ)/r, so r = mean(μ) / (φ - 1).
         """
-        y = df[self.TARGET].fillna(0).values
         # Score at the minutes actually played: with the exposure offset,
         # predict() uses pred_minutes, and minutes-model misses would read as
         # count overdispersion (r fell from ~7 to 0.67, capping P(hit) near .35).
+        # 60+ minute rows only: cameo counts don't scale with minutes (Pearson
+        # r 0.9 below 60 vs 18 above) and dragged the pooled r to ~7, too wide
+        # for the starters who earn defcon points (they out-hit it at the top).
+        df = df[df['minutes'] >= 60]
+        y = df[self.TARGET].fillna(0).values
         mu = np.maximum(self.predict(df.assign(pred_minutes=df['minutes'])), 0.01)
 
         pearson_chi2 = np.sum((y - mu) ** 2 / mu) / (len(y) - 1)
