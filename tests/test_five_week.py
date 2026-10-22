@@ -345,10 +345,15 @@ def test_lineup_probability_is_joint_and_availability_is_applied_once():
     probability, _ = model.predict_distribution(
         frame, appear_prob=np.full(4, .2), lineup_p_start=np.ones(4),
         lineup_weight=1., availability=np.array([1., .5, 0., 1.]))
-    np.testing.assert_allclose(probability[0], [0., .1, .9])
-    np.testing.assert_allclose(probability[1], [.5, .05, .45])
+    np.testing.assert_allclose(probability[0], [.01, .09, .9])
+    np.testing.assert_allclose(probability[1], [.505, .045, .45])
     np.testing.assert_allclose(probability[2], [1., 0., 0.])
     np.testing.assert_allclose(probability.sum(axis=1), 1.)
+    # The weight hedges who starts, not whether a listed starter plays.
+    hedged, _ = model.predict_distribution(
+        frame, appear_prob=np.full(4, .2), lineup_p_start=np.ones(4), lineup_weight=.7)
+    np.testing.assert_allclose(1 - hedged[:, 0], .99)
+    np.testing.assert_allclose(hedged[:, 2], .3 * .2 * .5 + .7 * .9)
 
 
 def test_bonus_baseline_removes_shared_penalties_before_simulation():
@@ -411,7 +416,7 @@ def test_lineup_surname_fallback_matches_our_surname_only():
     assert matched['matched_name'].tolist() == ['Bradley Barcola', None, 'Virgil van Dijk']
     overrides = build_overrides(matched, predictions, verbose=False)
     assert overrides['lineup_available'].isna().all()
-    assert overrides['lineup_p_start'].tolist() == [0.95, 0.95]
+    assert overrides['lineup_p_start'].tolist() == [1.0, 1.0]
 
 
 def test_gw1_display_roles_keep_weekly_mass_and_split_sixty_plus_by_horizon():

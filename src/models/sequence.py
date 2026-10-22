@@ -29,7 +29,7 @@ from .cards import CardsModel, RED_PER_FOUL
 from .clean_sheet import CleanSheetModel
 from .defcon import DefconModel
 from .goals import GoalsModel
-from .minutes import ALL_FEATURES as MINUTES_FEATURES, APPEARANCE_FEATURES
+from .minutes import ALL_FEATURES as MINUTES_FEATURES, APPEARANCE_FEATURES, LISTED_STARTER_APPEAR
 from .saves import SavesModel
 
 TOKEN_COLUMNS = [
@@ -491,8 +491,8 @@ class _Minutes(_Adapter):
             starts = np.clip(lineup, 0, 1)
             p60_joint = np.where(have, (1 - lineup_weight) * p60_joint
                                  + lineup_weight * starts * self.p60_given_start, p60_joint)
-            appear = np.where(have, (1 - lineup_weight) * appear
-                              + lineup_weight * np.maximum(appear, starts), appear)
+            appear = np.where(have, np.maximum(
+                appear, np.minimum(starts, LISTED_STARTER_APPEAR)), appear)
         if availability is not None:
             available = np.clip(np.asarray(availability, dtype=float), 0, 1)
             appear, p60_joint = appear * available, p60_joint * available

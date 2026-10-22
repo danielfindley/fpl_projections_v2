@@ -18,6 +18,11 @@ from ..features import APPEARANCE_FEATURES
 
 
 # Shared feature list (classifier uses all, regressors use subsets)
+# A listed starter's floor on P(appears). Hedging appearance with the model let
+# it keep the classifier's ~10% blank risk; all 1,448 listed starters with a row
+# over 2026/27 GW1-7 played. Kept below 1 for warm-up withdrawals.
+LISTED_STARTER_APPEAR = 0.99
+
 ALL_FEATURES = [
     # Minutes history
     'last_minutes', 'minutes_roll1', 'minutes_roll2', 'minutes_roll3', 'minutes_roll5', 'minutes_roll7', 'minutes_roll10',
@@ -491,12 +496,13 @@ class MinutesModel:
             lineup = np.asarray(lineup_p_start, dtype=float)
             have = np.isfinite(lineup)
             starts = np.clip(lineup, 0, 1)
-            feed_appear = np.maximum(appear, starts)
             feed_sixty = starts * getattr(self, 'p60_given_start', 0.90)
             p60_joint = np.where(have,
                 (1 - lineup_weight) * p60_joint + lineup_weight * feed_sixty, p60_joint)
+            # The hedge applies to who starts, not who plays: a listed starter
+            # appears, so appearance takes the feed's floor unblended.
             appear = np.where(have,
-                (1 - lineup_weight) * appear + lineup_weight * feed_appear, appear)
+                np.maximum(appear, np.minimum(starts, LISTED_STARTER_APPEAR)), appear)
         if availability is not None:
             available = np.clip(np.asarray(availability, dtype=float), 0, 1)
             appear, p60_joint = appear * available, p60_joint * available

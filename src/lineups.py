@@ -181,7 +181,7 @@ def evaluate_snapshots(actuals: pd.DataFrame, data_dir: str = 'data',
               f"{len(ev)} player-rows:")
         if len(xi):
             print(f"    predicted starter -> started {xi['started'].mean():.3f}, "
-                  f"appeared {xi['appeared'].mean():.3f}  (p_in currently 0.95)")
+                  f"appeared {xi['appeared'].mean():.3f}  (p_in currently 1.0)")
         if len(bench):
             print(f"    listed non-starter -> started {bench['started'].mean():.3f}"
                   f"  (p_out currently 0.10)")
@@ -260,7 +260,7 @@ def match_lineups(lineups: pd.DataFrame, predictions: pd.DataFrame,
 
 
 def build_overrides(matched: pd.DataFrame, predictions: pd.DataFrame,
-                    p_in: float = 0.95, p_out: float = 0.10,
+                    p_in: float = 1.0, p_out: float = 0.10,
                     verbose: bool = True) -> pd.DataFrame:
     """Turn matched lineup rows into per-player overrides aligned to predictions.
 
