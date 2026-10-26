@@ -456,8 +456,25 @@ def fetch_fpl_actual_points(gameweeks: list = None, cache_dir: str = None,
         }
 
     # Determine which GWs to fetch
+    # The event flag waits for FPL's data check, often days after the last
+    # match, while each fixture flips `finished` once its bonus is confirmed.
+    # Grade a GW whose fixtures are all finished, but keep re-fetching it until
+    # the event is final so late stat corrections replace the provisional rows.
+    provisional_gws = set()
     if gameweeks is None:
         gameweeks = [ev['id'] for ev in bootstrap['events'] if ev.get('finished')]
+        current = next((ev['id'] for ev in bootstrap['events']
+                        if ev.get('is_current') and not ev.get('finished')), None)
+        if current is not None:
+            try:
+                fx = requests.get(
+                    f"https://fantasy.premierleague.com/api/fixtures/?event={current}",
+                    timeout=15).json()
+                if fx and all(f.get('finished') for f in fx):
+                    gameweeks.append(current)
+                    provisional_gws.add(current)
+            except Exception:
+                pass
 
     if verbose and gameweeks:
         print(f"Fetching actual FPL points for GW {min(gameweeks)}-{max(gameweeks)} ({len(gameweeks)} GWs)...")
@@ -471,8 +488,10 @@ def fetch_fpl_actual_points(gameweeks: list = None, cache_dir: str = None,
         # A pre-migration cache has no BPS. Re-fetch those current-season GWs
         # rather than silently treating the incomplete rows as authoritative.
         if 'bps' in current_cache.columns:
-            cached_gws = set(
-                current_cache.loc[current_cache['bps'].notna(), 'gameweek'].unique())
+            complete = current_cache['bps'].notna()
+            if 'provisional' in current_cache.columns:
+                complete &= current_cache['provisional'].fillna(False).astype(bool) == False
+            cached_gws = set(current_cache.loc[complete, 'gameweek'].unique())
         if verbose:
             print(f"  Cache has {len(cached_gws)} complete BPS GWs already for {api_season}")
 
@@ -507,6 +526,7 @@ def fetch_fpl_actual_points(gameweeks: list = None, cache_dir: str = None,
                     'red_cards': stats.get('red_cards', 0),
                     'saves': stats.get('saves', 0),
                     'goals_conceded': stats.get('goals_conceded', 0),
+                    'provisional': gw in provisional_gws,
                 })
             if verbose:
                 print(f"  GW{gw}: {sum(1 for el in live['elements'] if el['stats']['minutes'] > 0)} players played")
