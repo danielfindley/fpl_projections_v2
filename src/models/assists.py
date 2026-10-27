@@ -47,6 +47,9 @@ class AssistsModel(BaseModel):
         # xA over/underperformance (regression signal)
         'xa_overperformance_roll10',
 
+        # Corner duty: set-piece takers get assists their open-play xA misses
+        'corners_per90_roll10', 'corners_per90_roll30', 'corner_share_roll30',
+
         # Match-specific predicted team goals (from CleanSheetModel, leak-free OOF)
         'pred_team_goals',
 

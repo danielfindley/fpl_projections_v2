@@ -1297,6 +1297,17 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     df['pen_share_roll30'] = (prior_stat(df, 'player_id', 'pen_xg', 30, 'sum')
                               / team_pen.where(team_pen > 0))
     df = df.drop(columns=['_team_pen_xg'])
+
+    # Corner duty, built the same way: FotMob fills `corners` only when > 0.
+    df['_corners'] = (pd.to_numeric(df['corners'], errors='coerce').fillna(0)
+                      if 'corners' in df.columns else 0.0)
+    for window in (10, 30):
+        df[f'corners_per90_roll{window}'] = prior_exposure_rate(df, 'player_id', '_corners', window)
+    df['_team_corners'] = df.groupby(['match_id', 'team'])['_corners'].transform('sum')
+    team_corners = prior_stat(df, 'player_id', '_team_corners', 30, 'sum')
+    df['corner_share_roll30'] = (prior_stat(df, 'player_id', '_corners', 30, 'sum')
+                                 / team_corners.where(team_corners > 0))
+    df = df.drop(columns=['_corners', '_team_corners'])
     df['xa_overperformance_roll10'] = df['assists_per90_roll10'] - df['xa_per90_roll10']
 
     # =========================================================================
