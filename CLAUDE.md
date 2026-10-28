@@ -214,6 +214,7 @@ When tuning is split from training (steps 3a/3b in the skill), tuned params are 
 - `data/players/player_stats.csv`: Player-match level FotMob stats (gitignored)
 - `data/fixtures.csv`: Match schedule with gameweeks
 - `data/fpl_actual_points.csv`: Cached FPL API data with yellow/red cards per gameweek
+- `data/fpl_history/{YYYY-YY}_merged_gw.csv` + `_players_raw.csv`: per-GW FPL archive (vaastav/Fantasy-Premier-League) for 2020/21-2024/25, read by `load_fpl_history()`. Backfills **assists and yellow cards only** through the same `merge_fpl_card_data` join; bonus, BPS, reds and positions stay API-only, and the API cache wins for any season it holds. The assists target is FPL's count wherever matched (`fotmob_assists` keeps the original): FPL credits ~35% more assists than FotMob (rebounds from saved shots, won penalties), so the FotMob target under-predicted every player by ~25%.
 - `data/fpl_prices.csv`: Weekly price snapshots keyed by (season, gameweek, fpl_id). Append-only; cannot be backfilled after a season rolls over.
 - `data/lineups/gw{N}_{timestamp}.csv`: RotoWire predicted-XI snapshots (team, player, position code, is_predicted_starter, OUT/QUES/SUS status). Timestamped so repeated scrapes across a week can be compared. Also cannot be backfilled — the feed serves only the current slate.
 - `data/tuning_results/`: Cached Optuna tuning results (JSON)

@@ -592,7 +592,44 @@ _FPL_TEAM_NORMALIZE = {
     'sheffield utd': 'sheffield united',
     'leeds': 'leeds united',
     'sunderland': 'sunderland',
+    'norwich': 'norwich city',
+    'west brom': 'west bromwich albion',
 }
+
+
+def load_fpl_history(data_dir: str = 'data') -> pd.DataFrame:
+    """Per-gameweek FPL assists and yellow cards for seasons before the API cache.
+
+    The FPL API drops per-gameweek history at season rollover, so earlier
+    seasons come from the vaastav/Fantasy-Premier-League archive, saved as
+    data/fpl_history/{YYYY-YY}_merged_gw.csv and {YYYY-YY}_players_raw.csv.
+    Only assists and yellow cards are taken: bonus, BPS, reds and positions
+    stay API-only. Names are built as in fetch_fpl_actual_points so both
+    sources go through the same join.
+    """
+    frames = []
+    for gw_path in sorted(Path(data_dir, 'fpl_history').glob('*_merged_gw.csv')):
+        label = gw_path.name.split('_')[0]
+        start = int(label[:4])
+        players = pd.read_csv(gw_path.with_name(f'{label}_players_raw.csv'),
+                              usecols=['id', 'first_name', 'second_name', 'web_name'])
+        gws = pd.read_csv(gw_path, usecols=['element', 'team', 'GW', 'assists', 'yellow_cards'])
+        # A double gameweek has one archive row per fixture; the API reports totals.
+        gws = gws.groupby(['element', 'GW'], as_index=False).agg(
+            team=('team', 'last'), assists=('assists', 'sum'),
+            yellow_cards=('yellow_cards', 'sum'))
+        gws = gws.merge(players, left_on='element', right_on='id', how='left', validate='many_to_one')
+        frames.append(pd.DataFrame({
+            'fpl_id': gws['element'],
+            'player_name': gws['first_name'] + ' ' + gws['second_name'],
+            'web_name': gws['web_name'],
+            'team': gws['team'],
+            'season': f'{start}/{start + 1}',
+            'gameweek': gws['GW'],
+            'assists': gws['assists'],
+            'yellow_cards': gws['yellow_cards'],
+        }))
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
 def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
@@ -637,6 +674,13 @@ def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
     fpl_df = fpl_df.copy()
     if 'season' not in fpl_df.columns:
         fpl_df['season'] = '2025/2026'
+    # Archived seasons fill assists and yellows only; the API cache wins
+    # wherever it has the season.
+    history = load_fpl_history(data_dir)
+    if len(history):
+        history = history[~history['season'].isin(fpl_df['season'].unique())]
+    fpl_df = pd.concat([fpl_df.assign(_backfill=False), history.assign(_backfill=True)],
+                       ignore_index=True)
     fpl_df['_name_norm'] = fpl_df['player_name'].apply(_norm_name)
     fpl_df['_team_norm'] = fpl_df['team'].apply(_norm_team)
     fpl_df['gameweek'] = pd.to_numeric(fpl_df['gameweek'], errors='coerce')
@@ -657,6 +701,7 @@ def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
     for _, row in fpl_df.iterrows():
         entry = {
             'fpl_id': row.get('fpl_id'),
+            'assists': row.get('assists', np.nan),
             'yellow_cards': row.get('yellow_cards', 0),
             'red_cards': row.get('red_cards', 0),
             'bonus': row.get('bonus', 0),
@@ -672,7 +717,8 @@ def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
         }
         team_gw_candidates.setdefault(candidate_key, []).append(
             (row.get('fpl_id'), candidate_names, entry))
-        if row['_name_norm']:
+        # Archived rows carry no position, so they stay out of the position lookup.
+        if row['_name_norm'] and not row['_backfill']:
             position_sets.setdefault(
                 (row['_name_norm'], row['season']), set()
             ).add(entry['fpl_position'])
@@ -681,9 +727,10 @@ def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
             alt_key = (row['_web_norm'], row['_team_norm'], row['season'], row['gameweek'])
             if alt_key not in fpl_lookup:
                 fpl_lookup[alt_key] = entry
-            position_sets.setdefault(
-                (row['_web_norm'], row['season']), set()
-            ).add(entry['fpl_position'])
+            if not row['_backfill']:
+                position_sets.setdefault(
+                    (row['_web_norm'], row['season']), set()
+                ).add(entry['fpl_position'])
     fpl_position_lookup = {
         key: next(iter(positions))
         for key, positions in position_sets.items()
@@ -725,6 +772,7 @@ def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
 
     # Match rows
     yellows = np.full(len(df), np.nan)
+    assists = np.full(len(df), np.nan)
     reds = np.full(len(df), np.nan)
     bonus = np.full(len(df), np.nan)
     bps = np.full(len(df), np.nan)
@@ -765,6 +813,7 @@ def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
             continue
         if result is not None:
             yellows[i] = result['yellow_cards']
+            assists[i] = result['assists']
             reds[i] = result['red_cards']
             bonus[i] = result['bonus']
             bps[i] = result['bps']
@@ -772,6 +821,7 @@ def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
             matched += 1
 
     df['yellow_cards'] = yellows
+    df['fpl_assists'] = assists
     df['red_cards'] = reds
     df['bonus'] = bonus
     df['bps'] = bps

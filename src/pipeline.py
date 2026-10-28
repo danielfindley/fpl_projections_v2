@@ -135,6 +135,13 @@ class FPLPipeline:
 
         # Merge FPL yellow/red card data (required for CardsModel)
         self.df = merge_fpl_card_data(self.df, str(self.data_dir), verbose)
+        # FPL credits assists FotMob does not (rebounds from saved shots, won
+        # penalties, forced own goals), ~35% more per season, and FPL's count is
+        # what scores. Use it wherever the merge matched one; DGW and unmatched
+        # rows keep FotMob's.
+        if 'fpl_assists' in self.df.columns:
+            self.df['fotmob_assists'] = self.df['assists']
+            self.df['assists'] = self.df['fpl_assists'].fillna(self.df['assists'])
 
         # Exact season/GW positions from the FPL cache take precedence; the
         # current FPL API fills older rows for players still in the game.
