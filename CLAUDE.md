@@ -103,6 +103,18 @@ Goals, Assists, and Defcon models output expected match counts (per-90 rate x `p
 Run the full pytest suite. Temporal leakage, clean-sheet prior/base-margin, match
 simulation, and distribution-report contracts have targeted regression tests.
 
+**Name matching must pass before every deploy push.** `_build_test_set` drops a
+current player it cannot find in the FPL squads as departed, so a FotMob/FPL
+spelling difference silently removes a real player from the weekly and five-week
+projections (GW10 2026/27 lost 11, including Josh King and Joe Willock). Misses
+are retried within the player's club by `match_within_club()` (nicknames,
+hyphenated or shortened surnames, transliterations); the review panel's
+`_match_fpl_actuals` uses the same fallback. `audit_fpl_coverage()` lists fit
+FPL players with minutes but no prediction, and
+`tests/test_name_matching.py::test_latest_run_covers_every_fit_fpl_player` runs
+it live on the newest saved run. Rectify failures in the matcher or
+`data/fpl_name_overrides.json`, never by skipping the test.
+
 ## Experiment Logging
 
 All tuning runs are auto-logged to `data/experiments.db` (SQLite). Each run captures: CV scores, test metrics, hyperparams, selected features, and FPL points MAE (actual vs predicted).

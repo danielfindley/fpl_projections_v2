@@ -8,7 +8,7 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, Optional
 
-from .data_loader import load_player_stats, load_fixtures, merge_fixtures, get_fpl_positions, map_fpl_position, get_fpl_availability, merge_fpl_card_data, get_fpl_current_squads, normalize_player_name
+from .data_loader import load_player_stats, load_fixtures, merge_fixtures, get_fpl_positions, map_fpl_position, get_fpl_availability, merge_fpl_card_data, get_fpl_current_squads, normalize_player_name, match_within_club, fetch_fpl_ownership
 from .features import (compute_rolling_features, build_appearance_grid,
                        chronological_frame, deadline_splits,
                        resolve_defcon_positions)
@@ -2471,12 +2471,31 @@ with open(r"{temp_result_path}", 'w') as f:
         return best
 
     @staticmethod
-    def _match_fpl_actuals(names, act):
+    def _match_fpl_actuals(names, act, teams=None):
         """Map player names to rows of one gameweek's FPL actuals.
 
         Full name, then web_name, then a token-subset match for FPL's middle names;
-        a key that resolves to more than one player is left unmatched.
+        a key that resolves to more than one player is left unmatched. With
+        ``teams`` (and a ``team`` column in ``act``), the misses are retried within
+        each player's club ('Vitaliy' vs FPL's 'Vitalii Mykolenko').
         """
+        hits = FPLPipeline._match_fpl_names(names, act)
+        if teams is None or 'team' not in act.columns:
+            return hits
+        keys = act['player_name'].map(normalize_player_name)
+        clubs = act['team'].map(normalize_team_name)
+        claimed = {keys[h] for h in hits if h is not None}
+        for k, (name, team) in enumerate(zip(names, teams)):
+            if hits[k] is None:
+                roster = keys[clubs == normalize_team_name(team)]
+                full = match_within_club(name, list(roster), claimed)
+                if full is not None:
+                    hits[k] = roster.index[roster == full][0]
+                    claimed.add(full)
+        return hits
+
+    @staticmethod
+    def _match_fpl_names(names, act):
         full, web = {}, {}
         for i, r in act.iterrows():
             full.setdefault(normalize_player_name(r['player_name']), []).append(i)
@@ -2504,6 +2523,8 @@ with open(r"{temp_result_path}", 'w') as f:
 
         Every gameweek is graded on the last run saved before its FPL deadline.
         MAE covers all predicted players who played 1+ minutes (bonus included).
+        ``bench_mae`` follows fplbench.com instead: every player owned by 1%+ of
+        managers that week, played or not, with an unpredicted player scored as 0.
         Returns None when there is no pre-deadline run or no actuals yet.
         """
         import requests
@@ -2519,8 +2540,9 @@ with open(r"{temp_result_path}", 'w') as f:
         act_all = act_all[act_all['season'] == season]
         act_all = act_all.assign(gameweek=pd.to_numeric(act_all['gameweek'], errors='coerce'))
 
-        events = requests.get('https://fantasy.premierleague.com/api/bootstrap-static/',
-                              timeout=20).json()['events']
+        bootstrap = requests.get('https://fantasy.premierleague.com/api/bootstrap-static/',
+                                 timeout=20).json()
+        events = bootstrap['events']
         deadlines = {int(e['id']): datetime.fromisoformat(e['deadline_time'].replace('Z', '+00:00'))
                      for e in events}
 
@@ -2532,15 +2554,16 @@ with open(r"{temp_result_path}", 'w') as f:
             preds = pd.read_csv(run / 'predictions.csv')
             if 'exp_total_pts' not in preds.columns or not len(preds):
                 return None
-            hits = self._match_fpl_actuals(preds['player_name'], act)
+            hits = self._match_fpl_actuals(preds['player_name'], act, preds.get('team'))
             preds['actual'] = [np.nan if h is None else act.at[h, 'actual_total_points'] for h in hits]
             preds['actual_minutes'] = [np.nan if h is None else act.at[h, 'minutes'] for h in hits]
-            return run, preds
+            preds['_act_row'] = hits
+            return run, preds, act
 
         prev = graded(prev_gw)
         if prev is None:
             return None
-        run, preds = prev
+        run, preds, _ = prev
 
         pos_names = {0: 'GK', 1: 'DEF', 2: 'MID', 3: 'FWD'}
         rows = []
@@ -2568,12 +2591,30 @@ with open(r"{temp_result_path}", 'w') as f:
             played = frame[frame['actual_minutes'] >= 1]
             return float((played['exp_total_pts'] - played['actual']).abs().mean()), len(played)
 
+        # fplbench.com's sample: owned by 1%+ of managers that week. FPL publishes
+        # no per-gameweek manager total, so today's total sets the threshold.
+        try:
+            ownership = fetch_fpl_ownership(season, range(1, prev_gw + 1), str(self.data_dir),
+                                            verbose=False)
+        except Exception as exc:
+            print(f"  (fplbench-style MAE skipped: {type(exc).__name__}: {exc})")
+            ownership = None
+
+        def bench_mae(gw, frame, act):
+            own = ownership[(ownership['gameweek'] == gw)
+                            & (ownership['selected'] >= 0.01 * bootstrap['total_players'])]
+            owned = act[act['fpl_id'].isin(own['fpl_id'])]
+            pred = frame.dropna(subset=['_act_row']).groupby('_act_row')['exp_total_pts'].sum()
+            return float((owned.index.map(pred).fillna(0) - owned['actual_total_points']).abs().mean())
+
         gw_mae, gw_n = played_mae(preds)
-        season_maes = {}
+        season_maes, bench_maes = {}, {}
         for gw in range(1, prev_gw + 1):
             result = prev if gw == prev_gw else graded(gw)
             if result is not None:
                 season_maes[gw] = played_mae(result[1])[0]
+                if ownership is not None:
+                    bench_maes[gw] = bench_mae(gw, result[1], result[2])
         return {
             'gameweek': prev_gw,
             'run': run.name,
@@ -2585,7 +2626,40 @@ with open(r"{temp_result_path}", 'w') as f:
             # mean of per-gameweek MAEs, the way public accuracy tables average
             'season_played_mae': sum(season_maes.values()) / len(season_maes),
             'season_gameweeks': sorted(season_maes),
+            'bench_mae': bench_maes.get(prev_gw),
+            'season_bench_mae': (sum(bench_maes.values()) / len(bench_maes)) if bench_maes else None,
         }
+
+    def audit_fpl_coverage(self, predictions, bootstrap=None, verbose=True):
+        """FPL players who have played this season and are fit, yet have no
+        prediction row.
+
+        That is almost always a FotMob/FPL name mismatch: predict() drops a player
+        it cannot find in the FPL squads as departed. Deploys must stop on a
+        non-empty result; fix it in data/fpl_name_overrides.json or the matcher.
+        Clubs without a fixture in ``predictions`` (blank gameweeks) are skipped.
+        """
+        import requests
+        if bootstrap is None:
+            bootstrap = requests.get('https://fantasy.premierleague.com/api/bootstrap-static/',
+                                     timeout=20).json()
+        teams = {t['id']: t['name'] for t in bootstrap['teams']}
+        fpl = pd.DataFrame([{
+            'player_name': f"{e['first_name']} {e['second_name']}", 'web_name': e['web_name'],
+            'team': teams[e['team']], 'minutes': e['minutes'], 'status': e['status'],
+        } for e in bootstrap['elements']])
+        playing = set(predictions['team'].map(normalize_team_name))
+        fpl = fpl[(fpl['minutes'] > 0) & fpl['status'].isin(['a', 'd'])
+                  & fpl['team'].map(normalize_team_name).isin(playing)].reset_index(drop=True)
+        hits = self._match_fpl_actuals(predictions['player_name'], fpl, predictions['team'])
+        missing = fpl.drop(index=[h for h in hits if h is not None])
+        missing = missing.sort_values('minutes', ascending=False)
+        if verbose:
+            print(f"  FPL coverage: {len(fpl) - len(missing)}/{len(fpl)} fit FPL players "
+                  f"with minutes have a prediction")
+            for _, r in missing.iterrows():
+                print(f"    MISSING: {r['player_name']} ({r['team']}, {r['minutes']} min)")
+        return missing[['player_name', 'web_name', 'team', 'minutes', 'status']]
 
     def get_viz_metrics(self):
         """Format last_test_metrics for generate_distribution_html(metrics=...).
@@ -3025,6 +3099,26 @@ with open(r"{temp_result_path}", 'w') as f:
 
             mapped = latest_identity['player_name'].apply(_fpl_team)
             fotmob_team_orig = latest_identity['team'].copy()
+
+            # An unmatched current player is dropped as departed, so retry the
+            # misses against their own club's FPL squad before giving up on them
+            # (Joshua King, a nailed Fulham starter, was silently missing).
+            roster = {}
+            for full, t in fpl_full_names.items():
+                roster.setdefault(normalize_team_name(t), []).append(full)
+            claimed = set()
+            for key in latest_identity.loc[mapped.notna(), 'player_name'].map(normalize_player_name):
+                toks = set(key.split())
+                claimed |= {f for f in fpl_full_names if f == key or (len(toks) >= 2 and toks <= set(f.split()))}
+            for idx in mapped.index[mapped.isna() & in_current]:
+                club = normalize_team_name(latest_identity.at[idx, 'team'])
+                if normalize_player_name(latest_identity.at[idx, 'player_name']) in name_overrides:
+                    continue
+                full = match_within_club(latest_identity.at[idx, 'player_name'],
+                                         roster.get(club, []), claimed)
+                if full is not None:
+                    mapped.at[idx] = fpl_full_names[full]
+                    claimed.add(full)
             mapped_fotmob = mapped.dropna().apply(_to_fotmob)
             changed = mapped_fotmob.index[
                 mapped_fotmob.apply(normalize_team_name)

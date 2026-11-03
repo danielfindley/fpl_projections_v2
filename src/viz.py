@@ -265,6 +265,13 @@ def _build_last_gw_html(last_gw):
             f'Graded on the projections published before each deadline, bonus included '
             f'({last_gw["played_n"]} players)</p>'
         )
+    if last_gw.get('bench_mae') is not None:
+        mae_note += (
+            f'<p style="color:#ccc;text-align:center;margin:8px 0 0;font-size:12px">'
+            f'fplbench-style MAE, players owned by 1%+ incl. non-starters: '
+            f'<span style="color:#7fdbca;font-weight:600">GW{last_gw["gameweek"]} {last_gw["bench_mae"]:.2f}</span>'
+            f' &middot; <span style="color:#7fdbca;font-weight:600">season avg {last_gw["season_bench_mae"]:.2f}</span></p>'
+        )
 
     return f'''
 <div style="max-width:620px;margin:32px auto 16px;padding:0 16px">

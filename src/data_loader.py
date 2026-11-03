@@ -364,6 +364,71 @@ def normalize_player_name(name) -> str:
     return ' '.join(stripped.replace('-', ' ').split())
 
 
+def match_within_club(name, roster, claimed=frozenset()):
+    """Resolve a player the league-wide name matches missed, within his own club.
+
+    FotMob and FPL often name one player differently ('Joshua King' vs 'Josh
+    King', 'Edward Nketiah' vs 'Eddie Nketiah', 'Jaden Philogene-Bidace' vs
+    'Jaden Philogene'). League-wide a surname like King is ambiguous; within one
+    squad it rarely is. ``roster`` holds the club's normalized FPL full names and
+    ``claimed`` those already matched to someone else. Returns the FPL full name
+    only when exactly one unclaimed squad member fits.
+    """
+    toks = normalize_player_name(name).split()
+    pool = [f for f in roster if f not in claimed]
+    # FPL's name inside ours: 'Juan Riquelme Angulo' -> 'Juan Angulo'
+    hits = [f for f in pool if set(f.split()) <= set(toks)]
+    if len(hits) != 1 and len(toks) >= 2:
+        surnames = set(toks[1:])
+        hits = [f for f in pool if surnames & set(f.split()[1:])]
+    if len(hits) != 1 and len(toks) >= 2:
+        # transliteration: 'Timur Tuterov' vs FPL's 'Tymur Tutierov'
+        from difflib import SequenceMatcher
+        hits = [f for f in pool if any(SequenceMatcher(None, toks[-1], s).ratio() >= 0.85
+                                       for s in f.split()[1:])]
+    return hits[0] if len(hits) == 1 else None
+
+
+def fetch_fpl_ownership(season: str, gameweeks, data_dir: str = 'data',
+                        verbose: bool = True) -> pd.DataFrame:
+    """Per-gameweek FPL ownership counts (``selected``) for the current season.
+
+    Only element-summary histories carry them, one request per player, so they
+    are cached to data/fpl_ownership.csv and refetched only when a requested
+    gameweek is missing. Like prices, the API drops this history at rollover.
+    """
+    import requests
+    from concurrent.futures import ThreadPoolExecutor
+
+    path = Path(data_dir) / 'fpl_ownership.csv'
+    cached = pd.read_csv(path) if path.exists() else pd.DataFrame(
+        columns=['season', 'gameweek', 'fpl_id', 'selected'])
+    have = set(cached.loc[cached['season'] == season, 'gameweek'])
+    if set(gameweeks) <= have:
+        return cached[cached['season'] == season]
+
+    api = 'https://fantasy.premierleague.com/api/'
+    ids = [e['id'] for e in requests.get(api + 'bootstrap-static/', timeout=20).json()['elements']]
+
+    def history(i):
+        for _ in range(3):
+            try:
+                return [(season, h['round'], i, h['selected'])
+                        for h in requests.get(api + f'element-summary/{i}/', timeout=20).json()['history']]
+            except Exception:
+                pass
+        raise RuntimeError(f'ownership history unavailable for element {i}')
+
+    with ThreadPoolExecutor(8) as pool:
+        rows = [r for rs in pool.map(history, ids) for r in rs]
+    fresh = pd.DataFrame(rows, columns=['season', 'gameweek', 'fpl_id', 'selected'])
+    out = pd.concat([cached[cached['season'] != season], fresh], ignore_index=True)
+    out.to_csv(path, index=False)
+    if verbose:
+        print(f"  FPL ownership: {len(fresh):,} player-gameweeks cached -> {path}")
+    return fresh
+
+
 def get_fpl_current_squads() -> dict:
     """Fetch current FPL squads from bootstrap-static.
 
