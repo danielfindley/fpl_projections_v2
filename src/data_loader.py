@@ -457,9 +457,10 @@ def fetch_fpl_actual_points(gameweeks: list = None, cache_dir: str = None,
 
     # Determine which GWs to fetch
     # The event flag waits for FPL's data check, often days after the last
-    # match, while each fixture flips `finished` once its bonus is confirmed.
-    # Grade a GW whose fixtures are all finished, but keep re-fetching it until
-    # the event is final so late stat corrections replace the provisional rows.
+    # match, and each fixture's `finished` waits for confirmed bonus, which can
+    # lag the last match by hours. Grade a GW once every fixture is
+    # `finished_provisional`, but keep re-fetching it until the event is final
+    # so confirmed bonus and late stat corrections replace the provisional rows.
     provisional_gws = set()
     if gameweeks is None:
         gameweeks = [ev['id'] for ev in bootstrap['events'] if ev.get('finished')]
@@ -470,7 +471,7 @@ def fetch_fpl_actual_points(gameweeks: list = None, cache_dir: str = None,
                 fx = requests.get(
                     f"https://fantasy.premierleague.com/api/fixtures/?event={current}",
                     timeout=15).json()
-                if fx and all(f.get('finished') for f in fx):
+                if fx and all(f.get('finished_provisional') for f in fx):
                     gameweeks.append(current)
                     provisional_gws.add(current)
             except Exception:
