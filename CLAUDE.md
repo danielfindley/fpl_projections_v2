@@ -212,6 +212,12 @@ Use the `$deploy-predictions` skill to run the full weekly pipeline. It automate
 
 When tuning is split from training (steps 3a/3b in the skill), tuned params are serialized to `data/_latest_tuned_params.json` so a crash in the training step doesn't lose the tuning work.
 
+The deploy also writes `fpl_predictions.csv` via `pipeline.export_fpl_predictions()`
+and publishes it unlinked at `danielfindley.com/projects/fpl-predictions.csv`: one
+row per FPL player whose club has a fixture, keyed by FPL id, with unconditional
+expected points (0 for players without a prediction). It exists for benchmarks such
+as fplbench.com, which grade every player with a fixture.
+
 ### Run directory structure (`data/runs/gw{N}_{timestamp}/`)
 - `predictions.csv` — full prediction table
 - `squad.csv` / `squad_meta.json` — optimized 15 with an `is_starter` flag, plus formation, cost, and the bench weights used

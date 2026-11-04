@@ -2661,6 +2661,52 @@ with open(r"{temp_result_path}", 'w') as f:
                 print(f"    MISSING: {r['player_name']} ({r['team']}, {r['minutes']} min)")
         return missing[['player_name', 'web_name', 'team', 'minutes', 'status']]
 
+    def export_fpl_predictions(self, predictions, gameweek, output_path='fpl_predictions.csv',
+                               bootstrap=None):
+        """Write one row per FPL player whose club has a fixture, keyed by FPL id.
+
+        This is the downloadable file for benchmarks such as fplbench.com, which
+        grade every player with a fixture. Players without a prediction row
+        (injured, no data) are written as 0 expected points, which is how they
+        would be graded anyway. Points are unconditional (they include P(appear)).
+        """
+        import requests
+        if bootstrap is None:
+            bootstrap = requests.get('https://fantasy.premierleague.com/api/bootstrap-static/',
+                                     timeout=20).json()
+        teams = {t['id']: t['name'] for t in bootstrap['teams']}
+        pos = {t['id']: t['singular_name_short'] for t in bootstrap['element_types']}
+        fpl = pd.DataFrame([{
+            'fpl_id': e['id'], 'player_name': f"{e['first_name']} {e['second_name']}",
+            'web_name': e['web_name'], 'team': teams[e['team']], 'position': pos[e['element_type']],
+        } for e in bootstrap['elements']])
+        playing = set(predictions['team'].map(normalize_team_name))
+        fpl = fpl[fpl['team'].map(normalize_team_name).isin(playing)].reset_index(drop=True)
+
+        hits = self._match_fpl_actuals(predictions['player_name'], fpl, predictions['team'])
+        unmatched = [n for n, h in zip(predictions['player_name'], hits) if h is None]
+        if unmatched:
+            raise ValueError(f"{len(unmatched)} predicted players have no FPL id: {unmatched[:10]}")
+        preds = predictions.assign(_row=hits)
+        clash = preds.groupby('_row')['player_id'].nunique()
+        if (clash > 1).any():
+            raise ValueError(f"Several predicted players share an FPL id: "
+                             f"{fpl.loc[clash[clash > 1].index, 'player_name'].tolist()}")
+        agg = preds.groupby('_row').agg(
+            opponent=('opponent', lambda s: ', '.join(s.astype(str))),
+            expected_points=('exp_total_pts', 'sum'),
+            expected_minutes=('pred_minutes_uncond', 'sum'),
+            appear_prob=('pred_appear_prob', 'max'),
+        )
+        out = fpl.join(agg)
+        out[['expected_points', 'expected_minutes', 'appear_prob']] = (
+            out[['expected_points', 'expected_minutes', 'appear_prob']].fillna(0).round(3))
+        out.insert(0, 'gameweek', gameweek)
+        out = out.sort_values('expected_points', ascending=False)
+        out.to_csv(output_path, index=False, encoding='utf-8')
+        print(f"  FPL export: {len(out)} players ({agg.shape[0]} predicted) -> {output_path}")
+        return out
+
     def get_viz_metrics(self):
         """Format last_test_metrics for generate_distribution_html(metrics=...).
 

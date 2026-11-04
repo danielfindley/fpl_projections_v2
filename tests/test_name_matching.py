@@ -104,3 +104,20 @@ def test_latest_run_covers_every_fit_fpl_player():
     missing = FPLPipeline('data').audit_fpl_coverage(preds, bootstrap=boot, verbose=False)
     assert missing.empty, (f"{latest.name} is missing fit FPL players (name-match misses):\n"
                            + missing.to_string(index=False))
+
+
+def test_fpl_export_keys_every_player_with_a_fixture_by_fpl_id(tmp_path):
+    boot = _bootstrap([
+        (('Josh', 'King'), 'Fulham', 735, 'a'),
+        (('Harry', 'Wilson'), 'Fulham', 300, 'i'),       # no prediction row: written as 0
+        (('Erling', 'Haaland'), 'Man City', 800, 'a'),   # club has no fixture: left out
+    ])
+    for i, e in enumerate(boot['elements']):
+        e.update(id=i + 1, element_type=3)
+    boot['element_types'] = [{'id': 3, 'singular_name_short': 'MID'}]
+    preds = pd.DataFrame({'player_id': [1], 'player_name': ['Joshua King'], 'team': ['Fulham'],
+                          'opponent': ['Newcastle'], 'exp_total_pts': [3.9],
+                          'pred_minutes_uncond': [74.8], 'pred_appear_prob': [0.99]})
+    out = FPLPipeline(str(tmp_path)).export_fpl_predictions(
+        preds, 10, output_path=tmp_path / 'out.csv', bootstrap=boot)
+    assert out.set_index('fpl_id')['expected_points'].to_dict() == {1: 3.9, 2: 0.0}
