@@ -121,3 +121,26 @@ def test_fpl_export_keys_every_player_with_a_fixture_by_fpl_id(tmp_path):
     out = FPLPipeline(str(tmp_path)).export_fpl_predictions(
         preds, 10, output_path=tmp_path / 'out.csv', bootstrap=boot)
     assert out.set_index('fpl_id')['expected_points'].to_dict() == {1: 3.9, 2: 0.0}
+
+
+def test_lineup_matcher_retries_misses_within_club():
+    from src.lineups import match_lineups
+    preds = pd.DataFrame({'player_name': ['Florentino', 'Yehor Yarmoliuk', 'Conor Bradley'],
+                          'team': ['Ipswich Town', 'Brentford', 'Liverpool']})
+    lu = pd.DataFrame({'player_name': ['Florentino Luis', 'Yehor Yarmolyuk', 'Bradley Barcola'],
+                       'team': ['Ipswich Town', 'Brentford', 'Liverpool'],
+                       'is_predicted_starter': [True, True, True]})
+    out = match_lineups(lu, preds, verbose=False)
+    assert out['matched_name'].tolist() == ['Florentino', 'Yehor Yarmoliuk', None]
+
+
+def test_price_join_retries_misses_within_club():
+    from src.optimizer import attach_prices
+    prices = pd.DataFrame({'fpl_id': [1, 2, 3], 'player_name': ['Daniel Burn', 'Ben Davies', 'Andrew Robertson'],
+                           'web_name': ['Burn', 'Davies', 'Robertson'], 'second_name': ['Burn', 'Davies', 'Robertson'],
+                           'team': ['Newcastle', 'Spurs', 'Liverpool'], 'position': ['DEF'] * 3,
+                           'price': [4.8, 4.5, 6.0], 'status': ['a'] * 3})
+    preds = pd.DataFrame({'player_name': ['Dan Burn', 'Andy Robertson', 'Dan Davies'],
+                          'team': ['Newcastle United', 'Liverpool', 'Newcastle United']})
+    out = attach_prices(preds, prices, verbose=False)
+    assert out['price'].tolist()[:2] == [4.8, 6.0] and pd.isna(out['price'].iloc[2])

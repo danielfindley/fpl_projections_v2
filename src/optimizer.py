@@ -14,7 +14,7 @@ import pandas as pd
 from pathlib import Path
 from scipy.optimize import milp, LinearConstraint, Bounds
 
-from .data_loader import normalize_player_name
+from .data_loader import match_within_club, normalize_player_name
 
 # FPL squad rules
 SQUAD_SIZE = 15
@@ -119,6 +119,22 @@ def attach_prices(predictions: pd.DataFrame, prices: pd.DataFrame = None,
 
     out = predictions.copy()
     matched = out['player_name'].apply(lookup)
+    if 'team' in out.columns:
+        # Misses are retried within the player's club ('Dan Burn' vs FPL's
+        # 'Daniel Burn'), excluding FPL names another prediction already took.
+        from .pipeline import normalize_team_name
+        keys = prices['player_name'].map(normalize_player_name)
+        clubs = prices['team'].map(normalize_team_name)
+        recs = {k: (r['price'], r['position'], r['team'], r['status'], r['web_name'])
+                for k, (_, r) in zip(keys, prices.iterrows())}
+        taken = {rec: k for k, rec in recs.items()}
+        claimed = {taken[m] for m in matched if m is not None and m in taken}
+        for i in out.index[matched.isna()]:
+            roster = list(keys[clubs == normalize_team_name(out.at[i, 'team'])])
+            full = match_within_club(out.at[i, 'player_name'], roster, claimed)
+            if full is not None:
+                matched.at[i] = recs[full]
+                claimed.add(full)
     out['price'] = [m[0] if m else np.nan for m in matched]
     out['fpl_status'] = [m[3] if m else None for m in matched]
     # FPL's own short name — what the pitch view labels each dot with

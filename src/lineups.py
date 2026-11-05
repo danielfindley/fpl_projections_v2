@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .data_loader import normalize_player_name
+from .data_loader import match_within_club, normalize_player_name
 
 LINEUPS_URL = "https://www.rotowire.com/soccer/lineups.php"
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -245,6 +245,15 @@ def match_lineups(lineups: pd.DataFrame, predictions: pd.DataFrame,
 
     out = lineups.copy()
     out['matched_name'] = out.apply(_match, axis=1)
+    # Misses are retried with the shared club fallback ('Florentino Luis' vs our
+    # 'Florentino', 'Yarmolyuk' vs 'Yarmoliuk'); names already taken are excluded.
+    for i in out.index[out['matched_name'].isna()]:
+        team = normalize_team_name(out.at[i, 'team']) if out.at[i, 'team'] else None
+        pool = by_team.get(team, {})
+        claimed = {_fold(n) for n in out.loc[out['team'] == out.at[i, 'team'], 'matched_name'].dropna()}
+        key = match_within_club(_fold(out.at[i, 'player_name']), list(pool), claimed)
+        if key is not None:
+            out.at[i, 'matched_name'] = pool[key]
 
     if verbose:
         xi = out[out['is_predicted_starter']]
