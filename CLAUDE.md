@@ -109,7 +109,8 @@ spelling difference silently removes a real player from the weekly and five-week
 projections (GW10 2026/27 lost 11, including Josh King and Joe Willock). Misses
 are retried within the player's club by `match_within_club()` (nicknames,
 hyphenated or shortened surnames, transliterations); the review panel's
-`_match_fpl_actuals` uses the same fallback. `audit_fpl_coverage()` lists fit
+`_match_fpl_actuals`, the RotoWire `match_lineups` and the optimizer's
+`attach_prices` use the same fallback. `audit_fpl_coverage()` lists fit
 FPL players with minutes but no prediction, and
 `tests/test_name_matching.py::test_latest_run_covers_every_fit_fpl_player` runs
 it live on the newest saved run. Rectify failures in the matcher or
