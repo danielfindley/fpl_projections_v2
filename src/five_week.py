@@ -18,7 +18,7 @@ from sklearn.metrics import log_loss, mean_absolute_error
 from .data_loader import get_fpl_positions, map_fpl_position
 from .features import (APPEARANCE_FEATURES, _compute_calendar_minutes_features,
                        chronological_frame, prior_stat, resolve_defcon_positions)
-from .pipeline import FPL_POINTS
+from .pipeline import FPL_POINTS, fpl_chance_of_playing
 
 
 ROLE_NAMES = ("Absent", "Sub appearance", "60-79 minutes", "80+ minutes")
@@ -348,21 +348,9 @@ class FiveWeekForecaster:
         self.fpl_positions = get_fpl_positions()
         self.live_availability = live_availability or {}
 
-    def _live_chance(self, player_name: str, fallback: float = 100.0) -> float:
+    def _live_chance(self, player_name: str, fallback: float = 100.0, team=None) -> float:
         """Resolve the true current FPL chance after the build-step inclusion shim."""
-        name = str(player_name).lower().strip()
-        info = self.live_availability.get(name)
-        if info is None and " " in name:
-            info = self.live_availability.get(name.split()[-1])
-        if not isinstance(info, dict):
-            return float(fallback)
-        chance = info.get("chance_of_playing")
-        status = info.get("status", "a")
-        if chance is None:
-            return 100.0
-        if status in ("i", "s", "u") and chance == 0:
-            return 0.0
-        return float(chance)
+        return float(fpl_chance_of_playing(self.live_availability, player_name, team, fallback))
 
     def _freeze_current_player_state(self, future: pd.DataFrame,
                                      base: pd.DataFrame) -> pd.DataFrame:
@@ -385,10 +373,11 @@ class FiveWeekForecaster:
 
         if self.live_availability:
             future["fpl_chance_of_playing"] = [
-                self._live_chance(name, fallback)
-                for name, fallback in zip(
+                self._live_chance(name, fallback, team)
+                for name, fallback, team in zip(
                     future["player_name"],
                     future.get("fpl_chance_of_playing", pd.Series(100, index=future.index)),
+                    future["team"],
                 )
             ]
 

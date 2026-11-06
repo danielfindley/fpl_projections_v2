@@ -63,6 +63,31 @@ def normalize_team_name(name: str) -> str:
     return name_lower
 
 
+def fpl_chance_of_playing(availability: dict, name, team=None, fallback=100.0):
+    """FPL chance of playing for a FotMob name, from ``get_fpl_availability()``.
+
+    Tries the full name, then the bare surname. A surname is shared across clubs
+    (Lisandro Martínez's suspension dropped Emiliano Martínez from GW10 2026/27),
+    so the surname hit only counts when it belongs to the player's own club.
+    Returns ``fallback`` when nothing matches.
+    """
+    if pd.isna(name):
+        return fallback
+    key = str(name).lower().strip()
+    info = availability.get(key)
+    if info is None and ' ' in key:
+        info = availability.get(key.split()[-1])
+        if (isinstance(info, dict) and team is not None and info.get('team')
+                and normalize_team_name(info['team']) != normalize_team_name(team)):
+            info = None
+    if not isinstance(info, dict):
+        return fallback
+    chance = info.get('chance_of_playing')
+    if info.get('status', 'a') in ('i', 's', 'u') and chance == 0:
+        return 0
+    return chance if chance is not None else 100
+
+
 def _tune_worker(data_dir, name, n_iter, verbose, frame, params):
     pipeline = FPLPipeline(data_dir)
     pipeline.tuned_params = params
@@ -3218,34 +3243,9 @@ with open(r"{temp_result_path}", 'w') as f:
         # FPL availability filter
         fpl_availability = get_fpl_availability()
         if fpl_availability:
-            def get_availability(name, team=None):
-                if pd.isna(name):
-                    return 100
-                name_lower = str(name).lower()
-                if name_lower in fpl_availability:
-                    chance = fpl_availability[name_lower].get('chance_of_playing')
-                    status = fpl_availability[name_lower].get('status', 'a')
-                    if status in ['i', 's', 'u'] and chance == 0:
-                        return 0
-                    return chance if chance is not None else 100
-                parts = str(name).split()
-                if len(parts) > 1:
-                    last = parts[-1].lower()
-                    # A bare surname is shared across clubs (Lisandro Martínez's
-                    # suspension dropped Emiliano Martínez), so require the same club.
-                    fpl_team = fpl_availability.get(last, {}).get('team')
-                    same_club = (team is None or fpl_team is None
-                                 or normalize_team_name(fpl_team) == normalize_team_name(team))
-                    if last in fpl_availability and same_club:
-                        chance = fpl_availability[last].get('chance_of_playing')
-                        status = fpl_availability[last].get('status', 'a')
-                        if status in ['i', 's', 'u'] and chance == 0:
-                            return 0
-                        return chance if chance is not None else 100
-                return 100
-
             latest_identity['fpl_chance_of_playing'] = [
-                get_availability(n, t) for n, t in zip(latest_identity['player_name'], latest_identity['team'])]
+                fpl_chance_of_playing(fpl_availability, n, t)
+                for n, t in zip(latest_identity['player_name'], latest_identity['team'])]
             n_before = len(latest_identity)
             latest_identity = latest_identity[latest_identity['fpl_chance_of_playing'] > 0].copy()
             if verbose and (n_before - len(latest_identity)) > 0:

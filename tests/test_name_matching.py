@@ -144,3 +144,41 @@ def test_price_join_retries_misses_within_club():
                           'team': ['Newcastle United', 'Liverpool', 'Newcastle United']})
     out = attach_prices(preds, prices, verbose=False)
     assert out['price'].tolist()[:2] == [4.8, 6.0] and pd.isna(out['price'].iloc[2])
+
+
+def test_availability_surname_fallback_requires_same_club():
+    """Lisandro Martínez's suspension once dropped Emiliano Martínez (GW10 2026/27)."""
+    from src.five_week import FiveWeekForecaster
+    from src.pipeline import fpl_chance_of_playing
+    lisandro = {'chance_of_playing': 0, 'status': 's', 'team': 'Man Utd'}
+    availability = {'lisandro martínez': lisandro, 'martínez': lisandro,
+                    'fernandes': {'chance_of_playing': 75, 'status': 'd', 'team': 'Man Utd'}}
+    assert fpl_chance_of_playing(availability, 'Emiliano Martínez', 'Chelsea') == 100
+    assert fpl_chance_of_playing(availability, 'Lisandro Martínez', 'Manchester United') == 0
+    assert fpl_chance_of_playing(availability, 'Bruno Fernandes', 'Manchester United') == 75
+    forecaster = FiveWeekForecaster.__new__(FiveWeekForecaster)
+    forecaster.live_availability = availability
+    assert forecaster._live_chance('Emiliano Martínez', 100, 'Chelsea') == 100
+
+
+def test_five_week_first_gameweek_matches_weekly_run():
+    """Live check: the five-week GW+1 must agree with the weekly run it was built from.
+
+    Both run the same components on the same inputs, so beyond Monte Carlo noise
+    (sd ~0.05) any gap means the two paths resolved a player differently.
+    """
+    path = Path('output/five_week/five_week_predictions.csv')
+    runs = [d for d in Path('data/runs').glob('gw*') if (d / 'predictions.csv').exists()]
+    if not path.exists() or not runs:
+        pytest.skip('no five-week output or saved run')
+    latest = max(runs, key=lambda d: (d / 'predictions.csv').stat().st_mtime)
+    weekly = pd.read_csv(latest / 'predictions.csv')
+    five = pd.read_csv(path)
+    gw = int(weekly['gameweek'].iloc[0])
+    if five['gameweek'].min() != gw or path.stat().st_mtime < (latest / 'predictions.csv').stat().st_mtime:
+        pytest.skip(f'five-week output is not built from {latest.name}')
+    week_pts = weekly.groupby('player_id')['exp_total_pts'].sum()
+    five_pts = five[five['gameweek'] == gw].groupby('player_id')['expected_points'].sum()
+    both = pd.concat([week_pts, five_pts], axis=1, keys=['weekly', 'five_week']).dropna()
+    gap = both[(both['weekly'] - both['five_week']).abs() > 0.5]
+    assert gap.empty, f"five-week GW{gw} disagrees with {latest.name}:\n{gap.round(2).to_string()}"
