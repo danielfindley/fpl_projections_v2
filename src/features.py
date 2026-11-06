@@ -885,6 +885,12 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     df['is_mid'] = (pos == 2).astype(int)
     df['is_fwd'] = (pos == 3).astype(int)
 
+    # Recent role mix: share of the last five prior matches at each FotMob role.
+    # The current match's role isn't known at the deadline, so the model sees
+    # history only; players with none fall back to their listed role.
+    for role in ('gk', 'def', 'mid', 'fwd'):
+        df[f'{role}_share_roll5'] = prior_stat(df, 'player_id', f'is_{role}', 5).fillna(df[f'is_{role}'])
+
     # FPL position is authoritative whenever known (so an FPL DEF playing as a
     # winger still uses CBIT/10). Historical gaps fall back to that match's
     # FotMob role rather than discarding otherwise useful DefCon history.

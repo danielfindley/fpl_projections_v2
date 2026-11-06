@@ -69,12 +69,22 @@ Tuning follows the model dependency chain with OOF feature propagation:
 2. **Clean sheet** tunes next → generates OOF `pred_team_goals` on training set
 3. **Goals, Assists, Defcon, Saves** tune using OOF predictions as features (matches inference conditions)
 
-Feature ranking uses wrapper-based XGBoost gain fitted separately inside each
-expanding training fold. Optuna jointly selects the feature count and tree
-parameters via five-fold temporal CV; the final ranking is fit again on the
-full training window only.
+**Goals, assists and defcon use no feature selection** (subprocess tune path,
+`SELECT_FEATURES`): every candidate in `FEATURES` goes in and Optuna tunes only the
+tree parameters, with column subsampling and regularisation handling the heavily
+correlated windows. On three 10-GW holdouts the old top-N selection tied
+all-features (within ±0.5% deviance) while its ranking ignored the exposure offset
+and saw the CV folds. Saves still ranks features five ways (xgb_gain, xgb_cover,
+lgbm, permutation, mutual_info) once on the full tuning window, and Optuna picks
+`feat_method` and `n_features` alongside the tree parameters via five-fold
+temporal CV. Protected features (`pred_minutes`, `pred_team_goals`) are always
+included and don't count toward the feature count.
 
-Protected features (`pred_minutes`, `pred_team_goals`) are always included and don't count toward the feature count. Min features: 15 for goals, 5 for others.
+**Role-mix features** (`{gk,def,mid,fwd}_share_roll5`, goals and assists): share of
+the last five prior matches at each FotMob role (`prior_stat`, so never the
+match's own role). FotMob roles are sticky (0.6% of matches differ from the
+previous one); Mbeumo, Saka and Semenyo are FWD. Without them the goals model
+over-predicted defenders' goals by ~25% (DEF convert below their xG).
 
 Loss functions per model: Poisson deviance (goals, assists, defcon, clean sheet), MAE (saves), Huber (minutes). Goals, Assists, and Defcon use `count:poisson` objective + Poisson deviance eval metric on raw match counts (0, 1, 2, ...) with a log-minutes exposure offset, so the booster learns a per-90 rate and expected counts scale with `pred_minutes`.
 

@@ -1491,11 +1491,15 @@ exposure = (np.column_stack([log_exposure(df_train['minutes']), log_exposure(df_
 
 tscv = TimeSeriesSplit(n_splits=5)
 
+# Rate models use every candidate: on three 10-GW holdouts top-N selection tied
+# all-features, and column subsampling + regularisation handle the redundancy.
+SELECT_FEATURES = model_name not in ('goals', 'assists', 'defcon')
+
 # Pre-compute feature rankings
-xgb_hint = {{'objective': 'count:poisson'}} if model_name in ('goals', 'assists', 'defcon') else {{}}
-print(f"Pre-computing feature rankings ({{n_total_features}} features, {{len(RANKING_METHODS)}} methods)...")
-rankings = compute_feature_rankings(X_full, y, all_features, task='regression', xgb_params=xgb_hint)
-print(f"Rankings computed. Starting Optuna search...")
+if SELECT_FEATURES:
+    print(f"Pre-computing feature rankings ({{n_total_features}} features, {{len(RANKING_METHODS)}} methods)...")
+    rankings = compute_feature_rankings(X_full, y, all_features, task='regression')
+    print(f"Rankings computed. Starting Optuna search...")
 
 def objective(trial):
     params = {{
@@ -1516,13 +1520,16 @@ def objective(trial):
         params['objective'] = 'count:poisson'
 
     # Feature selection as hyperparameters
-    feat_method = trial.suggest_categorical('feat_method', RANKING_METHODS)
-    n_selectable = n_total_features - len(protected)
-    n_features = trial.suggest_int('n_features', min_feats, n_selectable)
+    if SELECT_FEATURES:
+        feat_method = trial.suggest_categorical('feat_method', RANKING_METHODS)
+        n_selectable = n_total_features - len(protected)
+        n_features = trial.suggest_int('n_features', min_feats, n_selectable)
 
-    selected = select_features(rankings, feat_method, n_features, protected)
-    feat_idx = [all_features.index(f) for f in selected]
-    X_sel = X_full[:, feat_idx]
+        selected = select_features(rankings, feat_method, n_features, protected)
+        feat_idx = [all_features.index(f) for f in selected]
+        X_sel = X_full[:, feat_idx]
+    else:
+        X_sel = X_full
 
     if exposure is not None:
         model = ExposureXGBRegressor(**params)
@@ -1536,9 +1543,13 @@ study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESam
 study.optimize(objective, n_trials=n_iter, show_progress_bar=False)
 
 best_params = study.best_params.copy()
-best_feat_method = best_params.pop('feat_method')
-best_n_features = best_params.pop('n_features')
-selected_features = select_features(rankings, best_feat_method, best_n_features, protected)
+if SELECT_FEATURES:
+    best_feat_method = best_params.pop('feat_method')
+    best_n_features = best_params.pop('n_features')
+    selected_features = select_features(rankings, best_feat_method, best_n_features, protected)
+else:
+    best_feat_method = 'none'
+    selected_features = list(all_features)
 
 if model_name in ('goals', 'assists', 'defcon'):
     best_params['objective'] = 'count:poisson'
@@ -3207,7 +3218,7 @@ with open(r"{temp_result_path}", 'w') as f:
         # FPL availability filter
         fpl_availability = get_fpl_availability()
         if fpl_availability:
-            def get_availability(name):
+            def get_availability(name, team=None):
                 if pd.isna(name):
                     return 100
                 name_lower = str(name).lower()
@@ -3220,7 +3231,12 @@ with open(r"{temp_result_path}", 'w') as f:
                 parts = str(name).split()
                 if len(parts) > 1:
                     last = parts[-1].lower()
-                    if last in fpl_availability:
+                    # A bare surname is shared across clubs (Lisandro Martínez's
+                    # suspension dropped Emiliano Martínez), so require the same club.
+                    fpl_team = fpl_availability.get(last, {}).get('team')
+                    same_club = (team is None or fpl_team is None
+                                 or normalize_team_name(fpl_team) == normalize_team_name(team))
+                    if last in fpl_availability and same_club:
                         chance = fpl_availability[last].get('chance_of_playing')
                         status = fpl_availability[last].get('status', 'a')
                         if status in ['i', 's', 'u'] and chance == 0:
@@ -3228,7 +3244,8 @@ with open(r"{temp_result_path}", 'w') as f:
                         return chance if chance is not None else 100
                 return 100
 
-            latest_identity['fpl_chance_of_playing'] = latest_identity['player_name'].apply(get_availability)
+            latest_identity['fpl_chance_of_playing'] = [
+                get_availability(n, t) for n, t in zip(latest_identity['player_name'], latest_identity['team'])]
             n_before = len(latest_identity)
             latest_identity = latest_identity[latest_identity['fpl_chance_of_playing'] > 0].copy()
             if verbose and (n_before - len(latest_identity)) > 0:

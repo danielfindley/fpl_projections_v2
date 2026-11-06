@@ -312,6 +312,7 @@ def get_fpl_availability() -> dict:
         bootstrap = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/", timeout=10).json()
         
         availability = {}
+        teams = {t['id']: t['name'] for t in bootstrap['teams']}
         for p in bootstrap['elements']:
             names = [
                 p['web_name'].lower(),
@@ -324,6 +325,7 @@ def get_fpl_availability() -> dict:
                 'status': p.get('status', 'a'),  # a=available, i=injured, d=doubtful, s=suspended
                 'news': p.get('news', ''),
                 'fpl_id': p['id'],
+                'team': teams.get(p['team']),
             }
             
             for name in names:
