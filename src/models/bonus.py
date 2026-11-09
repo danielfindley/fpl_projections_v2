@@ -669,7 +669,10 @@ class BonusModel:
                 team_goals[:, attackers] = score[:, None]
                 scorer_weights = goal_mean[attackers][None, :] * scale[:, attackers] / lam
                 scorer_weights /= np.maximum(scorer_weights.sum(axis=1, keepdims=True), 1)
-                assist_weights = assist_mean[attackers][None, :] * scale[:, attackers] / lam
+                # The assist model already counts only assists on team-mates' goals,
+                # so spread each player's mean over the goals he does not score.
+                assist_weights = (assist_mean[attackers][None, :] * scale[:, attackers] / lam
+                                  / np.maximum(1 - scorer_weights, 1e-6))
                 for event in range(int(score.max(initial=0))):
                     active = np.flatnonzero(score > event)
                     cdf = scorer_weights[active].cumsum(axis=1)
