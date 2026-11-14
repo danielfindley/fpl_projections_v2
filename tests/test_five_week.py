@@ -345,14 +345,14 @@ def test_lineup_probability_is_joint_and_availability_is_applied_once():
     probability, _ = model.predict_distribution(
         frame, appear_prob=np.full(4, .2), lineup_p_start=np.ones(4),
         lineup_weight=1., availability=np.array([1., .5, 0., 1.]))
-    np.testing.assert_allclose(probability[0], [.01, .09, .9])
-    np.testing.assert_allclose(probability[1], [.505, .045, .45])
+    np.testing.assert_allclose(probability[0], [.05, .05, .9])
+    np.testing.assert_allclose(probability[1], [.525, .025, .45])
     np.testing.assert_allclose(probability[2], [1., 0., 0.])
     np.testing.assert_allclose(probability.sum(axis=1), 1.)
     # The weight hedges who starts, not whether a listed starter plays.
     hedged, _ = model.predict_distribution(
         frame, appear_prob=np.full(4, .2), lineup_p_start=np.ones(4), lineup_weight=.7)
-    np.testing.assert_allclose(1 - hedged[:, 0], .99)
+    np.testing.assert_allclose(1 - hedged[:, 0], .95)
     np.testing.assert_allclose(hedged[:, 2], .3 * .2 * .5 + .7 * .9)
 
 

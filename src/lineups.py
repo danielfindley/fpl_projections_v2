@@ -153,7 +153,12 @@ def evaluate_snapshots(actuals: pd.DataFrame, data_dir: str = 'data',
         truth = played[(played['season'] == season) & (played['gameweek'] == gw)]
         if truth.empty:
             continue
-        matched = match_lineups(snap, truth, verbose=False)
+        # Match against the whole squad, not only those who played: a listed
+        # player who never came on must count as a miss, not vanish.
+        start = int(str(season)[:4])
+        squad = played[played['season'].isin([season, f'{start - 1}/{start}'])]
+        squad = squad.drop_duplicates('player_name', keep='last')[['player_name', 'team']]
+        matched = match_lineups(snap, squad, verbose=False)
         m = matched[matched['matched_name'].notna()]
         actual = truth.groupby('player_name')['minutes'].max()
         for r in m.itertuples():
@@ -182,12 +187,16 @@ def evaluate_snapshots(actuals: pd.DataFrame, data_dir: str = 'data',
         if len(xi):
             print(f"    predicted starter -> started {xi['started'].mean():.3f}, "
                   f"appeared {xi['appeared'].mean():.3f}  (p_in currently 1.0)")
+            xq = xi[xi['status'] == 'QUES']
+            if len(xq):
+                print(f"    predicted starter flagged QUES -> started {xq['started'].mean():.3f}, "
+                      f"appeared {xq['appeared'].mean():.3f}  (p_in_ques currently 0.65)")
         if len(bench):
-            print(f"    listed non-starter -> started {bench['started'].mean():.3f}"
-                  f"  (p_out currently 0.10)")
+            print(f"    injury-list player -> started {bench['started'].mean():.3f}, "
+                  f"appeared {bench['appeared'].mean():.3f}")
         q = ev[ev['status'] == 'QUES']
         if len(q):
-            print(f"    QUES -> appeared {q['appeared'].mean():.3f} (not applied)")
+            print(f"    QUES -> appeared {q['appeared'].mean():.3f}")
     return ev
 
 
@@ -270,6 +279,7 @@ def match_lineups(lineups: pd.DataFrame, predictions: pd.DataFrame,
 
 def build_overrides(matched: pd.DataFrame, predictions: pd.DataFrame,
                     p_in: float = 1.0, p_out: float = 0.10,
+                    p_in_ques: float = 0.65, p_out_gk: float = 0.03,
                     verbose: bool = True) -> pd.DataFrame:
     """Turn matched lineup rows into per-player overrides aligned to predictions.
 
@@ -279,6 +289,10 @@ def build_overrides(matched: pd.DataFrame, predictions: pd.DataFrame,
 
     Players the feed does not mention at all keep NaN and fall through to the model,
     since absence from the page is not evidence of being dropped.
+
+    Over GW1-10 2026/27 a predicted starter flagged QUES played 60+ in 59% of
+    cases and appeared in 70%, against 84% and 94% unflagged, hence ``p_in_ques``.
+    A goalkeeper left out of the XI appeared in 3%, hence ``p_out_gk``.
     """
     from .pipeline import normalize_team_name
 
@@ -311,6 +325,9 @@ def build_overrides(matched: pd.DataFrame, predictions: pd.DataFrame,
         if not risky:
             complete.add(tn)
 
+    doubtful = set(xi.loc[xi['status'] == 'QUES', 'matched_name'])
+    keepers = pd.to_numeric(predictions.get('is_gk', pd.Series(0, index=predictions.index)),
+                            errors='coerce').fillna(0).eq(1).to_numpy()
     unavailable = set(listed.loc[listed['status'].isin(UNAVAILABLE), 'matched_name'])
     unavailable |= set(xi.loc[xi['status'].isin(UNAVAILABLE), 'matched_name'])
 
@@ -324,14 +341,15 @@ def build_overrides(matched: pd.DataFrame, predictions: pd.DataFrame,
             p_start[i] = p_out
             continue
         if name in starters:
-            p_start[i] = p_in
+            p_start[i] = p_in_ques if name in doubtful else p_in
         elif team in complete:
-            p_start[i] = p_out
+            p_start[i] = p_out_gk if keepers[i] else p_out
 
     if verbose:
         n_partial = len(set(all_xi['team'].map(normalize_team_name)) - complete)
-        print(f"  Lineup overrides: {int(np.sum(p_start == p_in))} starters, "
-              f"{int(np.sum((p_start == p_out) & (available != 0.0)))} benched, "
+        print(f"  Lineup overrides: {int(np.sum(p_start >= p_in_ques))} starters "
+              f"({int(np.sum(p_start == p_in_ques))} doubtful), "
+              f"{int(np.sum((p_start <= p_out) & (available != 0.0)))} benched, "
               f"{int(np.nansum(available == 0.0))} unavailable, "
               f"{int(np.sum(np.isnan(p_start)))} left to the model")
         if n_partial:

@@ -819,6 +819,8 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     # =========================================================================
 
     if 'yellow_cards' in df.columns:
+        # The fill below would otherwise let rows with no FPL match train as "no card".
+        df['yellow_cards_known'] = pd.to_numeric(df['yellow_cards'], errors='coerce').notna()
         df['yellow_cards'] = pd.to_numeric(df['yellow_cards'], errors='coerce').fillna(0)
         for window in ROLLING_WINDOWS:
             df[f'yellow_cards_roll{window}'] = prior_stat(df, 'player_id', 'yellow_cards', window, 'mean', 1)
@@ -1026,6 +1028,8 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     if 'opponent' in df.columns:
         opp_og = df.groupby(['opponent', 'season', 'gameweek', 'match_id'])['own_goal'].sum().reset_index()
         opp_og = opp_og.rename(columns={'opponent': 'team', 'own_goal': 'opp_own_goals'})
+        # 'opponent' comes from fixtures and spells Bournemouth and Brighton differently.
+        opp_og['team'] = opp_og['team'].replace(TEAM_NAME_MAP)
         team_stats = team_stats.merge(opp_og, on=['team', 'season', 'gameweek', 'match_id'], how='left')
         team_stats['opp_own_goals'] = team_stats['opp_own_goals'].fillna(0)
         team_stats['team_goals'] = team_stats['goals'] + team_stats['opp_own_goals']

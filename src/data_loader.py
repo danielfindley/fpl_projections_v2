@@ -229,6 +229,60 @@ def merge_fixtures(player_df: pd.DataFrame, fixtures_df: pd.DataFrame) -> pd.Dat
     return merged
 
 
+def load_fpl_schedule(data_dir: str = 'data') -> pd.Series:
+    """(season, kickoff) -> FPL gameweek, from the archived per-gameweek files."""
+    frames = []
+    for path in sorted(Path(data_dir, 'fpl_history').glob('*_merged_gw.csv')):
+        start = int(path.name[:4])
+        gws = pd.read_csv(path, usecols=['GW', 'kickoff_time'])
+        gws['season'] = f'{start}/{start + 1}'
+        frames.append(gws)
+    if not frames:
+        return pd.Series(dtype=float)
+    gws = pd.concat(frames, ignore_index=True)
+    gws['kickoff'] = pd.to_datetime(gws['kickoff_time'], errors='coerce', utc=True)
+    return gws.dropna(subset=['kickoff']).groupby(['season', 'kickoff'])['GW'].agg(
+        lambda values: values.mode().iloc[0])
+
+
+def assign_played_gameweek(df: pd.DataFrame, match_dates: pd.DataFrame,
+                           schedule: pd.Series = None,
+                           tolerance_days: float = 2.5) -> pd.DataFrame:
+    """Move rescheduled fixtures to the gameweek they were actually played in.
+
+    FotMob keeps a postponed match under its original round, months before its
+    kickoff. FPL scores it in the gameweek whose deadline precedes it, which is
+    also the information cutoff a forecast of that match would have had. Left
+    alone, the row's features freeze at the original deadline and its FPL stats
+    join the wrong gameweek.
+
+    Seasons in ``schedule`` (from ``load_fpl_schedule``) take FPL's own gameweek
+    by kickoff time. Other seasons move a match played away from its round's
+    main block to the latest round that had started by then.
+    """
+    dates = match_dates.drop_duplicates('match_id').set_index('match_id')['match_date']
+    matches = df[['match_id', 'season', 'gameweek']].drop_duplicates('match_id').copy()
+    matches['date'] = pd.to_datetime(matches['match_id'].map(dates), errors='coerce', utc=True)
+    matches = matches.dropna(subset=['date', 'gameweek'])
+    moved = {}
+    known = set(schedule.index.get_level_values(0)) if schedule is not None and len(schedule) else set()
+    for name, season in matches.groupby('season'):
+        if name in known:
+            official = schedule.loc[name].reindex(season['date'])
+            moved.update(dict(zip(season['match_id'][official.notna().to_numpy()], official.dropna())))
+            continue
+        median = season.groupby('gameweek')['date'].transform('median')
+        on_time = (season['date'] - median).abs() <= pd.Timedelta(days=tolerance_days)
+        starts = season[on_time].groupby('gameweek')['date'].min().sort_values()
+        for match_id, date in season.loc[~on_time, ['match_id', 'date']].itertuples(index=False):
+            earlier = starts[starts <= date + pd.Timedelta(hours=12)]
+            if len(earlier):
+                moved[match_id] = earlier.index[-1]
+    out = df.copy()
+    out['gameweek'] = out['match_id'].map(moved).fillna(out['gameweek'])
+    return out
+
+
 def get_fpl_positions() -> dict:
     """Fetch ambiguity-safe FPL positions keyed by normalized player names.
 
@@ -764,6 +818,10 @@ def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
 
     # Build FPL lookup: (name_norm, team_norm, gameweek) -> dict of FPL stats
     fpl_lookup = {}
+    # The API cache files a player under his current club, so matches he played
+    # before a mid-season move miss the club-scoped keys. A full name held by one
+    # FPL player that gameweek is safe to match without the club.
+    any_club = {}
     team_gw_candidates = {}
     position_sets = {}
     for _, row in fpl_df.iterrows():
@@ -779,6 +837,8 @@ def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
         }
         key = (row['_name_norm'], row['_team_norm'], row['season'], row['gameweek'])
         fpl_lookup[key] = entry
+        if ' ' in row['_name_norm']:
+            any_club.setdefault((row['_name_norm'], row['season'], row['gameweek']), {})[row.get('fpl_id')] = entry
         candidate_key = (row['_team_norm'], row['season'], row['gameweek'])
         candidate_names = {
             name for name in (row['_name_norm'], row.get('_web_norm', '')) if name
@@ -866,6 +926,10 @@ def merge_fpl_card_data(df: pd.DataFrame, data_dir: str = 'data',
         if result is None:
             result = _match_team_candidate(
                 row['_name_norm'], row['_team_norm'], row['season'], gw)
+        if result is None:
+            elsewhere = any_club.get((row['_name_norm'], row['season'], gw), {})
+            if len(elsewhere) == 1:
+                result = next(iter(elsewhere.values()))
         if result is not None:
             fpl_positions[i] = result['fpl_position']
         else:

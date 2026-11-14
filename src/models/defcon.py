@@ -60,6 +60,13 @@ class DefconModel(BaseModel):
 
     TARGET = 'defcon'
     EXPOSURE_OFFSET = True
+    # FotMob's defensive counts drifted: at 60+ minutes defenders hit the
+    # threshold 18% of the time through 2023/24 and 28-29% since 2025/26
+    # (clearances up 40%), while midfielders fell from 36% to about 20%
+    # (recoveries down 20%). Trained on every season, defender defcon points ran
+    # 17% low on three 10-GW holdouts (.350 vs .423); from 2023/24 they run 11%
+    # low (.378) with the best defcon deviance (2.3281 vs 2.3332).
+    TRAIN_FROM_SEASON = '2023/2024'
 
     def __init__(self, **xgb_params):
         # Existing tuned-parameter files remain loadable, but their position
@@ -118,6 +125,10 @@ class DefconModel(BaseModel):
         ].copy()
         if train_df.empty:
             raise ValueError("DefconModel requires an FPL/FotMob-resolved DEF or MID position")
+        if 'season' in train_df:
+            recent = train_df[train_df['season'].astype(str) >= self.TRAIN_FROM_SEASON]
+            if not recent.empty:
+                train_df = recent
 
         super().fit(train_df, verbose=verbose)
         self._estimate_dispersion(train_df)

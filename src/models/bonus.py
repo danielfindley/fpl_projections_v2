@@ -120,6 +120,7 @@ def normalize_team_name(name: str) -> str:
         'aston villa': 'villa',
         'leeds united': 'leeds',
         'leicester city': 'leicester',
+        'afc bournemouth': 'bournemouth',
         # Short variations
         'man city': 'man city',
         'man utd': 'man utd',

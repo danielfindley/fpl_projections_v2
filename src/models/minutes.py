@@ -18,10 +18,13 @@ from ..features import APPEARANCE_FEATURES
 
 
 # Shared feature list (classifier uses all, regressors use subsets)
-# A listed starter's floor on P(appears). Hedging appearance with the model let
-# it keep the classifier's ~10% blank risk; all 1,448 listed starters with a row
-# over 2026/27 GW1-7 played. Kept below 1 for warm-up withdrawals.
-LISTED_STARTER_APPEAR = 0.99
+# A listed starter's floor on P(appears). Over 2026/27 GW1-10, 93.9% of the
+# 2,145 predicted starters (latest snapshot before the first kickoff, scored
+# against the whole squad) appeared, and 95.9% when scraped two hours out.
+LISTED_STARTER_APPEAR = 0.95
+# Goalkeepers are almost never substituted on: 98.3% of their appearances last
+# 60+ minutes, so a keeper cannot be much likelier to appear than to play 60.
+GK_SIXTY_GIVEN_APPEAR = 0.983
 
 ALL_FEATURES = [
     # Minutes history
@@ -476,13 +479,16 @@ class MinutesModel:
 
     def predict_distribution(self, df: pd.DataFrame, lineup_p_start=None,
                              lineup_weight: float = 0.7, appear_prob=None,
-                             availability=None):
+                             availability=None, cap_keepers: bool = False):
         """Joint probabilities for absent, 1-59 minutes and 60-90 minutes.
 
         The classifier estimates P(60+ | appears); a lineup feed estimates
         P(start). Convert the latter to a joint 60+ prior with a completion rate,
         then blend whole distributions. A probable starter must also be probable
         to appear. Injury/suspension availability discounts the mixture once.
+        ``cap_keepers`` ties a goalkeeper's appearance to his 60+ probability;
+        it is for live forecasts, where appearance is modelled, not for scoring
+        conditional on an appearance.
         """
         if not self.is_fitted:
             raise ValueError("MinutesModel not fitted")
@@ -503,6 +509,9 @@ class MinutesModel:
             # appears, so appearance takes the feed's floor unblended.
             appear = np.where(have,
                 np.maximum(appear, np.minimum(starts, LISTED_STARTER_APPEAR)), appear)
+        if cap_keepers and 'is_gk' in df:
+            keeper = pd.to_numeric(df['is_gk'], errors='coerce').fillna(0).eq(1).to_numpy()
+            appear = np.where(keeper, np.minimum(appear, p60_joint / GK_SIXTY_GIVEN_APPEAR), appear)
         if availability is not None:
             available = np.clip(np.asarray(availability, dtype=float), 0, 1)
             appear, p60_joint = appear * available, p60_joint * available

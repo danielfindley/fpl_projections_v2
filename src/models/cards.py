@@ -111,6 +111,8 @@ class CardsModel(ManagerFeatureMixin):
                 "and that the FPL API is reachable."
             )
 
+        if 'yellow_cards_known' in df.columns:
+            df['yellow_cards'] = df['yellow_cards'].where(df['yellow_cards_known'].fillna(False).astype(bool))
         n_with_data = df['yellow_cards'].notna().sum()
         if n_with_data == 0:
             raise ValueError(

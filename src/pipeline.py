@@ -8,7 +8,7 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, Optional
 
-from .data_loader import load_player_stats, load_fixtures, merge_fixtures, get_fpl_positions, map_fpl_position, get_fpl_availability, merge_fpl_card_data, get_fpl_current_squads, normalize_player_name, match_within_club, fetch_fpl_ownership
+from .data_loader import load_player_stats, load_fixtures, merge_fixtures, get_fpl_positions, map_fpl_position, get_fpl_availability, merge_fpl_card_data, get_fpl_current_squads, normalize_player_name, match_within_club, fetch_fpl_ownership, assign_played_gameweek, load_fpl_schedule
 from .features import (compute_rolling_features, build_appearance_grid,
                        chronological_frame, deadline_splits,
                        resolve_defcon_positions)
@@ -132,6 +132,12 @@ class FPLPipeline:
             on='match_id', how='left'
         )
         
+        date_path = self.data_dir / 'matches' / 'match_details.csv'
+        if date_path.exists():
+            self.df = assign_played_gameweek(
+                self.df, pd.read_csv(date_path, usecols=['match_id', 'match_date']),
+                load_fpl_schedule(str(self.data_dir)))
+
         # Merge to get opponent and is_home
         self.df = merge_fixtures(self.df, fixtures)
         
@@ -178,6 +184,11 @@ class FPLPipeline:
                 fallback_to_fotmob=False),
             axis=1,
         ).astype('string').str.upper()
+        # A current FPL player can share a past player's surname (Pedro Neto / the
+        # goalkeeper Neto). Goalkeeper status never differs between the two feeds,
+        # so a disagreement there means the name matched someone else.
+        fotmob_gk = pd.to_numeric(self.df['position'], errors='coerce').eq(0)
+        api_position = api_position.mask(api_position.eq('GK').fillna(False) != fotmob_gk)
         cached_position = self.df.get(
             'fpl_position', pd.Series(pd.NA, index=self.df.index, dtype='string')
         ).astype('string').str.upper()
@@ -2836,7 +2847,8 @@ with open(r"{temp_result_path}", 'w') as f:
         if lineup_available is not None:
             available *= np.where(np.isfinite(lineup_available), lineup_available, 1.)
         return self.models['minutes'].predict_distribution(
-            test_df, lineup_p_start=lineup_p_start, appear_prob=appear, availability=available)
+            test_df, lineup_p_start=lineup_p_start, appear_prob=appear, availability=available,
+            cap_keepers=True)
 
     def load_lineups(self, gameweek: int = None, season: str = '2026/2027',
                      snapshot: bool = True, html: str = None,
