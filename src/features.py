@@ -343,8 +343,18 @@ def _compute_calendar_minutes_features(df: pd.DataFrame,
                 prev_team = last_team.reindex(pd.MultiIndex.from_arrays([spells['player_id'], prev_season]))
                 opening = schedule.groupby(['team', 'season'])['match_date'].min()
                 season_start = opening.reindex(pd.MultiIndex.from_frame(spells[['team', 'season']]))
-                carried = (prev_team.to_numpy() == spells['team'].to_numpy()) \
-                    & ~spells.duplicated(['player_id', 'season']).to_numpy()
+                carried = prev_team.to_numpy() == spells['team'].to_numpy()
+                # A squad player whose first row this season is the fixture being
+                # forecast has not played yet, whatever club he was at before. Without
+                # this a benched signing keeps his old club's starter history (Darlow,
+                # GW12 2026/27: 0.88 to appear after ten unused weeks).
+                if '_synthetic' in frame:
+                    unplayed = (frame.assign(_synthetic=frame['_synthetic'].fillna(False).astype(bool))
+                                .sort_values('match_date')
+                                .groupby(['player_id', 'season'])['_synthetic'].first())
+                    carried |= unplayed.reindex(pd.MultiIndex.from_frame(
+                        spells[['player_id', 'season']])).fillna(False).astype(bool).to_numpy()
+                carried &= ~spells.duplicated(['player_id', 'season']).to_numpy()
                 spells.loc[carried, 'start_date'] = season_start.to_numpy()[carried]
         spells = pd.DataFrame(spells)
         grids = []

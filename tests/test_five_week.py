@@ -5,6 +5,7 @@ from src.five_week import (
     WeekForecast,
     apply_live_availability,
     build_horizon_training_frame,
+    cap_keeper_share,
     current_durability,
 )
 from src.five_week_viz import build_report_payload, render_five_week_html
@@ -49,6 +50,19 @@ def test_live_zero_chance_recovers_across_horizons():
     np.testing.assert_allclose(h1, [[1.0, 0.0, 0.0, 0.0]], atol=1e-8)
     assert h5[0, 0] < 0.2
     np.testing.assert_allclose(h5.sum(axis=1), [1.0])
+
+
+def test_backup_keepers_share_what_the_first_choice_leaves():
+    probability = np.array([[.1, .0, .1, .8], [.5, .0, .1, .4], [.7, .1, .1, .1],
+                            [.4, .2, .2, .2], [.2, .0, .0, .8], [.9, .0, .0, .1]])
+    frame = pd.DataFrame({"is_gk": [1, 1, 1, 0, 1, 1], "team": ["A", "A", "A", "A", "B", "B"],
+                          "match_id": [1, 1, 1, 1, 2, 2]})
+
+    capped = cap_keeper_share(probability, frame)
+
+    np.testing.assert_allclose(1 - capped[:3, 0], [.9, .1 * .5 / .8, .1 * .3 / .8])
+    np.testing.assert_allclose(capped[3:], probability[3:])
+    np.testing.assert_allclose(capped.sum(axis=1), 1.0)
 
 
 def test_report_is_standalone_sortable_and_has_distribution_modal(tmp_path):

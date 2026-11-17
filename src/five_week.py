@@ -305,6 +305,29 @@ def apply_live_availability(
     return out / out.sum(axis=1, keepdims=True)
 
 
+def cap_keeper_share(probability: np.ndarray, frame: pd.DataFrame) -> np.ndarray:
+    """Limit a club's backup goalkeepers to the share its first choice leaves.
+
+    The role model scores each keeper alone, so a first choice at 0.89 and two
+    established backups at 0.39 and 0.30 add up to 1.6 keepers in one match. The
+    most likely keeper is left as predicted (a keeper on a run of ten or more
+    matches was still in goal 94% of the time two matches later and 89% five
+    later, in line with the model) and the others are scaled to fit the rest.
+    """
+    out = np.asarray(probability, dtype=float).copy()
+    keeper = pd.to_numeric(frame["is_gk"], errors="coerce").fillna(0).eq(1).to_numpy()
+    play = pd.Series(np.where(keeper, 1.0 - out[:, 0], 0.0))
+    club = play.groupby([frame["team"].to_numpy(), frame["match_id"].to_numpy()])
+    first = club.transform("max").to_numpy()
+    backups = club.transform("sum").to_numpy() - first
+    is_first = club.rank(ascending=False, method="first").eq(1).to_numpy()
+    scale = np.divide(1.0 - first, backups, out=np.ones(len(out)), where=backups > 1.0 - first)
+    scale = np.where(keeper & ~is_first, np.minimum(scale, 1.0), 1.0)
+    out[:, 1:] *= scale[:, None]
+    out[:, 0] = 1.0 - out[:, 1:].sum(axis=1)
+    return out
+
+
 def weekly_display_roles(weekly_probability: np.ndarray,
                          horizon_probability: np.ndarray) -> np.ndarray:
     """Map the weekly model's absent / sub / 60+ onto the report's four roles.
@@ -388,6 +411,7 @@ class FiveWeekForecaster:
             future.get("fpl_chance_of_playing", pd.Series(100, index=future.index)),
             horizon,
         )
+        probability = cap_keeper_share(probability, future)
         state_minutes = self.role_model.state_minutes
         seed = self.seed + int(gameweek) * 1009
         if horizon == 1:

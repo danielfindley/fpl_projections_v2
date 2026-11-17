@@ -27,6 +27,7 @@ from src.five_week import (
     HorizonRoleModel,
     backtest_role_variants,
     build_horizon_training_frame,
+    build_role_grid,
     current_durability,
 )
 from src.five_week_viz import build_report_payload, render_five_week_html
@@ -166,7 +167,7 @@ def main() -> int:
     pipeline.compute_features(verbose=verbose)
 
     print("\nBuilding direct GW+1..GW+5 role targets...")
-    training_frame, role_grid = build_horizon_training_frame(pipeline.df)
+    training_frame, _ = build_horizon_training_frame(pipeline.df)
     seasons = sorted(training_frame["season"].dropna().unique())
     completed = [value for value in seasons if value < season]
     if not completed:
@@ -205,10 +206,15 @@ def main() -> int:
         base_rows = pipeline._build_test_set(gameweeks[0], season, verbose=verbose)
         if base_rows.empty:
             raise RuntimeError(f"No prediction rows generated for GW{gameweeks[0]}")
+        # Durability has to count this season's unused weeks for squad players who
+        # have not appeared yet; the grid built from played matches has no rows for them.
+        live_grid = build_role_grid(pd.concat(
+            [pipeline.df, base_rows.assign(_synthetic=True)], ignore_index=True))
+        live_grid = live_grid[~live_grid["match_id"].isin(base_rows["match_id"])]
         forecaster = FiveWeekForecaster(
             pipeline,
             role_model,
-            current_durability(role_grid),
+            current_durability(live_grid),
             n_sims=args.n_sims,
             live_availability=live_availability,
         )
