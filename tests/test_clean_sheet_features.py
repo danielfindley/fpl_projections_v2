@@ -512,6 +512,7 @@ def test_train_predict_holdout_use_shared_wrappers_without_production_files(tmp_
     raw = _dated_history(9)
     raw.attrs['data_dir'] = str(tmp_path)
     pipeline = FPLPipeline(str(tmp_path), n_sims=40)
+    pipeline.model_backend = 'xgboost'
     pipeline.raw_df = chronological_frame(raw)
     pipeline.df = compute_rolling_features(raw, verbose=False)
     pipeline.current_season_players = set(raw['player_id'])
@@ -542,6 +543,49 @@ def test_train_predict_holdout_use_shared_wrappers_without_production_files(tmp_
     assert np.isfinite(metrics['_fpl_points_mae']['mae_ex_bonus'])
     assert all(np.isfinite(metrics[name]['primary']) for name in
                ('minutes', 'clean_sheet', 'goals', 'assists', 'defcon', 'saves'))
+
+
+def test_neural_backend_drives_train_predict_and_holdout(tmp_path, monkeypatch):
+    """The neural adapters must satisfy every interface train/predict/holdout call."""
+    torch = pytest.importorskip('torch')
+    if not torch.cuda.is_available():
+        pytest.skip('neural backend needs a CUDA GPU')
+    from src.features import compute_rolling_features, chronological_frame
+    from src.pipeline import FPLPipeline
+    import src.pipeline as pipeline_module
+    import src.models.neural as neural
+    original = neural.train_net
+    monkeypatch.setattr(neural, 'train_net', lambda X, S, T, loss, cfg, valid, label='', verbose=True:
+                        original(X, S, T, loss, {**cfg, 'seeds': 1, 'epochs': 2}, valid, label, False))
+    raw = _dated_history(9)
+    raw.attrs['data_dir'] = str(tmp_path)
+    pipeline = FPLPipeline(str(tmp_path), n_sims=40)
+    assert pipeline.model_backend == 'neural'
+    pipeline.raw_df = chronological_frame(raw)
+    pipeline.df = compute_rolling_features(raw, verbose=False)
+    pipeline.current_season_players = set(raw['player_id'])
+    pipeline.train(verbose=False)
+    assert isinstance(pipeline.models['minutes'], neural.NeuralMinutes)
+
+    monkeypatch.setattr(pipeline_module, 'get_fpl_positions', lambda: {})
+    monkeypatch.setattr(pipeline_module, 'get_fpl_availability', lambda: {})
+    monkeypatch.setattr(pipeline_module, 'get_fpl_current_squads', lambda: ({}, {}))
+    monkeypatch.setattr(pipeline, '_get_gw_fixtures', lambda *args: pd.DataFrame([{
+        'home_team': 'Alpha', 'away_team': 'Beta', 'match_id': 99,
+        'match_date': pd.Timestamp('2024-10-12', tz='UTC')}]))
+    forecast = pipeline.predict(10, '2024/2025', verbose=False)
+    assert len(forecast) == 4 and np.isfinite(forecast['exp_total_pts']).all()
+    frame = pipeline.df
+    metrics = pipeline._evaluate_on_test_set(
+        None, frame[frame['gameweek'] <= 6], frame[frame['gameweek'] > 6], verbose=False)
+    assert metrics['_backend'] == 'neural'
+    assert np.isfinite(metrics['_fpl_points_mae']['mae_ex_bonus'])
+    assert all(np.isfinite(metrics[name]['primary']) for name in
+               ('minutes', 'clean_sheet', 'goals', 'assists', 'defcon', 'saves'))
+    # Metrics from the other backend are refused, never shown under this one.
+    pipeline.last_test_metrics = {**metrics, '_backend': 'xgboost'}
+    with pytest.raises(ValueError, match='backend'):
+        pipeline.get_viz_metrics()
 
 
 def test_fast_tuning_keeps_oof_dependencies_causal(tmp_path, monkeypatch):

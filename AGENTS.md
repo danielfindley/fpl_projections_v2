@@ -2,6 +2,8 @@
 
 This file tells Claude Code sub-agents how to run, evaluate, and iterate on FPL model experiments. Read this before doing any experimentation work.
 
+**Backend.** Production runs `MODEL_BACKEND = 'neural'` (src/pipeline.py; see CLAUDE.md, "Model backend"). On that backend `tune()` runs no Optuna search: it fits the fixed neural recipe and scores the holdout. The Optuna workflow below applies only with `MODEL_BACKEND = 'xgboost'`, so set it explicitly on the pipeline (`pipeline.model_backend = 'xgboost'`) for XGBoost experiments. Compare backends on points Poisson deviance and Spearman. Played-only MAE favours low predictions, and a constant 2 beats both models on it.
+
 ## Goal
 
 Improve FPL point prediction accuracy by iteratively tuning models, analyzing results, and making targeted changes. The north star metric is **FPL Points MAE (ex-bonus)** — the mean absolute error between actual and predicted total FPL points on the holdout test set, excluding bonus (since BonusModel is not part of tuning).

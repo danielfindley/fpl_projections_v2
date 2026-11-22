@@ -4,7 +4,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-FPL prediction pipeline: predicts Fantasy Premier League player points using FotMob match data, XGBoost models, and Optuna hyperparameter tuning.
+FPL prediction pipeline: predicts Fantasy Premier League player points using FotMob match data. The production backend is a pure deep-learning system; the XGBoost models with Optuna tuning remain selectable.
+
+## Model backend (`MODEL_BACKEND` in src/pipeline.py)
+
+`'neural'` (default since GW11 2026/27) or `'xgboost'`. It decides what `train()`, `tune()`'s holdout and `predict()` use; everything downstream (lineup blending, availability, simulation, report, optimizer, five-week) runs unchanged on either backend. **There is no automatic fallback.** A neural failure (no CUDA GPU, a training error) raises. Holdout metrics are tagged `_backend`, and `get_viz_metrics()` refuses metrics from the other backend (untagged old runs count as XGBoost), so the first deploy after a switch must re-score the holdout.
+
+**Neural system (`src/models/neural.py`, `NeuralSystem`).** No XGBoost output is used anywhere. Every network takes the row's engineered features (quantile-clipped, NaN flags, piecewise-linear encoding) plus history sequences. The sequences are the player's last 20 raw appearances, his club's last fixtures including weeks he didn't play, up to 30 squad-mates for the fixture, and both teams' last 10 matches, all cut at the row's deadline. Each sequence is encoded by a transformer or GRU, attention-pooled by the static features, and joined with its last token. The components:
+- **Minutes:** a split P(60+|appears) BCE classifier plus start/sub minute regressors. P(60+) is averaged with a 3-class grid net (DNP / 1-59 / 60+ over every eligible fixture), which also gives P(appear).
+- **Events:** per-90 Poisson rates on a log-minutes offset. Goals and defcon average single- and multi-task nets; assists, fouls, yellows and baseline BPS come from a multi-task net; saves is single-task.
+- **Defcon dispersion:** the NB `r` comes from early-stopped nets on their own validation slice.
+- **Goals conceded:** a no-offset team net.
+
+`tune()` runs no Optuna search on this backend. It fits the fixed recipe on the training window and scores the holdout (~25 min). `train()` takes ~20 min on the GPU. `tuned_params` are carried but unused.
+
+The recipe was frozen on two 10-GW windows (2025/26 GW29-38 and 2026/27 GW1-10). On the official window it beat XGBoost on minutes Huber (122.7 vs 126.0, z +4.2), saves MAE (1.354 vs 1.420, z +3.7) and defcon (2.273 vs 2.310). Points Poisson deviance (1.785 vs 1.806) and Spearman (.435 vs .426) were better, within noise. Goals and assists were tied. The neural system loses played-only points MAE by ~0.013, but MAE rewards predicting low and a constant 2 beats both models on it, so deviance and Spearman are the headline. Giving XGBoost the transferable ideas (rest-day and squad features, out-of-sample `r`, seed averaging) moved nothing, so the edge comes from the sequence formulation.
+
+What mattered: training P(60+) with BCE only (a mixture-mean loss inflates it and wrecks points). The club-rest vs player-rest features, without which a season opener reads as a 90-day injury. Head biases initialised at the pooled rates. Refitting on all data for the early-stopped epoch count. Squad players with no appearance this season get their club's unused fixtures as calendar history (`Data.augment_unused`), or they read as ~90% likely to play. Encoder choice, bigger nets and player-id embeddings made no difference.
 
 ## Setup & Running
 
@@ -216,8 +232,8 @@ failure, not a reason to silently omit a panel.
 Use the `$deploy-predictions` skill to run the full weekly pipeline. It automates:
 1. **Detect season and next gameweek** — derives the current season, queries FPL API for latest finished GW, compares against scraped data, and fails closed on a season mismatch
 2. **Scrape** — `python scrape_update_data.py --auto` (Playwright + Cloudflare bypass on FotMob)
-3. **Tune** (optional, ~30-60 min) — evaluates on the latest 10 completed GWs across seasons
-4. **Train + predict + viz** — loads tuned params, trains on all data, predicts next GW, and generates the complete report described above
+3. **Tune** (optional) — evaluates on the latest 10 completed GWs across seasons. On the neural backend this is holdout scoring only (~25 min GPU, no Optuna) and is required on the first deploy after a backend switch. On XGBoost it is the ~30-60 min Optuna tune.
+4. **Train + predict + viz** — trains the active backend on all data (neural ~20 min GPU), predicts next GW, and generates the complete report described above. A rerun after the FPL deadline must reuse the last pre-deadline `data/lineups/gw{N}_*.csv` snapshot (`pipeline.last_lineups = pd.read_csv(...)`) instead of `load_lineups()`, which would scrape RotoWire's current slate.
 5. **Save run** — `pipeline.save_run()` persists predictions, simulations, tuned params, and metrics to `data/runs/gw{N}_{timestamp}/`
 6. **Deploy** — verifies desktop/mobile report content, copies pages to the website repo, and commits/pushes intentional FPL code and website changes to `main`
 

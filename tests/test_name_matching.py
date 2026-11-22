@@ -161,6 +161,21 @@ def test_availability_surname_fallback_requires_same_club():
     assert forecaster._live_chance('Emiliano Martínez', 100, 'Chelsea') == 100
 
 
+def test_availability_matches_fpl_middle_names_within_club():
+    """Jesus and Igor Julio were projected for GW11 2026/27 after leaving: FPL keys
+    them by full names with middle names, which only a token subset reaches."""
+    from src.pipeline import fpl_chance_of_playing
+    jesus = {'chance_of_playing': 0, 'status': 'u', 'team': 'Arsenal'}
+    joao = {'chance_of_playing': 0, 'status': 'i', 'team': 'Chelsea'}
+    igor_jesus = {'chance_of_playing': 100, 'status': 'a', 'team': "Nott'm Forest"}
+    availability = {'gabriel fernando de jesus': jesus, 'fernando de jesus': jesus, 'g.jesus': jesus,
+                    'joão pedro junqueira de jesus': joao, 'igor jesus maciel da cruz': igor_jesus}
+    assert fpl_chance_of_playing(availability, 'Gabriel Jesus', 'Arsenal') == 0
+    # The subset match never crosses clubs.
+    assert fpl_chance_of_playing(availability, 'Gabriel Jesus', 'Chelsea') == 100
+    assert fpl_chance_of_playing(availability, 'Igor Jesus', 'Nottingham Forest') == 100
+
+
 def test_five_week_first_gameweek_matches_weekly_run():
     """Live check: the five-week GW+1 must agree with the weekly run it was built from.
 

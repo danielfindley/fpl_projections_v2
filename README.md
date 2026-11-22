@@ -1,12 +1,12 @@
 # FPL Prediction Pipeline
 
-Predicts Fantasy Premier League (FPL) player points using historical FotMob data, XGBoost models, and Optuna hyperparameter tuning.
+Predicts Fantasy Premier League (FPL) player points using historical FotMob data. Since GW11 2026/27 the production backend is a pure deep-learning system (PyTorch transformers/GRUs over match histories, `src/models/neural.py`, needs a CUDA GPU). The XGBoost models and Optuna tuning described below remain available with `MODEL_BACKEND = 'xgboost'` in `src/pipeline.py`. See CLAUDE.md, "Model backend".
 
 ## Quick Start
 
 ```bash
 # Install dependencies
-pip install pandas numpy xgboost scikit-learn scipy requests optuna lightgbm
+pip install pandas numpy xgboost scikit-learn scipy requests optuna lightgbm torch  # torch: a CUDA build
 
 # Or use the notebook
 jupyter notebook run_models.ipynb

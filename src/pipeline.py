@@ -80,6 +80,17 @@ def fpl_chance_of_playing(availability: dict, name, team=None, fallback=100.0):
         if (isinstance(info, dict) and team is not None and info.get('team')
                 and normalize_team_name(info['team']) != normalize_team_name(team)):
             info = None
+    if info is None and ' ' in key and team is not None:
+        # FPL full names carry middle names the squad override already accepts by
+        # token subset ('Gabriel Jesus' -> 'Gabriel Fernando de Jesus'). Without the
+        # same rule here, reinstated players never saw their status (GW11 2026/27:
+        # Jesus and Igor Julio projected after joining Barcelona and Burnley).
+        tokens = set(key.split())
+        hits = {id(v): v for k, v in availability.items()
+                if isinstance(v, dict) and tokens <= set(k.split()) and v.get('team')
+                and normalize_team_name(v['team']) == normalize_team_name(team)}
+        if len(hits) == 1:
+            info = next(iter(hits.values()))
     if not isinstance(info, dict):
         return fallback
     chance = info.get('chance_of_playing')
@@ -99,6 +110,13 @@ def _tune_worker(data_dir, name, n_iter, verbose, frame, params):
 # the neural fit. Off since the per-90 offset rate models (see CLAUDE.md).
 NEURAL_EVENT_WEIGHTS = {'goals': 0., 'assists': 0., 'defcon': 0., 'saves': 0.}
 
+# Which models train(), tune()'s holdout and predict() use: 'neural' (the pure
+# deep-learning system in src/models/neural.py) or 'xgboost'. There is no
+# automatic fallback: a neural failure raises, and holdout metrics from the other
+# backend are refused rather than shown under this one.
+MODEL_BACKEND = 'neural'
+BACKENDS = ('neural', 'xgboost')
+
 
 class FPLPipeline:
     """Complete FPL prediction pipeline."""
@@ -115,6 +133,9 @@ class FPLPipeline:
         self.current_season_players = set()  # Track players in current season
         self.n_sims = n_sims
         self.neural_event_weights = dict(NEURAL_EVENT_WEIGHTS)
+        self.model_backend = MODEL_BACKEND
+        if self.model_backend not in BACKENDS:
+            raise ValueError(f"MODEL_BACKEND must be one of {BACKENDS}, not {self.model_backend!r}")
     
     def load_data(self, verbose: bool = True) -> 'FPLPipeline':
         """Load and merge all data."""
@@ -247,9 +268,17 @@ class FPLPipeline:
         if self.df is None:
             raise ValueError("Data not loaded")
         
+        if self.model_backend == 'neural':
+            if verbose:
+                print("\n" + "=" * 60)
+                print("TRAINING FINAL MODELS ON ALL DATA (backend: neural)")
+                print("=" * 60)
+            self.models = self._fit_neural(self.df[self.df['minutes'] >= 1], verbose)
+            return self
+
         if verbose:
             print("\n" + "=" * 60)
-            print("TRAINING FINAL MODELS ON ALL DATA")
+            print("TRAINING FINAL MODELS ON ALL DATA (backend: xgboost)")
             if self.tuned_params:
                 print("(using tuned hyperparameters)")
             else:
@@ -314,6 +343,18 @@ class FPLPipeline:
 
         self.models = self._with_neural_events(self.models, self.df, verbose)
         return self
+
+    def _fit_neural(self, train, verbose=True, teams=None):
+        """Fit the pure deep-learning system on ``train`` and return its model adapters.
+
+        History pools come from the full frame and are cut at each row's deadline,
+        so they are leak-free for any ``train``/holdout split."""
+        from .models.neural import NeuralSystem
+        train = chronological_frame(train.copy())
+        if teams is None:
+            teams = CleanSheetModel().prepare_team_features(train)
+        self.neural_system = NeuralSystem(self.n_sims, verbose).fit(self.df, train, teams)
+        return self.neural_system.models()
 
     def _with_neural_events(self, fitted, train, verbose=False):
         """Blend neural per-90 event rates into the fitted XGBoost event models."""
@@ -556,11 +597,17 @@ class FPLPipeline:
             print("PHASE 1: Hyperparameter + Feature Selection Tuning (5-fold CV)")
             print("-" * 60)
         
-        if use_subprocess:
+        if self.model_backend == 'neural':
+            # The neural recipe is fixed; Optuna tunes only the XGBoost models.
+            if verbose:
+                print("  backend 'neural': no XGBoost tuning, holdout evaluation only")
+            cv_scores = {}
+        elif use_subprocess:
             new_params, cv_scores = self._tune_with_subprocess(models, n_iter, verbose, df_train)
+            self.tuned_params.update(new_params)
         else:
             new_params, cv_scores = self._tune_in_process(models, n_iter, verbose, df_train)
-        self.tuned_params.update(new_params)
+            self.tuned_params.update(new_params)
 
         # Evaluate on held-out test set
         if verbose:
@@ -577,6 +624,7 @@ class FPLPipeline:
         try:
             fpl_mae_dict = test_metrics.pop('_fpl_points_mae', None)
             test_metrics.pop('_sample_info', None)
+            description = f"[{test_metrics.pop('_backend', self.model_backend)}] {description}"
             fpl_ex = fpl_mae_dict['mae_ex_bonus'] if isinstance(fpl_mae_dict, dict) else fpl_mae_dict
             fpl_inc = fpl_mae_dict['mae_inc_bonus'] if isinstance(fpl_mae_dict, dict) else None
             fpl_top25 = None  # deprecated; column kept for schema compat
@@ -1652,19 +1700,29 @@ with open(r"{temp_result_path}", 'w') as f:
         appearance. This is not an official-points or all-roster evaluation.
         """
         from sklearn.metrics import mean_absolute_error
-        train, test = self._dependency_frames(df_train, df_test)
-        fitted = {'minutes': self._fit_model('minutes', train, self.tuned_params.get('minutes', {}))}
-        teams = CleanSheetModel().prepare_team_features(pd.concat([train, test], ignore_index=True))
-        fitted['clean_sheet'] = self._fit_model('clean_sheet',
-            teams[teams['match_id'].isin(train['match_id'])], self.tuned_params.get('clean_sheet', {}))
+        neural = self.model_backend == 'neural'
+        if neural:
+            # The networks take no upstream model outputs, so the frames need no
+            # cross-fitted pred_minutes / pred_team_goals.
+            train, test = chronological_frame(df_train.copy()), chronological_frame(df_test.copy())
+            teams = CleanSheetModel().prepare_team_features(pd.concat([train, test], ignore_index=True))
+            fitted = self._fit_neural(train, verbose, teams)
+            test['pred_minutes'] = fitted['minutes'].predict(test)
+        else:
+            train, test = self._dependency_frames(df_train, df_test)
+            fitted = {'minutes': self._fit_model('minutes', train, self.tuned_params.get('minutes', {}))}
+            teams = CleanSheetModel().prepare_team_features(pd.concat([train, test], ignore_index=True))
+            fitted['clean_sheet'] = self._fit_model('clean_sheet',
+                teams[teams['match_id'].isin(train['match_id'])], self.tuned_params.get('clean_sheet', {}))
         against = fitted['clean_sheet'].predict_goals_against(teams)
         test['pred_goals_against'] = self._map_team_prediction(test, teams, against)
         test['pred_team_goals'] = self._map_team_prediction(test, teams, against, opponent=True)
         test['pred_cs_prob'] = np.exp(-test['pred_goals_against'])
         metrics, pred_store, model_samples = {}, {}, {}
-        for name in ('goals', 'assists', 'defcon', 'saves'):
-            fitted[name] = self._fit_model(name, train, self.tuned_params.get(name, {}))
-        fitted = self._with_neural_events(fitted, train)
+        if not neural:
+            for name in ('goals', 'assists', 'defcon', 'saves'):
+                fitted[name] = self._fit_model(name, train, self.tuned_params.get(name, {}))
+            fitted = self._with_neural_events(fitted, train)
         for name in ('minutes', 'goals', 'assists', 'defcon', 'saves'):
             if name == 'saves':
                 target_rows = test[test['is_gk'] == 1]
@@ -1729,8 +1787,9 @@ with open(r"{temp_result_path}", 'w') as f:
         metrics['clean_sheet'] = {
             'metric_name': 'Poisson Dev', 'primary': self._loss('clean_sheet', actual, predicted),
             'MAE': float(mean_absolute_error(actual, predicted))}
-        fitted['cards'] = CardsModel(**self.tuned_params.get('cards', {})).fit(train, verbose=False)
-        fitted['bonus'] = BonusModel(n_simulations=self.n_sims).fit(train, verbose=False)
+        if not neural:
+            fitted['cards'] = CardsModel(**self.tuned_params.get('cards', {})).fit(train, verbose=False)
+            fitted['bonus'] = BonusModel(n_simulations=self.n_sims).fit(train, verbose=False)
         test = self._predict_player_components(test, fitted)
         # Bound memory by processing one deadline at a time; no files/live API calls.
         for _, batch in test.groupby('forecast_time', sort=True):
@@ -1782,6 +1841,7 @@ with open(r"{temp_result_path}", 'w') as f:
             final_training['appearance_grid_nonappearances'] = int(
                 full_appearance_grid['appeared'].eq(0).sum())
 
+        metrics['_backend'] = self.model_backend
         metrics['_sample_info'] = {
             'evaluation': {
                 'train_player_rows': len(train),
@@ -2762,6 +2822,13 @@ with open(r"{temp_result_path}", 'w') as f:
         """
         if not hasattr(self, 'last_test_metrics') or not self.last_test_metrics:
             return None
+        # Metrics saved before the backend switch carry no tag and are XGBoost's.
+        scored = self.last_test_metrics.get('_backend', 'xgboost')
+        if scored != self.model_backend:
+            raise ValueError(
+                f"Holdout metrics are from the {scored!r} backend but predictions use "
+                f"{self.model_backend!r}: rerun tune(test_last_n_gameweeks=10) to score "
+                "this backend before building the report.")
 
         sub_rows = []
         display_names = {
@@ -3002,6 +3069,7 @@ with open(r"{temp_result_path}", 'w') as f:
             'n_players': len(predictions),
             'points_semantics': 'unconditional' if 'exp_total_pts_uncond' in predictions else 'legacy_conditional',
             'simulation_schema': 2 if 'exp_total_pts_uncond' in predictions else 1,
+            'model_backend': self.model_backend,
         }
         with open(run_dir / 'meta.json', 'w') as f:
             json.dump(meta, f, indent=2)
